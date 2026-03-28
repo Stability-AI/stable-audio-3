@@ -8,7 +8,7 @@ dependencies = [
     "alias-free-torch>=0.0.6",
     "einops>=0.8.2",
     "einops-exts>=0.0.4",
-    "gradio>=6.9.0",
+    "gradio==6.3.0",
     "matplotlib>=3.10.8",
     "numpy>=2.2.6",
     "packaging>=26.0",

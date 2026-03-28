@@ -1,386 +1,136 @@
 import numpy as np
 import torch
 import typing as tp
-import math
-import copy
 from torch.nn.functional import interpolate
 
-from .utils import prepare_audio
+from .audio_utils import prepare_audio, numpy_audio_to_tensor
 from .sampling import sample_diffusion
-from .inversion import invert_audio
 
 
-def generate_diffusion_uncond(
+
+def generate(
         model,
-        steps: int = 250,
-        batch_size: int = 1,
-        sample_size: int = 2097152,
-        seed: int = -1,
-        device: str = "cuda",
-        init_audio: tp.Optional[tp.Tuple[int, torch.Tensor]] = None,
-        init_noise_level: float = 1.0,
-        return_latents = False,
-        **sampler_kwargs
-        ) -> torch.Tensor:
-    
-    # The length of the output in audio samples 
-    audio_sample_size = sample_size
-
-    # If this is latent diffusion, change sample_size instead to the downsampled latent size
-    if model.pretransform is not None:
-        sample_size = sample_size // model.pretransform.downsampling_ratio
-        
-    # Seed
-    # The user can explicitly set the seed to deterministically generate the same output. Otherwise, use a random seed.
-    seed = seed if seed != -1 else np.random.randint(0, 2**32 - 1, dtype=np.uint32)
-    print(seed)
-    torch.manual_seed(seed)
-    # Define the initial noise immediately after setting the seed
-    noise = torch.randn([batch_size, model.io_channels, sample_size], device=device)
-
-    if init_audio is not None:
-        # The user supplied some initial audio (for inpainting or variation). Let us prepare the input audio.
-        in_sr, init_audio = init_audio
-
-        io_channels = model.io_channels
-
-        # For latent models, set the io_channels to the autoencoder's io_channels
-        if model.pretransform is not None:
-            io_channels = model.pretransform.io_channels
-
-        # Prepare the initial audio for use by the model
-        init_audio = prepare_audio(init_audio, in_sr=in_sr, target_sr=model.sample_rate, target_length=audio_sample_size, target_channels=io_channels, device=device)
-
-        # For latent models, encode the initial audio into latents
-        if model.pretransform is not None:
-            init_audio = model.pretransform.encode(init_audio)
-
-        init_audio = init_audio.repeat(batch_size, 1, 1)
-    # Extract sampler_type from sampler_kwargs if present
-    sampler_type = sampler_kwargs.pop("sampler_type", "dpmpp-2m-sde")
-
-    sampled = sample_diffusion(
-        model=model.model,
-        noise=noise,
-        cond_inputs={},
-        diffusion_objective=model.diffusion_objective,
-        steps=steps,
-        cfg_scale=1.0,
-        pretransform=model.pretransform,
-        # Sampler options
-        sampler_type=sampler_type,
-        batch_cfg=False,
-        # Init data
-        init_data=init_audio,
-        init_noise_level=init_noise_level,
-        # Other
-        decode=not return_latents,
-        **sampler_kwargs
-    )
-
-    return sampled
-
-
-def generate_diffusion_cond(
-        model,
-        steps: int = 250,
-        cfg_scale=6,
-        conditioning: dict = None,
+        # Simple path: pass a prompt string and duration
+        prompt: str = None,
+        duration: float = 120,
+        seconds_start: float = 0,
+        lyrics: tp.Optional[str] = None,
+        negative_prompt: str = None,
+        # Low-level path: pass pre-built conditioning dicts
+        conditioning: tp.Optional[tp.List[dict]] = None,
         conditioning_tensors: tp.Optional[dict] = None,
-        negative_conditioning: dict = None,
+        negative_conditioning: tp.Optional[tp.List[dict]] = None,
         negative_conditioning_tensors: tp.Optional[dict] = None,
-        batch_size: int = 1,
-        sample_size: int = 2097152,
-        sample_rate: int = 48000,
-        seed: int = -1,
-        device: str = "cuda",
-        init_audio: tp.Optional[tp.Tuple[int, torch.Tensor]] = None,
-        init_noise_level: float = 1.0,
-        return_latents = False,
-        inversion_params: dict = None,
-        adapt_duration_to_conditioning: bool = False,
-        duration_padding_sec: float = 6.0,
-        use_effective_length_for_schedule: bool = False,
-        mask_padding_attention: bool = False,
-        apg_scale: float = 1.0,
-        dist_shift = None,
-        **sampler_kwargs
-        ) -> torch.Tensor:
-    """
-    Generate audio from a prompt using a diffusion model.
-
-    Args:
-        model: The diffusion model to use for generation.
-        steps: The number of diffusion steps to use.
-        cfg_scale: Classifier-free guidance scale
-        conditioning: A dictionary of conditioning parameters to use for generation.
-        conditioning_tensors: A dictionary of precomputed conditioning tensors to use for generation.
-        batch_size: The batch size to use for generation.
-        sample_size: The length of the audio to generate, in samples.
-        sample_rate: The sample rate of the audio to generate (Deprecated, now pulled from the model directly)
-        seed: The random seed to use for generation, or -1 to use a random seed.
-        device: The device to use for generation.
-        init_audio: A tuple of (sample_rate, audio) to use as the initial audio for generation.
-        init_noise_level: The noise level to use when generating from an initial audio sample.
-        return_latents: Whether to return the latents used for generation instead of the decoded audio.
-        adapt_duration_to_conditioning: If True, adapt the sample size based on seconds_total in conditioning plus duration_padding_sec.
-            This enables variable-length generation for models trained with padding masking.
-        duration_padding_sec: Extra seconds to add when adapting duration (default 6.0).
-        use_effective_length_for_schedule: If True, use effective_seq_len for distribution shift.
-            Enable this for models trained with use_effective_length_for_schedule=True.
-        mask_padding_attention: If True, create padding_mask for attention based on effective_seq_len.
-            Only needed when generating at full sequence length but wanting to mask padding.
-        apg_scale: APG (Adaptive Projected Guidance) scale. 1.0 = full APG, 0.0 = vanilla CFG.
-        dist_shift: Optional distribution shift override for sampling. If None, uses model.sampling_dist_shift.
-        **sampler_kwargs: Additional keyword arguments to pass to the sampler.
-    """
-
-    # The length of the output in audio samples 
-    audio_sample_size = sample_size
-
-    # Optionally adapt sample size based on seconds_total conditioning
-    if adapt_duration_to_conditioning and conditioning is not None:
-        # Find the maximum seconds_total across the batch
-        max_seconds = 0.0
-        for cond_dict in conditioning:
-            if "seconds_total" in cond_dict:
-                max_seconds = max(max_seconds, cond_dict["seconds_total"])
-        
-        if max_seconds > 0:
-            # Calculate target audio samples with padding, capped at original sample_size
-            target_audio_samples = int((max_seconds + duration_padding_sec) * model.sample_rate)
-            
-            # Ensure we align to pretransform downsampling ratio if applicable
-            if model.pretransform is not None:
-                ds_ratio = model.pretransform.downsampling_ratio
-                # Round up to nearest multiple of downsampling ratio
-                target_audio_samples = ((target_audio_samples + ds_ratio - 1) // ds_ratio) * ds_ratio
-            
-            # Cap at original sample_size (don't exceed what was requested)
-            audio_sample_size = min(target_audio_samples, sample_size)
-
-    # Use the (potentially adapted) audio_sample_size for latent size calculation
-    latent_sample_size = audio_sample_size
-
-    # If this is latent diffusion, change sample_size instead to the downsampled latent size
-    if model.pretransform is not None:
-        latent_sample_size = audio_sample_size // model.pretransform.downsampling_ratio
-        
-    # Seed
-    # The user can explicitly set the seed to deterministically generate the same output. Otherwise, use a random seed.
-    seed = seed if seed != -1 else np.random.randint(0, 2**32 - 1)
-    torch.manual_seed(seed)
-    # Define the initial noise immediately after setting the seed
-    noise = torch.randn([batch_size, model.io_channels, latent_sample_size], device=device)
-
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
-    torch.backends.cudnn.benchmark = False
-
-    # Conditioning
-    assert conditioning is not None or conditioning_tensors is not None, "Must provide either conditioning or conditioning_tensors"
-    if conditioning_tensors is None:
-        conditioning_tensors = model.conditioner(conditioning, device)
-    conditioning_inputs = model.get_conditioning_inputs(conditioning_tensors)
-
-    if negative_conditioning is not None or negative_conditioning_tensors is not None:
-        
-        if negative_conditioning_tensors is None:
-            negative_conditioning_tensors = model.conditioner(negative_conditioning, device)
-            
-        negative_conditioning_tensors = model.get_conditioning_inputs(negative_conditioning_tensors, negative=True)
-    else:
-        negative_conditioning_tensors = {}
-
-    model_dtype = next(model.model.parameters()).dtype
-    noise = noise.type(model_dtype)
-    conditioning_inputs = {k: v.type(model_dtype) if v is not None else v for k, v in conditioning_inputs.items()}
-
-    diff_objective = model.diffusion_objective
-
-    if init_audio is not None:
-        # The user supplied some initial audio (for inpainting or variation or inversion). Let us prepare the input audio.
-        in_sr, init_audio = init_audio
-
-        io_channels = model.io_channels
-
-        # For latent models, set the io_channels to the autoencoder's io_channels
-        if model.pretransform is not None:
-            io_channels = model.pretransform.io_channels
-
-        # Prepare the initial audio for use by the model
-        init_audio = prepare_audio(init_audio, in_sr=in_sr, target_sr=model.sample_rate, target_length=audio_sample_size, target_channels=io_channels, device=device)
-
-        # For latent models, encode the initial audio into latents
-        if model.pretransform is not None:
-            init_audio = model.pretransform.encode(init_audio)
-
-        init_audio = init_audio.repeat(batch_size, 1, 1)
-
-        if inversion_params is not None:
-            # we're doing an inversion task
-            assert diff_objective in diff_objective in ["rectified_flow"], "inversion is supported in RF models only"
-            # RF-Inversion
-            inversion_noise = noise # this is not the inverted latent, this is gamma-parameterized noise we use during inversion to guide it in-distribution 
-            # Modify the conditioning for inversion
-            inversion_conditioning = copy.deepcopy(conditioning)
-            inversion_conditioning_tensors = model.conditioner(inversion_conditioning, device)
-            inversion_conditioning_inputs = model.get_conditioning_inputs(inversion_conditioning_tensors)
-            inversion_conditioning_inputs =  {k: v.type(model_dtype) if v is not None else v for k, v in inversion_conditioning_inputs.items()}
-            if inversion_params["inversion_unconditional"]:
-                # Unconditional seems better for prompt re-stylization
-                cfg_dropout_prob = 1.0
-            else:
-                # "" prompt w/ cfg=1 seems better for reconstruction
-                cfg_dropout_prob = 0.0
-                for x in inversion_conditioning:
-                    if "prompt" in x: x["prompt"] = ""
-            # invert the audio
-            inverted_latents = invert_audio(model.model, init_audio, noise=inversion_noise, \
-                inversion_params=inversion_params,
-                cfg_dropout_prob=cfg_dropout_prob,
-                **inversion_conditioning_inputs)
-            noise = inverted_latents # from here on, use this as the seed noise. it represents the inverted audio
-            init_audio = None
-
-    # Merge positive and negative conditioning inputs
-    cond_inputs = {**conditioning_inputs, **negative_conditioning_tensors}
-
-    # Extract sampler_type from sampler_kwargs if present
-    sampler_type = sampler_kwargs.pop("sampler_type", "euler")
-
-    sampled = sample_diffusion(
-        model=model.model,
-        noise=noise,
-        cond_inputs=cond_inputs,
-        diffusion_objective=diff_objective,
-        steps=steps,
-        cfg_scale=cfg_scale,
-        # Varlen support
-        conditioning=conditioning,
-        sample_rate=model.sample_rate,
-        pretransform=model.pretransform,
-        mask_padding_attention=mask_padding_attention,
-        use_effective_length_for_schedule=use_effective_length_for_schedule,
-        headroom_seconds=duration_padding_sec,
-        # Timestep schedule
-        dist_shift=dist_shift if dist_shift is not None else model.sampling_dist_shift,
-        # Sampler options
-        sampler_type=sampler_type,
-        batch_cfg=True,
-        rescale_cfg=True,
-        apg_scale=apg_scale,
-        # Init data
-        init_data=init_audio,
-        init_noise_level=init_noise_level,
-        # Other
-        decode=not return_latents,
-        **sampler_kwargs
-    )
-
-    return sampled
-
-def generate_diffusion_cond_inpaint(
-        model,
+        # Generation parameters
         steps: int = 250,
-        cfg_scale=6,
-        conditioning: dict = None,
-        conditioning_tensors: tp.Optional[dict] = None,
-        negative_conditioning: dict = None,
-        negative_conditioning_tensors: tp.Optional[dict] = None,
+        cfg_scale: float = 6.0,
         batch_size: int = 1,
         sample_size: int = 2097152,
         seed: int = -1,
         device: str = "cuda",
+        # Audio inputs
         init_audio: tp.Optional[tp.Tuple[int, torch.Tensor]] = None,
         init_noise_level: float = 1.0,
         inpaint_audio: tp.Optional[tp.Tuple[int, torch.Tensor]] = None,
-        inpaint_mask = None,
+        inpaint_mask=None,
         inpaint_mask_start_seconds: tp.Optional[float] = None,
         inpaint_mask_end_seconds: tp.Optional[float] = None,
-        return_latents = False,
+        # Duration / schedule options
         adapt_duration_to_conditioning: bool = False,
         duration_padding_sec: float = 6.0,
         use_effective_length_for_schedule: bool = False,
         mask_padding_attention: bool = False,
         apg_scale: float = 1.0,
-        dist_shift = None,
+        dist_shift=None,
+        return_latents: bool = False,
         **sampler_kwargs
         ) -> torch.Tensor:
     """
-    Generate audio from a prompt using a diffusion inpainting model.
+    Generate audio from a model.
+
+    Can be called two ways:
+
+    Simple:
+        generate(model, prompt="...", duration=30, steps=100)
+
+    Low-level (pre-built conditioning):
+        generate(model, conditioning=[{"prompt": "...", "seconds_total": 30}], steps=100, ...)
 
     Args:
-        model: The diffusion model to use for generation.
-        steps: The number of diffusion steps to use.
-        cfg_scale: Classifier-free guidance scale
-        conditioning: A dictionary of conditioning parameters to use for generation.
-        conditioning_tensors: A dictionary of precomputed conditioning tensors to use for generation.
-        batch_size: The batch size to use for generation.
-        sample_size: The length of the audio to generate, in samples.
-        seed: The random seed to use for generation, or -1 to use a random seed.
-        device: The device to use for generation.
-        init_audio: A tuple of (sample_rate, audio) to use as the initial audio for generation.
-        inpaint_mask: A prebuilt mask tensor for inpainting. Shape should be [batch_size, sample_size].
-            When adapt_duration_to_conditioning is True, the mask length should match the adapted audio_sample_size.
-            Ignored if inpaint_mask_start_seconds/inpaint_mask_end_seconds are provided.
-        inpaint_mask_start_seconds: Start of the inpaint region in seconds. The mask will be built internally
-            at the correct audio_sample_size (after duration adaptation), so positions are always accurate.
-        inpaint_mask_end_seconds: End of the inpaint region in seconds.
-        return_latents: Whether to return the latents used for generation instead of the decoded audio.
-        adapt_duration_to_conditioning: If True, adapt the sample size based on seconds_total in conditioning plus duration_padding_sec.
-        duration_padding_sec: Extra seconds to add when adapting duration (default 6.0).
-        use_effective_length_for_schedule: If True, use effective_seq_len for distribution shift.
-            Enable this for models trained with use_effective_length_for_schedule=True.
-        mask_padding_attention: If True, create padding_mask for attention based on effective_seq_len.
-            Enable this for models trained with mask_padding_attention=True.
-        apg_scale: APG (Adaptive Projected Guidance) scale. 1.0 = full APG, 0.0 = vanilla CFG.
-        **sampler_kwargs: Additional keyword arguments to pass to the sampler.
+        model: The model to use for generation.
+        prompt: Text prompt (simple path). Builds conditioning internally.
+        duration: Duration in seconds (simple path, default 120).
+        seconds_start: Start time in seconds for conditioning (simple path, default 0).
+        lyrics: Optional lyrics string added to conditioning (simple path).
+        negative_prompt: Negative text prompt (simple path).
+        conditioning: Pre-built conditioning dicts (low-level path).
+        conditioning_tensors: Pre-computed conditioning tensors.
+        negative_conditioning: Pre-built negative conditioning dicts.
+        negative_conditioning_tensors: Pre-computed negative conditioning tensors.
+        steps: Number of sampling steps.
+        cfg_scale: Classifier-free guidance scale.
+        batch_size: Batch size.
+        sample_size: Output length in audio samples.
+        seed: Random seed (-1 for random).
+        device: Device to run on.
+        init_audio: (sample_rate, audio tensor) for variation/inpainting.
+        init_noise_level: Noise level for init_audio mixing.
+        inpaint_audio: (sample_rate, audio tensor) to inpaint into.
+        inpaint_mask: Pre-built inpaint mask tensor [batch, sample_size].
+        inpaint_mask_start_seconds: Start of inpaint region in seconds.
+        inpaint_mask_end_seconds: End of inpaint region in seconds.
+        adapt_duration_to_conditioning: Shrink sample_size to match seconds_total + padding.
+        duration_padding_sec: Extra padding when adapting duration.
+        use_effective_length_for_schedule: Use effective_seq_len for distribution shift.
+        mask_padding_attention: Mask padding tokens in attention.
+        apg_scale: APG scale (1.0 = full APG, 0.0 = vanilla CFG).
+        dist_shift: Distribution shift override.
+        return_latents: Return raw latents instead of decoded audio.
+        **sampler_kwargs: Extra args forwarded to the sampler (sampler_type, sigma_min, sigma_max, etc.).
     """
+
+    # Build conditioning from prompt string if not provided directly
+    if conditioning is None and conditioning_tensors is None:
+        assert prompt is not None, "Must provide either prompt or conditioning"
+        cond_dict = {"prompt": prompt, "seconds_start": seconds_start, "seconds_total": duration}
+        if lyrics:
+            cond_dict["lyrics"] = lyrics
+        conditioning = [cond_dict] * batch_size
+        if negative_prompt:
+            neg_dict = {"prompt": negative_prompt, "seconds_start": seconds_start, "seconds_total": duration}
+            if lyrics:
+                neg_dict["lyrics"] = lyrics
+            negative_conditioning = [neg_dict] * batch_size
 
     # The length of the output in audio samples
     audio_sample_size = sample_size
 
     # Optionally adapt sample size based on seconds_total conditioning
     if adapt_duration_to_conditioning and conditioning is not None:
-        # Find the maximum seconds_total across the batch
         max_seconds = 0.0
         for cond_dict in conditioning:
             if "seconds_total" in cond_dict:
                 max_seconds = max(max_seconds, cond_dict["seconds_total"])
-        
+
         if max_seconds > 0:
-            # Calculate target audio samples with padding, capped at original sample_size
             target_audio_samples = int((max_seconds + duration_padding_sec) * model.sample_rate)
-            
-            # Ensure we align to pretransform downsampling ratio if applicable
+
             if model.pretransform is not None:
                 ds_ratio = model.pretransform.downsampling_ratio
-                # Round up to nearest multiple of downsampling ratio
                 target_audio_samples = ((target_audio_samples + ds_ratio - 1) // ds_ratio) * ds_ratio
-            
-            # Cap at original sample_size (don't exceed what was requested)
+
             audio_sample_size = min(target_audio_samples, sample_size)
 
-    # Use the (potentially adapted) audio_sample_size for latent size calculation
+    # Convert audio sample size to latent size
     latent_sample_size = audio_sample_size
-
-    # If this is latent diffusion, change sample_size to the downsampled latent size
     if model.pretransform is not None:
         latent_sample_size = audio_sample_size // model.pretransform.downsampling_ratio
-    
-    # Keep sample_size variable pointing to latent size for backward compatibility in rest of function
     sample_size = latent_sample_size
-    
-    # Build inpaint mask from seconds if provided, using the (potentially adapted) audio_sample_size.
-    # This ensures mask positions are correct regardless of duration adaptation.
+
+    # Build inpaint mask from seconds if provided
     if inpaint_mask_start_seconds is not None and inpaint_mask_end_seconds is not None:
-        mask_start_samples = int(inpaint_mask_start_seconds * model.sample_rate)
-        mask_end_samples = int(inpaint_mask_end_seconds * model.sample_rate)
-        # Clamp to audio_sample_size
-        mask_start_samples = min(mask_start_samples, audio_sample_size)
-        mask_end_samples = min(mask_end_samples, audio_sample_size)
+        mask_start_samples = min(int(inpaint_mask_start_seconds * model.sample_rate), audio_sample_size)
+        mask_end_samples = min(int(inpaint_mask_end_seconds * model.sample_rate), audio_sample_size)
         inpaint_mask = torch.ones(1, audio_sample_size, device=device)
         inpaint_mask[:, mask_start_samples:mask_end_samples] = 0
 
@@ -399,8 +149,7 @@ def generate_diffusion_cond_inpaint(
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cudnn.benchmark = False
 
-    # Conditioning
-    assert conditioning is not None or conditioning_tensors is not None, "Must provide either conditioning or conditioning_tensors"
+    # Encode conditioning
     if conditioning_tensors is None:
         conditioning_tensors = model.conditioner(conditioning, device)
     if negative_conditioning is not None or negative_conditioning_tensors is not None:
@@ -409,69 +158,48 @@ def generate_diffusion_cond_inpaint(
     else:
         negative_conditioning_tensors = {}
 
+    # Process init audio
     if init_audio is not None:
-        # The user supplied some initial audio (for inpainting or variation). Let us prepare the input audio.
+        in_sr, audio_data = init_audio
+        if isinstance(audio_data, np.ndarray):
+            audio_data = numpy_audio_to_tensor(audio_data)
+        init_audio = (in_sr, audio_data)
         in_sr, init_audio = init_audio
-
-        io_channels = model.io_channels
-
-        # For latent models, set the io_channels to the autoencoder's io_channels
-        if model.pretransform is not None:
-            io_channels = model.pretransform.io_channels
-
-        # Prepare the initial audio for use by the model
+        io_channels = model.pretransform.io_channels if model.pretransform is not None else model.io_channels
         init_audio = prepare_audio(init_audio, in_sr=in_sr, target_sr=model.sample_rate, target_length=audio_sample_size, target_channels=io_channels, device=device)
-
-        # For latent models, encode the initial audio into latents
         if model.pretransform is not None:
             init_audio = model.pretransform.encode(init_audio)
-            
-            # Interpolate inpaint mask to the same length as the encoded init audio
             if inpaint_mask is not None:
                 inpaint_mask = interpolate(inpaint_mask.unsqueeze(1), size=init_audio.shape[-1], mode='nearest').squeeze(1)
-
         init_audio = init_audio.repeat(batch_size, 1, 1)
 
+    # Process inpaint audio
     if inpaint_audio is not None:
-        # The user supplied some initial audio (for inpainting or variation). Let us prepare the input audio.
+        inpaint_sr, inpaint_data = inpaint_audio
+        if isinstance(inpaint_data, np.ndarray):
+            inpaint_data = numpy_audio_to_tensor(inpaint_data)
+        inpaint_audio = (inpaint_sr, inpaint_data)
         inpaint_sr, inpaint_audio = inpaint_audio
-
-        io_channels = model.io_channels
-
-        # For latent models, set the io_channels to the autoencoder's io_channels
-        if model.pretransform is not None:
-            io_channels = model.pretransform.io_channels
-
-        # Prepare the initial audio for use by the model
+        io_channels = model.pretransform.io_channels if model.pretransform is not None else model.io_channels
         inpaint_audio = prepare_audio(inpaint_audio, in_sr=inpaint_sr, target_sr=model.sample_rate, target_length=audio_sample_size, target_channels=io_channels, device=device)
-
-        # For latent models, encode the initial audio into latents
         if model.pretransform is not None:
             inpaint_audio = model.pretransform.encode(inpaint_audio)
-            
-            # Interpolate inpaint mask to the same length as the encoded init audio
             if inpaint_mask is not None:
                 inpaint_mask = interpolate(inpaint_mask.unsqueeze(1), size=inpaint_audio.shape[-1], mode='nearest').squeeze(1)
-
         inpaint_audio = inpaint_audio.repeat(batch_size, 1, 1)
     else:
-       
         if inpaint_mask is not None:
-            # interpolate inpaint mask to the sample size
             inpaint_mask = interpolate(inpaint_mask.unsqueeze(1), size=sample_size, mode='nearest').squeeze(1)
 
+    # Build inpaint mask tensor
     if inpaint_mask is None:
-        mask = torch.zeros((batch_size, 1, sample_size), device=device)  
+        mask = torch.zeros((batch_size, 1, sample_size), device=device)
     else:
         mask = inpaint_mask.unsqueeze(1)
-
-    # Inpainting mask
     mask = mask.to(device)
 
-    if inpaint_audio is not None:
-        inpaint_input = inpaint_audio * mask.expand_as(inpaint_audio)
-    else:
-        inpaint_input = torch.zeros((batch_size, model.io_channels, sample_size), device=device)
+    inpaint_input = inpaint_audio * mask.expand_as(inpaint_audio) if inpaint_audio is not None else \
+        torch.zeros((batch_size, model.io_channels, sample_size), device=device)
 
     conditioning_tensors['inpaint_mask'] = [mask]
     conditioning_tensors['inpaint_masked_input'] = [inpaint_input]
@@ -481,69 +209,35 @@ def generate_diffusion_cond_inpaint(
         negative_conditioning_tensors['inpaint_mask'] = [mask]
         negative_conditioning_tensors['inpaint_masked_input'] = [inpaint_input]
         negative_conditioning_tensors = model.get_conditioning_inputs(negative_conditioning_tensors, negative=True)
-    
+
     model_dtype = next(model.model.parameters()).dtype
     noise = noise.type(model_dtype)
     conditioning_inputs = {k: v.type(model_dtype) if v is not None else v for k, v in conditioning_inputs.items()}
 
-    # Merge positive and negative conditioning inputs
     cond_inputs = {**conditioning_inputs, **negative_conditioning_tensors}
 
-    # Extract sampler_type from sampler_kwargs if present
     sampler_type = sampler_kwargs.pop("sampler_type", "euler")
 
-    sampled = sample_diffusion(
+    return sample_diffusion(
         model=model.model,
         noise=noise,
         cond_inputs=cond_inputs,
         diffusion_objective=model.diffusion_objective,
         steps=steps,
         cfg_scale=cfg_scale,
-        # Varlen support
         conditioning=conditioning,
         sample_rate=model.sample_rate,
         pretransform=model.pretransform,
         mask_padding_attention=mask_padding_attention,
         use_effective_length_for_schedule=use_effective_length_for_schedule,
         headroom_seconds=duration_padding_sec,
-        # Timestep schedule
         dist_shift=dist_shift if dist_shift is not None else model.sampling_dist_shift,
-        # Sampler options
         sampler_type=sampler_type,
         batch_cfg=True,
         rescale_cfg=True,
         apg_scale=apg_scale,
-        # Init data
         init_data=init_audio,
         init_noise_level=init_noise_level,
-        # Other
         decode=not return_latents,
         **sampler_kwargs
     )
-
-    return sampled
-
-
-# builds a softmask given the parameters
-# returns array of values 0 to 1, size sample_size, where 0 means noise / fresh generation, 1 means keep the input audio, 
-# and anything between is a mixture of old/new
-# ideally 0.5 is half/half mixture but i haven't figured this out yet
-def build_mask(sample_size, mask_args):
-    maskstart = math.floor(mask_args["maskstart"]/100.0 * sample_size)
-    maskend = math.ceil(mask_args["maskend"]/100.0 * sample_size)
-    softnessL = round(mask_args["softnessL"]/100.0 * sample_size)
-    softnessR = round(mask_args["softnessR"]/100.0 * sample_size)
-    marination = mask_args["marination"]
-    # use hann windows for softening the transition (i don't know if this is correct)
-    hannL = torch.hann_window(softnessL*2, periodic=False)[:softnessL]
-    hannR = torch.hann_window(softnessR*2, periodic=False)[softnessR:]
-    # build the mask. 
-    mask = torch.zeros((sample_size))
-    mask[maskstart:maskend] = 1
-    mask[maskstart:maskstart+softnessL] = hannL
-    mask[maskend-softnessR:maskend] = hannR
-    # marination finishes the inpainting early in the denoising schedule, and lets audio get changed in the final rounds
-    if marination > 0:        
-        mask = mask * (1-marination) 
-    #print(mask)
-    return mask

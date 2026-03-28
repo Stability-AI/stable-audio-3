@@ -1,20 +1,12 @@
-from stable_audio_3.interface.gradio import create_ui
-import json 
-
 import torch
+from stable_audio_3.interface.diffusion_cond import create_diffusion_cond_ui
+from stable_audio_3.pipeline import StableAudioPipeline
 
+model_half = True
 def main(args):
     torch.manual_seed(42)
-
-    interface = create_ui(
-        model_config_path = args.model_config,
-        ckpt_path=args.ckpt_path,
-        pretrained_name=args.pretrained_name,
-        pretransform_ckpt_path=args.pretransform_ckpt_path,
-        model_half=args.model_half,
-        gradio_title=args.title,
-        lora_ckpt_paths=args.lora_ckpt_path,
-    )
+    pipe = StableAudioPipeline.from_pretrained("test")
+    interface = create_diffusion_cond_ui(pipe.model_config, pipe.model, in_model_half=model_half, gradio_title=args.title if args.title is not None else "Stable Audio 3")
     interface.queue()
     interface.launch(share=True, auth=(args.username, args.password) if args.username is not None else None, js=getattr(interface, '_sao_js', None), theme=getattr(interface, '_sao_theme', None))
 

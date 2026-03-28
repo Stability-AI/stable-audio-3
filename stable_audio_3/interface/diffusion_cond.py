@@ -1,7 +1,6 @@
 import gc
 import numpy as np
 import gradio as gr
-import json 
 import re
 import subprocess
 import torch
@@ -10,18 +9,11 @@ import threading
 import os, time, math
 
 from einops import rearrange
-from safetensors.torch import load_file
-from torch.nn import functional as F
-from torchaudio import transforms as T
 
-from ..aeiou import audio_spectrogram_image
-from ...inference.generation import generate_diffusion_cond, generate_diffusion_cond_inpaint #, generate_diffusion_uncond
-from ...inference.sampling import LogSNRShift, FluxDistributionShift, DistributionShift, IdentityDistributionShift
-#from ..models.factory import create_model_from_config
-#from ..models.pretrained import get_pretrained_model
-#from ..models.utils import copy_state_dict, load_ckpt_state_dict
-from ...inference.utils import prepare_audio
-from ...models.minlora import set_lora_strength, has_lora, get_lora_count
+from stable_audio_3.interface.aeiou import audio_spectrogram_image
+from stable_audio_3.inference.generation import generate as generate_audio
+from stable_audio_3.inference.distribution_shift import LogSNRShift, FluxDistributionShift, DistributionShift, IdentityDistributionShift
+from stable_audio_3.core.minlora import set_lora_strength, has_lora, get_lora_count
 
 
 model = None
@@ -56,9 +48,7 @@ def generate_cond(
         preview_every=None,
         seed=-1,
         sampler_type="dpmpp-3m-sde",
-        sigma_min=0.03,
         sigma_max=1000,
-        rho=1.0,
         cfg_interval_min=0.0,
         cfg_interval_max=1.0,
         cfg_rescale=0.0,
@@ -95,24 +85,6 @@ def generate_cond(
     if preview_every == 0:
         preview_every = None
 
-    # Return fake stereo audio
-    conditioning_dict = {"prompt": prompt, "seconds_start": seconds_start, "seconds_total": seconds_total}
-
-    if lyrics_prompt:
-        conditioning_dict["lyrics"] = lyrics_prompt
-
-    conditioning = [conditioning_dict] * batch_size
-
-    if negative_prompt:
-        negative_conditioning_dict = {"prompt": negative_prompt, "seconds_start": seconds_start, "seconds_total": seconds_total}
-
-        if lyrics_prompt:
-            negative_conditioning_dict["lyrics"] = lyrics_prompt
-
-        negative_conditioning = [negative_conditioning_dict] * batch_size
-    else:
-        negative_conditioning = None
-        
     #Get the device from the model
     device = next(model.parameters()).device
 
@@ -142,72 +114,6 @@ def generate_cond(
             })
 
     input_sample_size = sample_size
-
-    if init_audio is not None:
-        in_sr, init_audio = init_audio
-
-        if init_audio.dtype == np.float32:
-            init_audio = torch.from_numpy(init_audio)
-        elif init_audio.dtype == np.int16:
-            init_audio = torch.from_numpy(init_audio).float().div(32767)
-        elif init_audio.dtype == np.int32:
-            init_audio = torch.from_numpy(init_audio).float().div(2147483647)
-        else:
-            raise ValueError(f"Unsupported audio data type: {init_audio.dtype}")
-
-        if model_half:
-            init_audio = init_audio.to(torch.float16)
-        
-        if init_audio.dim() == 1:
-            init_audio = init_audio.unsqueeze(0) # [1, n]
-        elif init_audio.dim() == 2:
-            init_audio = init_audio.transpose(0, 1) # [n, 2] -> [2, n]
-
-        if in_sr != sample_rate:
-            resample_tf = T.Resample(in_sr, sample_rate).to(init_audio.device).to(init_audio.dtype)
-            init_audio = resample_tf(init_audio)
-
-        audio_length = init_audio.shape[-1]
-
-        if audio_length > sample_size:
-
-            #input_sample_size = audio_length + (model.min_input_length - (audio_length % model.min_input_length)) % model.min_input_length
-            init_audio = init_audio[:, :sample_size]
-
-        init_audio = (sample_rate, init_audio)
-
-    if inpaint_audio is not None:
-        in_sr, inpaint_audio = inpaint_audio
-        
-        if inpaint_audio.dtype == np.float32:
-            inpaint_audio = torch.from_numpy(inpaint_audio)
-        elif inpaint_audio.dtype == np.int16:
-            inpaint_audio = torch.from_numpy(inpaint_audio).float().div(32767)
-        elif inpaint_audio.dtype == np.int32:
-            inpaint_audio = torch.from_numpy(inpaint_audio).float().div(2147483647)
-        else:
-            raise ValueError(f"Unsupported audio data type: {inpaint_audio.dtype}")
-
-        if model_half:
-            inpaint_audio = inpaint_audio.to(torch.float16)
-        
-        if inpaint_audio.dim() == 1:
-            inpaint_audio = inpaint_audio.unsqueeze(0) # [1, n]
-        elif inpaint_audio.dim() == 2:
-            inpaint_audio = inpaint_audio.transpose(0, 1) # [n, 2] -> [2, n]
-
-        if in_sr != sample_rate:
-            resample_tf = T.Resample(in_sr, sample_rate).to(inpaint_audio.device).to(inpaint_audio.dtype)
-            inpaint_audio = resample_tf(inpaint_audio)
-
-        audio_length = inpaint_audio.shape[-1]
-
-        if audio_length > sample_size:
-
-            #input_sample_size = audio_length + (model.min_input_length - (audio_length % model.min_input_length)) % model.min_input_length
-            inpaint_audio = inpaint_audio[:, :sample_size]
-
-        inpaint_audio = (sample_rate, inpaint_audio)
 
     def progress_callback(callback_info):
         global preview_images
@@ -249,8 +155,11 @@ def generate_cond(
 
     generate_args = {
         "model": model,
-        "conditioning": conditioning,
-        "negative_conditioning": negative_conditioning,
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "duration": seconds_total,
+        "seconds_start": seconds_start,
+        "lyrics": lyrics_prompt if lyrics_prompt else None,
         "steps": steps,
         "cfg_scale": cfg_scale,
         "cfg_interval": (cfg_interval_min, cfg_interval_max),
@@ -260,7 +169,6 @@ def generate_cond(
         "seed": seed,
         "device": device,
         "sampler_type": sampler_type,
-        "sigma_min": sigma_min,
         "sigma_max": sigma_max,
         "init_audio": init_audio,
         "init_noise_level": init_noise_level,
@@ -268,7 +176,6 @@ def generate_cond(
         "scale_phi": cfg_rescale,
         "cfg_norm_threshold": cfg_norm_threshold,
         "apg_scale": apg_scale,
-        "rho": rho,
         "adapt_duration_to_conditioning": adapt_duration_to_conditioning,
         "duration_padding_sec": duration_padding_sec,
         "use_effective_length_for_schedule": use_effective_length_for_schedule,
@@ -278,23 +185,14 @@ def generate_cond(
 
      # If inpainting, send mask args
     # This will definitely change in the future
-    if model_type == "diffusion_cond":
+    if inpaint_audio is not None:
+        generate_args.update({
+            "inpaint_audio": inpaint_audio,
+            "inpaint_mask_start_seconds": mask_maskstart,
+            "inpaint_mask_end_seconds": mask_maskend,
+        })
 
-        generate_args["inversion_params"] = inversion_params
-
-        # Do the audio generation
-        audio = generate_diffusion_cond(**generate_args)
-
-    elif model_type == "diffusion_cond_inpaint":
-
-        if inpaint_audio is not None:
-            generate_args.update({
-                "inpaint_audio": inpaint_audio,
-                "inpaint_mask_start_seconds": mask_maskstart,
-                "inpaint_mask_end_seconds": mask_maskend,
-            })
-
-        audio = generate_diffusion_cond_inpaint(**generate_args)
+    audio = generate_audio(**generate_args)
 
     # Filenaming convention
     prompt_condensed = condense_prompt(prompt) 
@@ -360,7 +258,7 @@ def generate_cond(
     if file_naming in ["verbose", "prompt"]:
         delete_files_async([output_wav, output_filename], 30)
 
-    return (output_filename, [audio_spectrogram, *preview_images])
+    return ((sample_rate, audio.numpy().T), [audio_spectrogram, *preview_images])
 
 #  Asynchronously delete the given list of filenames after delay seconds. Sets up thread that sleeps for delay then deletes. 
 def delete_files_async(filenames, delay):
@@ -519,9 +417,7 @@ def create_sampling_ui(model_config):
                         sigma_max_default = 100.0
                         
                     sampler_type_dropdown = gr.Dropdown(sampler_types, label="Sampler type", value=default_sampler_type)
-                    sigma_min_slider = gr.Slider(minimum=0.0, maximum=2.0, step=0.01, value=0.01, label="Sigma min", visible=is_v)
                     sigma_max_slider = gr.Slider(minimum=0.0, maximum=sigma_max_max, step=0.1, value=sigma_max_default, label="Sigma max", visible=True)
-                    rho_slider = gr.Slider(minimum=0.0, maximum=10.0, step=0.01, value=1.0, label="Sigma curve strength", visible=is_v)
 
                 with gr.Row():
                     adapt_duration_checkbox = gr.Checkbox(label="Adapt duration to conditioning", value=trained_with_masking, info="Generate at shorter sequence length based on seconds_total + padding")
@@ -656,9 +552,7 @@ def create_sampling_ui(model_config):
                 preview_every_slider,
                 seed_textbox,
                 sampler_type_dropdown,
-                sigma_min_slider,
                 sigma_max_slider,
-                rho_slider,
                 cfg_interval_min_slider,
                 cfg_interval_max_slider,
                 cfg_rescale_slider,

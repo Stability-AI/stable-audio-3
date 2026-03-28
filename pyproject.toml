@@ -1,0 +1,51 @@
+[project]
+name = "stable-audio-3"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "alias-free-torch>=0.0.6",
+    "einops>=0.8.2",
+    "einops-exts>=0.0.4",
+    "gradio==6.3.0",
+    "matplotlib>=3.10.8",
+    "numpy>=2.2.6",
+    "packaging>=26.0",
+    "pywavelets>=1.8.0",
+    "safetensors>=0.7.0",
+    "scipy>=1.15.3",
+    "soundfile>=0.13.1",
+    "soxr>=1.0.0",
+    "torch==2.7.1",
+    "torchaudio==2.7.1",
+    "torchsde>=0.2.6",
+    "tqdm>=4.67.3",
+    "transformers>=5.3.0",
+]
+[project.optional-dependencies]
+flash-attn = [
+  "ninja",
+  "pip",
+  "flash-attn"
+  ]
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
+]
+torchaudio = [
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

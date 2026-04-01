@@ -166,3 +166,4 @@ wandb/*
 test_*
 
 .gradio
+.DS_Store

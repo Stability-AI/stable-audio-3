@@ -7,10 +7,10 @@ from stable_audio_3.model import create_diffusion_cond_from_config
 from stable_audio_3.loading_utils import copy_state_dict, load_ckpt_state_dict
 from stable_audio_3.core.minlora import add_lora, LoRAParametrization, set_lora_strength, infer_global_rank, get_lora_layers, load_lora_checkpoint, remap_lora_state_dict
 
-MODEL_CONFIG_PATH = "44k_taae_4096_256_2_ct_dit_cond_t5gemma_380s_asx_large2_inpaint_ot_varlen_muon.json"
-CKPT_PATH = "4096_256_taaev2_rc2_base_cond_t5gemma_380s_inpaint_asxmi_varlen_muon_82k_unwrap.ckpt"
-# MODEL_CONFIG_PATH = ""
-# CKPT_PATH = ""
+# MODEL_CONFIG_PATH = "44k_taae_4096_256_2_ct_dit_cond_t5gemma_380s_asx_large2_inpaint_ot_varlen_muon.json"
+# CKPT_PATH = "4096_256_taaev2_rc2_base_cond_t5gemma_380s_inpaint_asxmi_varlen_muon_82k_unwrap.ckpt"
+MODEL_CONFIG_PATH = "SA3-S-ARC-CLAP.json"
+CKPT_PATH = "SA3-S-ARC-CLAP-5k.ckpt"
 model_half = True
 SEED = 124
 

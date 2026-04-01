@@ -244,7 +244,7 @@ def compute_effective_seq_len_from_conditioning(
             seconds = cond_dict["seconds_total"]
             # Convert seconds to latent sequence length
             audio_samples = int(seconds * sample_rate)
-            latent_length = audio_samples // downsampling_ratio
+            latent_length = math.ceil(audio_samples / downsampling_ratio)
             effective_lengths.append(latent_length)
         else:
             # If seconds_total not present for this item, use None as marker

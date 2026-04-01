@@ -32,8 +32,8 @@ def _zero_pad_modulo_sequence(x, size, dim=-2):
     return x
 
 class TransformerResamplingBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride, sliding_window = None, chunk_size = 128, type = 'encoder', transformer_depth = 3, checkpointing = False,
-                 conformer = False, layer_scale = False, dim_heads = 128, differential = True, variable_stride = False, use_flash = False, feat_scale = False,
+    def __init__(self, in_channels, out_channels, stride, sliding_window = None, chunk_size = 128, chunk_midpoint_shift = False, type = 'encoder', transformer_depth = 3, checkpointing = False,
+                 conformer = False, layer_scale = False, dim_heads = 128, differential = True, variable_stride = False, feat_scale = False,
                  sinusoidal_blocks = 0, mask_noise = 0, ff_mult = 3, mapping_bias = True, cross_attn = False, dyt = True, conv_mapping = False, freeze_backbone = False, **kwargs):
         super().__init__()
         if type not in ['encoder', 'decoder']:
@@ -49,6 +49,7 @@ class TransformerResamplingBlock(nn.Module):
         self.stride = stride
         self.mapping = WNConv1d(in_channels, out_channels, 3 if conv_mapping else 1, padding = 'same', bias = mapping_bias) if in_channels != out_channels else nn.Identity()
         self.chunk_size = chunk_size
+        self.chunk_midpoint_shift = chunk_midpoint_shift
         self.type = type
         self.mask_noise = mask_noise
         self.sliding_window_latents = sliding_window
@@ -74,7 +75,6 @@ class TransformerResamplingBlock(nn.Module):
         self.new_tokens = nn.Parameter(1e-5 * torch.randn(1, self.output_seg_size if not self.variable_stride else 1, out_channels if type == 'encoder' else in_channels))
 
         self.transformers = nn.ModuleList(transformers)
-        self.use_flash = use_flash
 
         if freeze_backbone:
             for param in self.transformers.parameters():
@@ -156,19 +156,60 @@ class TransformerResamplingBlock(nn.Module):
             if sliding_window is None:
                 prepend_cond_length = prepend_cond.shape[-2] if prepend_cond is not None else 0
                 effective_chunk_size = self.chunk_size + self.chunk_size * (1 + prepend_cond_length) // (stride if stride is not None else self.stride)
+
+            if sliding_window is None and self.chunk_midpoint_shift:
+                split = self.transformer_depth // 2
+                shift = effective_chunk_size // 2
+
+                # First half: standard chunks
+                nc = x.shape[1] // effective_chunk_size
                 x = rearrange(x, 'b (nc cc) d -> (b nc) cc d', cc=effective_chunk_size)
-
-            for layer in self.transformers:
-                if self.checkpointing:
-                    x = checkpoint(layer, x, context = cross_attn_cond, self_attention_flash_sliding_window = sliding_window if self.use_flash else None)
-                else:
-                    x = layer(x, context = cross_attn_cond, self_attention_flash_sliding_window = sliding_window if self.use_flash else None)
-                if return_features:
-                    features.append(x)
-
-            # Unfold chunks back to original batch
-            if sliding_window is None:
+                cross_attn_first = None
+                if cross_attn_cond is not None:
+                    cross_attn_first = cross_attn_cond.repeat_interleave(nc, dim=0)
+                for layer in self.transformers[:split]:
+                    if self.checkpointing:
+                        x = checkpoint(layer, x, context = cross_attn_first, self_attention_flash_sliding_window = None)
+                    else:
+                        x = layer(x, context = cross_attn_first)
+                    if return_features:
+                        features.append(rearrange(x, '(b nc) cc d -> b (nc cc) d', b=batch_size))
                 x = rearrange(x, '(b nc) cc d -> b (nc cc) d', b=batch_size)
+
+                # Second half: shifted chunks with sub-chunk repeat padding
+                # shift is always a multiple of sub_chunk_size, so slicing
+                # by shift gives whole sub-chunks in their original order
+                x = torch.cat([x[:, :shift, :], x, x[:, -shift:, :]], dim=1)
+                nc_shifted = x.shape[1] // effective_chunk_size
+                x = rearrange(x, 'b (nc cc) d -> (b nc) cc d', cc=effective_chunk_size)
+                cross_attn_second = None
+                if cross_attn_cond is not None:
+                    cross_attn_second = cross_attn_cond.repeat_interleave(nc_shifted, dim=0)
+                for layer in self.transformers[split:]:
+                    if self.checkpointing:
+                        x = checkpoint(layer, x, context = cross_attn_second, self_attention_flash_sliding_window = None)
+                    else:
+                        x = layer(x, context = cross_attn_second)
+                    if return_features:
+                        feat = rearrange(x, '(b nc) cc d -> b (nc cc) d', b=batch_size)
+                        features.append(feat[:, shift:-shift, :])
+                x = rearrange(x, '(b nc) cc d -> b (nc cc) d', b=batch_size)
+                x = x[:, shift:-shift, :]
+            else:
+                if sliding_window is None:
+                    x = rearrange(x, 'b (nc cc) d -> (b nc) cc d', cc=effective_chunk_size)
+
+                for layer in self.transformers:
+                    if self.checkpointing:
+                        x = checkpoint(layer, x, context = cross_attn_cond, self_attention_flash_sliding_window = sliding_window)
+                    else:
+                        x = layer(x, context = cross_attn_cond, self_attention_flash_sliding_window = sliding_window)
+                    if return_features:
+                        features.append(x)
+
+                # Unfold chunks back to original batch
+                if sliding_window is None:
+                    x = rearrange(x, '(b nc) cc d -> b (nc cc) d', b=batch_size)
 
             x = rearrange(x, 'b (n c) d -> (b n) c d', c=sub_chunk_size)
             x = x[:,-output_seg_size:,:]

@@ -216,7 +216,7 @@ def generate(
 
     cond_inputs = {**conditioning_inputs, **negative_conditioning_tensors}
 
-    sampler_type = sampler_kwargs.pop("sampler_type", "euler")
+    sampler_type = sampler_kwargs.pop("sampler_type", None)
 
     return sample_diffusion(
         model=model.model,

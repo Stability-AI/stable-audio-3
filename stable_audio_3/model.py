@@ -1,14 +1,18 @@
 import typing as tp
 
-from stable_audio_3.core.diffusion import DiTWrapper, ConditionedDiffusionModelWrapper
-from stable_audio_3.core.autoencoders import AudioAutoencoder, SAMEEncoder, SAMEDecoder
-from stable_audio_3.core.conditioners import (
+from stable_audio_3.models.diffusion import DiTWrapper, ConditionedDiffusionModelWrapper
+from stable_audio_3.models.autoencoders import (
+    AudioAutoencoder,
+    SAMEEncoder,
+    SAMEDecoder,
+)
+from stable_audio_3.models.conditioners import (
     MultiConditioner,
     NumberConditioner,
     T5GemmaConditioner,
 )
-from stable_audio_3.core.bottleneck import SoftNormBottleneck
-from stable_audio_3.core.pretransforms import PatchedPretransform
+from stable_audio_3.models.bottleneck import SoftNormBottleneck
+from stable_audio_3.models.pretransforms import PatchedPretransform
 
 
 def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):

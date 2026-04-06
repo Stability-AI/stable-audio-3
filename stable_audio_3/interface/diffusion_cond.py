@@ -13,7 +13,7 @@ from einops import rearrange
 from stable_audio_3.interface.aeiou import audio_spectrogram_image
 from stable_audio_3.inference.generation import generate as generate_audio
 from stable_audio_3.inference.distribution_shift import LogSNRShift, FluxDistributionShift, DistributionShift, IdentityDistributionShift
-from stable_audio_3.core.minlora import set_lora_strength, has_lora, get_lora_count
+from stable_audio_3.models.minlora import set_lora_strength, has_lora, get_lora_count
 
 
 model = None

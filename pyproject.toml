@@ -56,4 +56,9 @@ dev = [
 ]
 
 [tool.ruff]
-exclude = ["core", "inference", "interface", "data"]
+exclude = [
+    "stable_audio_3/models",
+    "stable_audio_3/inference",
+    "stable_audio_3/interface",
+    "stable_audio_3/data",
+]

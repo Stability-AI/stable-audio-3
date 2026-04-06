@@ -5,7 +5,7 @@ from functools import partial
 from stable_audio_3.inference.generation import generate
 from stable_audio_3.model import create_diffusion_cond_from_config
 from stable_audio_3.loading_utils import copy_state_dict, load_ckpt_state_dict
-from stable_audio_3.core.minlora import (
+from stable_audio_3.models.minlora import (
     add_lora,
     LoRAParametrization,
     set_lora_strength,

@@ -11,7 +11,7 @@ from stable_audio_3.core.minlora import add_lora, LoRAParametrization, set_lora_
 # CKPT_PATH = "4096_256_taaev2_rc2_base_cond_t5gemma_380s_inpaint_asxmi_varlen_muon_82k_unwrap.ckpt"
 MODEL_CONFIG_PATH = "SA3-S-ARC-CLAP.json"
 CKPT_PATH = "SA3-S-ARC-CLAP-5k.ckpt"
-model_half = True
+model_half = False
 SEED = 124
 
 class StableAudioPipeline:

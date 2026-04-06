@@ -12,11 +12,11 @@ Stable Audio 3 is the next generation of Stable Audio: a focused, streamlined pl
 
 ## Models
 
-| Model | Hardware | Params | Use case |
-|---|---|---|---|
-| **Stable Audio 3 Small** | CPU | 433M | Lightweight inference, no GPU required |
-| **Stable Audio 3 Medium** | GPU (CUDA) | 1.4B | High Quality, Fast Inference |
-| **Stable Audio 3 Large** | API only | 1.7B | Highest quality, API only. Not supported by this repo, see the [API docs](#) |
+| RF Model | Autoencoder | Hardware | Params | Use case |
+|---|---|---|---|---|
+| **Stable Audio 3 Small** | SAME-Small | CPU | 433M | Lightweight inference, no GPU required |
+| **Stable Audio 3 Medium** | SAME-Large | GPU (CUDA) | 1.4B | High Quality, Fast Inference |
+| **Stable Audio 3 Large** | SAME-Large | API only | 1.7B | Highest quality, API only. Not supported by this repo, see the [API docs](#) |
 
 ---
 

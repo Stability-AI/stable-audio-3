@@ -1,5 +1,6 @@
 from stable_audio_3.pipeline import StableAudioPipeline
 
+
 class StableAudio:
     @staticmethod
     def generate(prompt, duration=30, **kwargs):

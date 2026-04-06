@@ -2,51 +2,61 @@ import typing as tp
 
 from stable_audio_3.core.diffusion import DiTWrapper, ConditionedDiffusionModelWrapper
 from stable_audio_3.core.autoencoders import AudioAutoencoder, SAMEEncoder, SAMEDecoder
-from stable_audio_3.core.conditioners import MultiConditioner, NumberConditioner, T5GemmaConditioner
+from stable_audio_3.core.conditioners import (
+    MultiConditioner,
+    NumberConditioner,
+    T5GemmaConditioner,
+)
 from stable_audio_3.core.bottleneck import SoftNormBottleneck
 from stable_audio_3.core.pretransforms import PatchedPretransform
 
 
 def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
     model_config = config["model"]
-    diffusion_config = model_config.get('diffusion', None)
-    diffusion_model_config = diffusion_config.get('config', None)
-    diffusion_objective = diffusion_config.get('diffusion_objective', 'v')
-    modular_local_cond_configs = diffusion_config.get('modular_local_cond_configs', [])
+    diffusion_config = model_config.get("diffusion", None)
+    diffusion_model_config = diffusion_config.get("config", None)
+    diffusion_objective = diffusion_config.get("diffusion_objective", "v")
+    modular_local_cond_configs = diffusion_config.get("modular_local_cond_configs", [])
 
     diffusion_model = DiTWrapper(
         diffusion_objective=diffusion_objective,
         modular_local_cond_configs=modular_local_cond_configs,
-        **diffusion_model_config
+        **diffusion_model_config,
     )
 
-    io_channels = model_config.get('io_channels', None)
-    sample_rate = config.get('sample_rate', None)
-    cross_attention_ids = diffusion_config.get('cross_attention_cond_ids', [])
-    global_cond_ids = diffusion_config.get('global_cond_ids', [])
-    input_concat_ids = diffusion_config.get('input_concat_ids', [])
-    local_add_cond_ids = diffusion_config.get('local_add_cond_ids', [])
+    io_channels = model_config.get("io_channels", None)
+    sample_rate = config.get("sample_rate", None)
+    cross_attention_ids = diffusion_config.get("cross_attention_cond_ids", [])
+    global_cond_ids = diffusion_config.get("global_cond_ids", [])
+    input_concat_ids = diffusion_config.get("input_concat_ids", [])
+    local_add_cond_ids = diffusion_config.get("local_add_cond_ids", [])
     modular_local_cond_ids = [c["id"] for c in modular_local_cond_configs]
-    prepend_cond_ids = diffusion_config.get('prepend_cond_ids', [])
+    prepend_cond_ids = diffusion_config.get("prepend_cond_ids", [])
 
     pretransform = model_config.get("pretransform", None)
 
-    distribution_shift_options = diffusion_config.get("distribution_shift_options", None)
-    sampling_distribution_shift_options = diffusion_config.get("sampling_distribution_shift_options", None)
+    distribution_shift_options = diffusion_config.get(
+        "distribution_shift_options", None
+    )
+    sampling_distribution_shift_options = diffusion_config.get(
+        "sampling_distribution_shift_options", None
+    )
     mask_padding_attention = diffusion_config.get("mask_padding_attention", False)
-    use_effective_length_for_schedule = diffusion_config.get("use_effective_length_for_schedule", False)
+    use_effective_length_for_schedule = diffusion_config.get(
+        "use_effective_length_for_schedule", False
+    )
 
     pretransform = create_autoencoder_from_config(model_config, sample_rate)
     min_input_length = pretransform.downsampling_ratio
 
-    conditioning_config = model_config.get('conditioning', None)
+    conditioning_config = model_config.get("conditioning", None)
 
     conditioner = create_multi_conditioner_from_conditioning_config(conditioning_config)
 
     min_input_length *= diffusion_model.model.patch_size
 
-    extra_kwargs= {"diffusion_objective": diffusion_objective}
-        
+    extra_kwargs = {"diffusion_objective": diffusion_objective}
+
     return ConditionedDiffusionModelWrapper(
         diffusion_model,
         conditioner,
@@ -64,8 +74,9 @@ def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
         sampling_distribution_shift_options=sampling_distribution_shift_options,
         mask_padding_attention=mask_padding_attention,
         use_effective_length_for_schedule=use_effective_length_for_schedule,
-        **extra_kwargs
+        **extra_kwargs,
     )
+
 
 def create_autoencoder_from_config(config, sample_rate):
     autoencoder_config = config["pretransform"]["config"]
@@ -96,7 +107,9 @@ def create_autoencoder_from_config(config, sample_rate):
     )
 
 
-def create_multi_conditioner_from_conditioning_config(config: tp.Dict[str, tp.Any]) -> MultiConditioner:
+def create_multi_conditioner_from_conditioning_config(
+    config: tp.Dict[str, tp.Any],
+) -> MultiConditioner:
     """
     Create a MultiConditioner from a conditioning config dictionary
 
@@ -106,7 +119,7 @@ def create_multi_conditioner_from_conditioning_config(config: tp.Dict[str, tp.An
     """
     conditioners = {}
     cond_dim = config["cond_dim"]
-    
+
     default_keys = config.get("default_keys", {})
 
     pre_encoded_keys = config.get("pre_encoded_keys", [])
@@ -117,9 +130,9 @@ def create_multi_conditioner_from_conditioning_config(config: tp.Dict[str, tp.An
         conditioner_type = conditioner_info["type"]
 
         conditioner_config = {"output_dim": cond_dim}
-        
+
         conditioner_config.update(conditioner_info["config"])
-    
+
         if conditioner_type == "t5gemma":
             conditioners[id] = T5GemmaConditioner(**conditioner_config)
         elif conditioner_type == "number":
@@ -127,4 +140,6 @@ def create_multi_conditioner_from_conditioning_config(config: tp.Dict[str, tp.An
         else:
             raise ValueError(f"Unknown conditioner type: {conditioner_type}")
 
-    return MultiConditioner(conditioners, default_keys=default_keys, pre_encoded_keys=pre_encoded_keys)
+    return MultiConditioner(
+        conditioners, default_keys=default_keys, pre_encoded_keys=pre_encoded_keys
+    )

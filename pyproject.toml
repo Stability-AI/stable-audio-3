@@ -49,3 +49,11 @@ torchaudio = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.9",
+]
+
+[tool.ruff]
+exclude = ["core", "inference", "interface", "data"]

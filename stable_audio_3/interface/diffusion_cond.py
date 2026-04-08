@@ -11,12 +11,12 @@ import os, time, math
 from einops import rearrange
 
 from stable_audio_3.interface.aeiou import audio_spectrogram_image
-from stable_audio_3.inference.generation import generate as generate_audio
+from stable_audio_3.pipeline import StableAudioPipeline
 from stable_audio_3.inference.distribution_shift import LogSNRShift, FluxDistributionShift, DistributionShift, IdentityDistributionShift
 from stable_audio_3.models.minlora import set_lora_strength, has_lora, get_lora_count
 
 
-model = None
+pipeline = None
 model_type = None
 sample_size = 2097152
 sample_rate = 44100
@@ -85,14 +85,6 @@ def generate_cond(
     if preview_every == 0:
         preview_every = None
 
-    #Get the device from the model
-    device = next(model.parameters()).device
-
-    seed = int(seed)
-    # if seed is -1, define the seed value now, randomly, so we can save it in the filename
-    if(seed==-1):
-        seed = np.random.randint(0, 2**32 - 1, dtype=np.uint32)
-    
     # Parse per-LoRA controls from trailing args
     # Each LoRA has 5 controls: dit_strength, cond_strength, interval_min, interval_max, layer_filter
     lora_configs = None
@@ -105,8 +97,8 @@ def generate_cond(
             interval_min = lora_args[off + 2]
             interval_max = lora_args[off + 3]
             layer_filter = lora_args[off + 4]
-            set_lora_strength(model.model, dit_strength, lora_index=i)
-            set_lora_strength(model.conditioner, cond_strength, lora_index=i)
+            set_lora_strength(pipeline.model.model, dit_strength, lora_index=i)
+            set_lora_strength(pipeline.model.conditioner, cond_strength, lora_index=i)
             lora_configs.append({
                 "lora_index": i,
                 "interval": (interval_min, interval_max),
@@ -135,8 +127,8 @@ def generate_cond(
             log_snr = math.log(((1 - sigma) / sigma) + 1e-6)
 
         if (current_step - 1) % preview_every == 0:
-            if model.pretransform is not None:
-                denoised = model.pretransform.decode(denoised)
+            if pipeline.model.pretransform is not None:
+                denoised = pipeline.model.pretransform.decode(denoised)
             denoised = rearrange(denoised, "b d n -> d (b n)")
             denoised = denoised.clamp(-1, 1).mul(32767).to(torch.int16).cpu()
             audio_spectrogram = audio_spectrogram_image(denoised, sample_rate=sample_rate)
@@ -154,7 +146,6 @@ def generate_cond(
         inversion_params = None
 
     generate_args = {
-        "model": model,
         "prompt": prompt,
         "negative_prompt": negative_prompt,
         "duration": seconds_total,
@@ -167,7 +158,6 @@ def generate_cond(
         "batch_size": batch_size,
         "sample_size": input_sample_size,
         "seed": seed,
-        "device": device,
         "sampler_type": sampler_type,
         "sigma_max": sigma_max,
         "init_audio": init_audio,
@@ -183,7 +173,7 @@ def generate_cond(
         "dist_shift": dist_shift,
     }
 
-     # If inpainting, send mask args
+    # If inpainting, send mask args
     # This will definitely change in the future
     if inpaint_audio is not None:
         generate_args.update({
@@ -192,7 +182,7 @@ def generate_cond(
             "inpaint_mask_end_seconds": mask_maskend,
         })
 
-    audio = generate_audio(**generate_args)
+    audio = pipeline.generate(**generate_args)
 
     # Filenaming convention
     prompt_condensed = condense_prompt(prompt) 
@@ -276,14 +266,14 @@ def create_sampling_ui(model_config):
 
     model_conditioning_config = model_config["model"].get("conditioning", None)
 
-    diffusion_objective = model.diffusion_objective
+    diffusion_objective = pipeline.model.diffusion_objective
     is_rf = diffusion_objective == "rectified_flow"
     is_rf_denoiser = diffusion_objective == "rf_denoiser" # includes ARC models
     is_v = diffusion_objective == "v"
 
     # Read from model wrapper (with fallback to training config for backward compat)
-    trained_with_effective_length = getattr(model, 'use_effective_length_for_schedule', False)
-    trained_with_masking = getattr(model, 'mask_padding_attention', False)
+    trained_with_effective_length = getattr(pipeline.model, 'use_effective_length_for_schedule', False)
+    trained_with_masking = getattr(pipeline.model, 'mask_padding_attention', False)
     if not trained_with_effective_length or not trained_with_masking:
         training_config = model_config.get("training", {})
         if not trained_with_effective_length:
@@ -293,7 +283,7 @@ def create_sampling_ui(model_config):
     mask_padding_attention = trained_with_masking
 
     # Extract default dist_shift params from model's sampling_dist_shift
-    default_sampling_dist_shift = getattr(model, 'sampling_dist_shift', None)
+    default_sampling_dist_shift = getattr(pipeline.model, 'sampling_dist_shift', None)
     default_dist_shift_type = "LogSNR"
     default_logsnr_params = {"anchor_length": 2000, "anchor_logsnr": -6.2, "rate": 0.0, "logsnr_end": 2.0}
     default_flux_params = {"min_length": 256, "max_length": 4096, "alpha_min": 6.93, "alpha_max": 6.93}
@@ -330,8 +320,8 @@ def create_sampling_ui(model_config):
     has_seconds_total = False
     has_lyrics = False
 
-    use_lora = has_lora(model)
-    lora_names = getattr(model, 'lora_names', [])
+    use_lora = has_lora(pipeline.model)
+    lora_names = getattr(pipeline.model, 'lora_names', [])
     n_loras = len(lora_names)
 
     if model_conditioning_config is not None:
@@ -597,9 +587,10 @@ def create_sampling_ui(model_config):
         api_name="generate")
 
 def create_diffusion_cond_ui(model_config, in_model, in_model_half=True, gradio_title=""):
-    global model, sample_size, sample_rate, model_type, model_half
+    global pipeline, sample_size, sample_rate, model_type, model_half
 
-    model = in_model
+    device = next(in_model.parameters()).device
+    pipeline = StableAudioPipeline(in_model, model_config, device)
     sample_size = model_config["sample_size"]
     sample_rate = model_config["sample_rate"]
     model_type = model_config["model_type"]

@@ -37,8 +37,6 @@ def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
     modular_local_cond_ids = [c["id"] for c in modular_local_cond_configs]
     prepend_cond_ids = diffusion_config.get("prepend_cond_ids", [])
 
-    pretransform = model_config.get("pretransform", None)
-
     distribution_shift_options = diffusion_config.get(
         "distribution_shift_options", None
     )
@@ -59,8 +57,6 @@ def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
 
     min_input_length *= diffusion_model.model.patch_size
 
-    extra_kwargs = {"diffusion_objective": diffusion_objective}
-
     return ConditionedDiffusionModelWrapper(
         diffusion_model,
         conditioner,
@@ -78,7 +74,7 @@ def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
         sampling_distribution_shift_options=sampling_distribution_shift_options,
         mask_padding_attention=mask_padding_attention,
         use_effective_length_for_schedule=use_effective_length_for_schedule,
-        **extra_kwargs,
+        diffusion_objective=diffusion_objective,
     )
 
 
@@ -114,13 +110,7 @@ def create_autoencoder_from_config(config, sample_rate):
 def create_multi_conditioner_from_conditioning_config(
     config: tp.Dict[str, tp.Any],
 ) -> MultiConditioner:
-    """
-    Create a MultiConditioner from a conditioning config dictionary
-
-    Args:
-        config: the conditioning config dictionary
-        device: the device to put the conditioners on
-    """
+    """Create a MultiConditioner from a conditioning config dictionary."""
     conditioners = {}
     cond_dim = config["cond_dim"]
 

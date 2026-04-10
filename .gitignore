@@ -163,7 +163,6 @@ cython_debug/
 *.wav
 wandb/*
 *.out
-test_*
 
 .gradio
 .DS_Store

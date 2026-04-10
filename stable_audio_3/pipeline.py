@@ -40,21 +40,20 @@ class StableAudioPipeline:
     def generate(
         self,
         # Simple path: pass a prompt string and duration
-        prompt: str = None,
-        duration: float = 120,
-        seconds_start: float = 0,
-        lyrics: tp.Optional[str] = None,
-        negative_prompt: str = None,
-        # Low-level path: pass pre-built conditioning dicts
-        conditioning: tp.Optional[tp.List[dict]] = None,
-        conditioning_tensors: tp.Optional[dict] = None,
-        negative_conditioning: tp.Optional[tp.List[dict]] = None,
-        negative_conditioning_tensors: tp.Optional[dict] = None,
+        prompt: str | list = None,
+        negative_prompt: str | list = None,
+        duration: float | list = 120,
         # Generation parameters
         steps: int = 8,
         cfg_scale: float = 1.0,
         batch_size: int = 1,
         sample_size: int = 5292032,
+        truncate_output_to_duration: bool = True,
+        # Low-level path: pass pre-built conditioning dicts
+        conditioning: tp.Optional[tp.List[dict]] = None,
+        conditioning_tensors: tp.Optional[dict] = None,
+        negative_conditioning: tp.Optional[tp.List[dict]] = None,
+        negative_conditioning_tensors: tp.Optional[dict] = None,
         seed: int = -1,
         # Audio inputs
         init_audio: tp.Optional[tp.Tuple[int, torch.Tensor]] = None,
@@ -83,18 +82,28 @@ class StableAudioPipeline:
             pipeline.generate(conditioning=[{"prompt": "...", "seconds_total": 30}], steps=100, ...)
 
         Args:
+            prompt: The text prompt to condition on. Ignored if conditioning dicts are provided directly.
+            negative_prompt: The negative text prompt for classifier-free guidance. Ignored if negative_conditioning dicts are provided directly.
+            duration: The duration of the generated audio in seconds. Only used if conditioning dicts with "seconds_total" are not provided.
             steps: The number of diffusion steps to use.
             cfg_scale: Classifier-free guidance scale
-            conditioning: A dictionary of conditioning parameters to use for generation.
-            conditioning_tensors: A dictionary of precomputed conditioning tensors to use for generation.
             batch_size: The batch size to use for generation.
             sample_size: The length of the audio to generate, in samples.
-            sample_rate: The sample rate of the audio to generate (Deprecated, now pulled from the model directly)
+            truncate_output_to_duration: If True, truncate the output audio to the specified duration.
+            conditioning: A dictionary of conditioning parameters to use for generation.
+            conditioning_tensors: A dictionary of precomputed conditioning tensors to use for generation.
+            negative_conditioning: A dictionary of negative conditioning parameters for classifier-free guidance.
+            negative_conditioning_tensors: A dictionary of precomputed negative conditioning tensors for classifier-free guidance
             seed: The random seed to use for generation, or -1 to use a random seed.
-            device: The device to use for generation.
             init_audio: A tuple of (sample_rate, audio) to use as the initial audio for generation.
             init_noise_level: The noise level to use when generating from an initial audio sample.
-            return_latents: Whether to return the latents used for generation instead of the decoded audio.
+            inpaint_audio: A tuple of (sample_rate, audio) to use as the source audio for inpainting. The inpaint region will be determined by the inpaint_mask or inpaint_mask_start_seconds/inpaint_mask_end_seconds parameters.
+            inpaint_mask: A prebuilt mask tensor for inpainting. Shape should be [batch_size, sample_size].
+                When adapt_duration_to_conditioning is True, the mask length should match the adapted audio_sample_size.
+                Ignored if inpaint_mask_start_seconds/inpaint_mask_end_seconds are provided.
+            inpaint_mask_start_seconds: Start of the inpaint region in seconds. The mask will be built internally
+                at the correct audio_sample_size (after duration adaptation), so positions are always accurate.
+            inpaint_mask_end_seconds: End of the inpaint region in seconds.
             adapt_duration_to_conditioning: If True, adapt the sample size based on seconds_total in conditioning plus duration_padding_sec.
                 This enables variable-length generation for models trained with padding masking.
             duration_padding_sec: Extra seconds to add when adapting duration (default 6.0).
@@ -104,6 +113,7 @@ class StableAudioPipeline:
                 Only needed when generating at full sequence length but wanting to mask padding.
             apg_scale: APG (Adaptive Projected Guidance) scale. 1.0 = full APG, 0.0 = vanilla CFG.
             dist_shift: Optional distribution shift override for sampling. If None, uses model.sampling_dist_shift.
+            return_latents: Whether to return the latents used for generation instead of the decoded audio.
             **sampler_kwargs: Additional keyword arguments to pass to the sampler.
         """
 
@@ -113,22 +123,44 @@ class StableAudioPipeline:
         # Build conditioning from prompt string if not provided directly
         if conditioning is None and conditioning_tensors is None:
             assert prompt is not None, "Must provide either prompt or conditioning"
-            cond_dict = {
-                "prompt": prompt,
-                "seconds_start": seconds_start,
-                "seconds_total": duration,
-            }
-            if lyrics:
-                cond_dict["lyrics"] = lyrics
-            conditioning = [cond_dict] * batch_size
+            if isinstance(prompt, str):
+                cond_dict = {
+                    "prompt": prompt,
+                    "seconds_total": duration,
+                }
+                conditioning = [cond_dict] * batch_size
+            else:
+                assert len(prompt) == batch_size, (
+                    "When passing a list of prompts, the length must match the batch size"
+                )
+                if isinstance(duration, (int, float)):
+                    cond_dicts = []
+                    for p in prompt:
+                        cond_dicts.append(
+                            {
+                                "prompt": p,
+                                "seconds_total": duration,
+                            }
+                        )
+                else:
+                    assert len(prompt) == len(duration), (
+                        "When passing a list of prompts and durations, the length of durations must match the length of prompts"
+                    )
+                    cond_dicts = []
+                    for p, d in zip(prompt, duration):
+                        cond_dicts.append(
+                            {
+                                "prompt": p,
+                                "seconds_total": d,
+                            }
+                        )
+                conditioning = cond_dicts
+
             if negative_prompt:
                 neg_dict = {
                     "prompt": negative_prompt,
-                    "seconds_start": seconds_start,
                     "seconds_total": duration,
                 }
-                if lyrics:
-                    neg_dict["lyrics"] = lyrics
                 negative_conditioning = [neg_dict] * batch_size
         # The length of the output in audio samples
         audio_sample_size = sample_size
@@ -364,7 +396,22 @@ class StableAudioPipeline:
             decode=not return_latents,
             **sampler_kwargs,
         )
-        print(f"Generated audio with shape {result.shape} and dtype {result.dtype}")
+        if not return_latents:
+            result = result.to(torch.float32).clamp(-1, 1)
+
+        if not return_latents and truncate_output_to_duration:
+            if isinstance(duration, (int, float)):
+                max_length_samples = int(duration * model.sample_rate)
+                result = result[:, :, :max_length_samples]
+            else:
+                if torch.all(torch.tensor(duration) == duration[0]):
+                    max_length_samples = int(duration[0] * model.sample_rate)
+                    result = result[:, :, :max_length_samples]
+                else:
+                    # Warn that we can't truncate to a single duration if the durations are different, and return the full length output
+                    print(
+                        "Warning: Cannot truncate output to a single duration when passing a list of different durations"
+                    )
         return result
 
     @staticmethod

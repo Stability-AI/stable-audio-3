@@ -40,8 +40,6 @@ def condense_prompt(prompt):
 def generate_cond(
         prompt,
         negative_prompt=None,
-        lyrics_prompt=None,
-        seconds_start=0,
         seconds_total=30,
         cfg_scale=6.0,
         steps=250,
@@ -120,11 +118,7 @@ def generate_cond(
         if isinstance(sigma, torch.Tensor):
             sigma = sigma[0].item() if sigma.dim() > 0 else sigma.item()
 
-        if diffusion_objective == "v":
-            alphas, sigmas = math.cos(t * math.pi / 2), math.sin(t * math.pi / 2)
-            log_snr = math.log((alphas / sigmas) + 1e-6)
-        elif diffusion_objective in ["rectified_flow", "rf_denoiser"]:
-            log_snr = math.log(((1 - sigma) / sigma) + 1e-6)
+        log_snr = math.log(((1 - sigma) / sigma) + 1e-6)
 
         if (current_step - 1) % preview_every == 0:
             if pipeline.model.pretransform is not None:
@@ -149,8 +143,6 @@ def generate_cond(
         "prompt": prompt,
         "negative_prompt": negative_prompt,
         "duration": seconds_total,
-        "seconds_start": seconds_start,
-        "lyrics": lyrics_prompt if lyrics_prompt else None,
         "steps": steps,
         "cfg_scale": cfg_scale,
         "cfg_interval": (cfg_interval_min, cfg_interval_max),
@@ -214,7 +206,6 @@ def generate_cond(
 
     # Encode the audio to WAV format
     audio = rearrange(audio, "b d n -> d (b n)")
-    #audio = audio.to(torch.float32).div(torch.max(torch.abs(audio))).clamp(-1, 1).mul(32767).to(torch.int16).cpu()
     audio = audio.to(torch.float32).clamp(-1, 1).mul(32767).to(torch.int16).cpu()
 
     # save as wav file
@@ -269,7 +260,6 @@ def create_sampling_ui(model_config):
     diffusion_objective = pipeline.model.diffusion_objective
     is_rf = diffusion_objective == "rectified_flow"
     is_rf_denoiser = diffusion_objective == "rf_denoiser" # includes ARC models
-    is_v = diffusion_objective == "v"
 
     # Read from model wrapper (with fallback to training config for backward compat)
     trained_with_effective_length = getattr(pipeline.model, 'use_effective_length_for_schedule', False)
@@ -316,35 +306,23 @@ def create_sampling_ui(model_config):
     elif default_sampling_dist_shift is None:
         default_dist_shift_type = "None"
 
-    has_seconds_start = False
-    has_seconds_total = False
-    has_lyrics = False
+    has_seconds_total = True
 
     use_lora = has_lora(pipeline.model)
     lora_names = getattr(pipeline.model, 'lora_names', [])
     n_loras = len(lora_names)
 
-    if model_conditioning_config is not None:
-        for conditioning_config in model_conditioning_config["configs"]:
-            if conditioning_config["id"] == "seconds_start":
-                has_seconds_start = True
-            if conditioning_config["id"] == "seconds_total":
-                has_seconds_total = True
-            if conditioning_config["id"] == "lyrics":
-                has_lyrics = True
 
     with gr.Row():
         with gr.Column(scale=6):
             prompt = gr.Textbox(show_label=False, placeholder="Prompt")
             negative_prompt = gr.Textbox(show_label=False, placeholder="Negative prompt")
-            lyrics_textbox = gr.Textbox(show_label=False, placeholder="Lyrics", lines=7, visible=has_lyrics)
         generate_button = gr.Button("Generate", variant='primary', scale=1)
 
     with gr.Row(equal_height=False):
         with gr.Column():
-            with gr.Row(visible = has_seconds_start or has_seconds_total):
+            with gr.Row(visible = True):
                 # Timing controls
-                seconds_start_slider = gr.Slider(minimum=0, maximum=512, step=1, value=0, label="Seconds start", visible=has_seconds_start)
                 seconds_total_slider = gr.Slider(minimum=0, maximum=512, step=1, value=sample_size//sample_rate, label="Seconds total", visible=has_seconds_total)
             
             with gr.Row():
@@ -353,8 +331,6 @@ def create_sampling_ui(model_config):
                     default_steps = 50
                 elif is_rf_denoiser:
                     default_steps = 8
-                else:
-                    default_steps = 100
                     
                 steps_slider = gr.Slider(minimum=1, maximum=500, step=1, value=default_steps, label="Steps")
                 # CFG scale 
@@ -491,9 +467,9 @@ def create_sampling_ui(model_config):
             # Default generation tab
             with gr.Accordion("Init audio", open=False):
                 init_audio_input = gr.Audio(label="Init audio", waveform_options=gr.WaveformOptions(show_recording_waveform=False))
-                min_noise_level = 0.1 if is_v else 0.01
-                max_noise_level = 100.0 if is_v else 1.0
-                default_noise_level = 8 if is_v else 0.9 # roughly halfway style transfer values
+                min_noise_level = 0.01
+                max_noise_level = 1.0
+                default_noise_level = 0.9 # roughly halfway style transfer values
                 if is_rf:
                     choices = ["Init audio","RF-Inversion"]
                 else:
@@ -534,8 +510,6 @@ def create_sampling_ui(model_config):
             inputs = [
                 prompt,
                 negative_prompt,
-                lyrics_textbox,
-                seconds_start_slider,
                 seconds_total_slider,
                 cfg_scale_slider,
                 steps_slider,

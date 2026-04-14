@@ -12,16 +12,20 @@ Stable Audio 3 is the next generation of Stable Audio: a focused, streamlined pl
 
 ## Models
 
-| RF Model | Autoencoder | Hardware | Params | Use case |
-|---|---|---|---|---|
-| **Stable Audio 3 Small** | SAME-Small | CPU | 433M | Lightweight inference, no GPU required |
-| **Stable Audio 3 Medium** | SAME-Large | GPU (CUDA) | 1.4B | High Quality, Fast Inference |
-| **Stable Audio 3 Large** | SAME-Large | API only | 1.7B | Highest quality, API only. Not supported by this repo, see the [API docs](#) |
-
+| RF Model | Autoencoder | Hardware | Params | Latency† | Use case |
+|---|---|---|---|---|---|
+| **Stable Audio 3 Small** | SAME-Small | CPU | 433M | 20ms | Lightweight inference, no GPU required |
+| **Stable Audio 3 Medium** | SAME-Large | GPU (CUDA) | 1.4B | 20ms | High Quality, Fast Inference |
+| **Stable Audio 3 Large** | SAME-Large | API only | 1.7B | 20ms | Highest quality, API only. Not supported by this repo, see the [API docs](#) |
 ---
 
+<sub>† Measured generating a 380s clip at 8 steps. Small: Apple M4 CPU. Medium: Intel x86 + NVIDIA H100.</sub>
+
 ## Features
-SAME
+- SAME
+- Hardware
+
+
 
 ## Installation
 
@@ -48,7 +52,6 @@ Stable Audio 3 Medium requires [Flash Attention](https://github.com/Dao-AILab/fl
 
 ## Usage
 
-## Flash attention (What I had to do)
 
 ## Hardware Support
 
@@ -84,7 +87,9 @@ model = StableAudioPipeline.from_pretrained(
 
 [Stability AI Community License](#)
 
----
+
+To use this model commercially, please refer to https://stability.ai/license
+
 
 ## Testing
 

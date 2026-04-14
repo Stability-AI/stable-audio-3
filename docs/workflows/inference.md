@@ -18,6 +18,7 @@ audio = pipe.generate(
     duration=30,
     steps=8, # default
     cfg_scale=1, # default
+    seed=-1, # default
     batch_size=1 # default
 )
 ```
@@ -30,6 +31,7 @@ Overview of the main controls
 - **`duration`** — Duration of the generated audio in seconds (default: `120`).
 - **`steps`** — Number of sampling steps (default: `8`). With ARC trained-models (default), you generally don't want to go higher than 8. For even faster inference, reduce this number, which may reduce audio quality.
 - **`cfg_scale`** — Classifier-free guidance scale (default: `1.0`). Higher values make the output adhere more closely to the prompt; lower values give the model more creative freedom.
+- **`seed`** - Random seed for reproducible outputs if needed. Use -1 to select a random seed (default) or select your favorite number for deterministic results.
 - **`batch_size`** - Generate multiple at once, useful is you have a GPU and want to get a lot of variations. The max is limited by your GPU's VRAM.
 
 ## Audio-To-Audio

@@ -46,7 +46,7 @@ uv sync --extra cuda --extra ui
 ```
 
 ### Flash Attention
-Stable Audio 3 Medium requires [Flash Attention](https://github.com/Dao-AILab/flash-attention), follow the instructions from there to install
+Stable Audio 3 Medium requires [Flash Attention](https://github.com/Dao-AILab/flash-attention), follow the instructions from there to install.
 
 ## Quick Start
 
@@ -80,6 +80,21 @@ model = StableAudioPipeline.from_pretrained(
 - [LoRA training guide](#)
 - [Prompt and control guide](#)
 - [Hardware setup](#)
+
+---
+
+## Troublshooting
+
+#### Output audio is a static glitch sound (affects Stable Audio 3 Medium-only)
+
+Likely an issue with flash-attention. Please make sure flash attention is installed correctly. 
+You can check with
+
+```
+python -c "import flash_attn; from flash_attn import flash_attn_func; print('Version:', flash_attn.__version__, '| flash_attn_func:', flash_attn_func)"
+```
+
+if there are errors in any of this, flash_attn is not installed correctly. 
 
 ---
 

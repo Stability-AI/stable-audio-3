@@ -7,7 +7,7 @@ model_half = True
 
 def main(args):
     torch.manual_seed(42)
-    pipe = StableAudioPipeline.from_pretrained("test")
+    pipe = StableAudioPipeline.from_pretrained("medium")
     interface = create_diffusion_cond_ui(
         pipe.model_config,
         pipe.model,
@@ -17,7 +17,6 @@ def main(args):
     interface.queue()
     interface.launch(
         share=True,
-        auth=(args.username, args.password) if args.username is not None else None,
         js=getattr(interface, "_sao_js", None),
         theme=getattr(interface, "_sao_theme", None),
     )

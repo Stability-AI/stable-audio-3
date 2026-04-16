@@ -24,5 +24,9 @@ def test_encode_decode(model_pipe):
     min_len = min(audio.shape[-1], recon.shape[-1])
     orig_flat = audio[..., :min_len].flatten().float()
     recon_flat = recon[0, ..., :min_len].flatten().float()
-    similarity = F.cosine_similarity(orig_flat.unsqueeze(0), recon_flat.unsqueeze(0)).item()
-    assert similarity > 0.5, f"Reconstruction cosine similarity too low: {similarity:.3f}"
+    similarity = F.cosine_similarity(
+        orig_flat.unsqueeze(0), recon_flat.unsqueeze(0)
+    ).item()
+    assert similarity > 0.5, (
+        f"Reconstruction cosine similarity too low: {similarity:.3f}"
+    )

@@ -59,9 +59,10 @@ def model_pipe(request):
         if not HAS_ACCEL:
             pytest.skip("Medium model requires a GPU/accelerator — none detected")
         # TODO: wire up once medium checkpoint is available on HuggingFace
-        pytest.skip(
-            "Medium model not yet configured — update from_pretrained call when ready"
-        )
+        # pytest.skip(
+        #     "Medium model not yet configured — update from_pretrained call when ready"
+        # )
+        return StableAudioPipeline.from_pretrained("medium")
 
 
 @pytest.fixture

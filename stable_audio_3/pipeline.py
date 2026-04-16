@@ -23,8 +23,10 @@ from stable_audio_3.models.minlora import (
 
 # MODEL_CONFIG_PATH = "44k_taae_4096_256_2_ct_dit_cond_t5gemma_380s_asx_large2_inpaint_ot_varlen_muon.json"
 # CKPT_PATH = "4096_256_taaev2_rc2_base_cond_t5gemma_380s_inpaint_asxmi_varlen_muon_82k_unwrap.ckpt"
-MODEL_CONFIG_PATH = "SA3-S-ARC-CLAP.json"
-CKPT_PATH = "SA3-S-ARC-CLAP-5k.ckpt"
+SMALL_MODEL_CONFIG_PATH = "SA3-S-ARC-CLAP.json"
+SMALL_CKPT_PATH = "SA3-S-ARC-CLAP-5k.ckpt"
+MEDIUM_MODEL_CONFIG_PATH = "SA3-M-ARC-CLAP.json"
+MEDIUM_CKPT_PATH = "SA3-M-ARC-50k.ckpt"
 SEED = 124
 
 
@@ -418,6 +420,12 @@ class StableAudioPipeline:
     def from_pretrained(model_name_or_path, model_half=False):
         # Load the model and any necessary components here
         ## TODO: Work with HuggingFace Hub to load models
+        if model_name_or_path == "small":
+            MODEL_CONFIG_PATH = SMALL_MODEL_CONFIG_PATH
+            CKPT_PATH = SMALL_CKPT_PATH
+        elif model_name_or_path == "medium":
+            MODEL_CONFIG_PATH = MEDIUM_MODEL_CONFIG_PATH
+            CKPT_PATH = MEDIUM_CKPT_PATH
         with open(MODEL_CONFIG_PATH) as f:
             model_config = json.load(f)
 

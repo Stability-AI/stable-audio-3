@@ -21,8 +21,6 @@ from stable_audio_3.models.minlora import (
 )
 
 
-# MODEL_CONFIG_PATH = "44k_taae_4096_256_2_ct_dit_cond_t5gemma_380s_asx_large2_inpaint_ot_varlen_muon.json"
-# CKPT_PATH = "4096_256_taaev2_rc2_base_cond_t5gemma_380s_inpaint_asxmi_varlen_muon_82k_unwrap.ckpt"
 SMALL_MODEL_CONFIG_PATH = "SA3-S-ARC-CLAP.json"
 SMALL_CKPT_PATH = "SA3-S-ARC-CLAP-5k.ckpt"
 MEDIUM_MODEL_CONFIG_PATH = "SA3-M-ARC-CLAP.json"
@@ -37,6 +35,29 @@ class StableAudioPipeline:
         self.device = device
         self.same = self.model.pretransform
         self.dit = self.model.model
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+        torch.backends.cudnn.benchmark = False
+
+    @staticmethod
+    def from_pretrained(model_name_or_path, model_half=False):
+        # Load the model and any necessary components here
+        ## TODO: Work with HuggingFace Hub to load models
+        if model_name_or_path == "small":
+            MODEL_CONFIG_PATH = SMALL_MODEL_CONFIG_PATH
+            CKPT_PATH = SMALL_CKPT_PATH
+        elif model_name_or_path == "medium":
+            MODEL_CONFIG_PATH = MEDIUM_MODEL_CONFIG_PATH
+            CKPT_PATH = MEDIUM_CKPT_PATH
+        with open(MODEL_CONFIG_PATH) as f:
+            model_config = json.load(f)
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model, model_config = StableAudioPipeline._load_model(
+            model_config, CKPT_PATH, model_half=model_half, device=device
+        )
+        return StableAudioPipeline(model, model_config, device)
 
     @torch.inference_mode()
     def generate(
@@ -64,11 +85,8 @@ class StableAudioPipeline:
         inpaint_mask=None,
         inpaint_mask_start_seconds: tp.Optional[float] = None,
         inpaint_mask_end_seconds: tp.Optional[float] = None,
-        # Duration / schedule options
-        adapt_duration_to_conditioning: bool = True,
+        # Schedule options
         duration_padding_sec: float = 6.0,
-        use_effective_length_for_schedule: bool = False,
-        mask_padding_attention: bool = False,
         apg_scale: float = 1.0,
         dist_shift=None,
         return_latents: bool = False,
@@ -101,132 +119,41 @@ class StableAudioPipeline:
             init_noise_level: The noise level to use when generating from an initial audio sample.
             inpaint_audio: A tuple of (sample_rate, audio) to use as the source audio for inpainting. The inpaint region will be determined by the inpaint_mask or inpaint_mask_start_seconds/inpaint_mask_end_seconds parameters.
             inpaint_mask: A prebuilt mask tensor for inpainting. Shape should be [batch_size, sample_size].
-                When adapt_duration_to_conditioning is True, the mask length should match the adapted audio_sample_size.
                 Ignored if inpaint_mask_start_seconds/inpaint_mask_end_seconds are provided.
-            inpaint_mask_start_seconds: Start of the inpaint region in seconds. The mask will be built internally
-                at the correct audio_sample_size (after duration adaptation), so positions are always accurate.
+            inpaint_mask_start_seconds: Start of the inpaint region in seconds.
             inpaint_mask_end_seconds: End of the inpaint region in seconds.
-            adapt_duration_to_conditioning: If True, adapt the sample size based on seconds_total in conditioning plus duration_padding_sec.
-                This enables variable-length generation for models trained with padding masking.
             duration_padding_sec: Extra seconds to add when adapting duration (default 6.0).
-            use_effective_length_for_schedule: If True, use effective_seq_len for distribution shift.
-                Enable this for models trained with use_effective_length_for_schedule=True.
-            mask_padding_attention: If True, create padding_mask for attention based on effective_seq_len.
-                Only needed when generating at full sequence length but wanting to mask padding.
             apg_scale: APG (Adaptive Projected Guidance) scale. 1.0 = full APG, 0.0 = vanilla CFG.
             dist_shift: Optional distribution shift override for sampling. If None, uses model.sampling_dist_shift.
             return_latents: Whether to return the latents used for generation instead of the decoded audio.
             **sampler_kwargs: Additional keyword arguments to pass to the sampler.
         """
 
-        model = self.model
         device = str(self.device)
 
         # Build conditioning from prompt string if not provided directly
         if conditioning is None and conditioning_tensors is None:
             assert prompt is not None, "Must provide either prompt or conditioning"
-            if isinstance(prompt, str):
-                cond_dict = {
-                    "prompt": prompt,
-                    "seconds_total": duration,
-                }
-                conditioning = [cond_dict] * batch_size
-            else:
-                assert len(prompt) == batch_size, (
-                    "When passing a list of prompts, the length must match the batch size"
-                )
-                if isinstance(duration, (int, float)):
-                    cond_dicts = []
-                    for p in prompt:
-                        cond_dicts.append(
-                            {
-                                "prompt": p,
-                                "seconds_total": duration,
-                            }
-                        )
-                else:
-                    assert len(prompt) == len(duration), (
-                        "When passing a list of prompts and durations, the length of durations must match the length of prompts"
-                    )
-                    cond_dicts = []
-                    for p, d in zip(prompt, duration):
-                        cond_dicts.append(
-                            {
-                                "prompt": p,
-                                "seconds_total": d,
-                            }
-                        )
-                conditioning = cond_dicts
+            conditioning, negative_conditioning = self._build_conditioning_dicts(
+                prompt, negative_prompt, duration, batch_size
+            )
 
-            if negative_prompt:
-                neg_dict = {
-                    "prompt": negative_prompt,
-                    "seconds_total": duration,
-                }
-                negative_conditioning = [neg_dict] * batch_size
-        # The length of the output in audio samples
+        # Adapt sample size based on seconds_total in conditioning
         audio_sample_size = sample_size
-
-        # Read from model wrapper (with fallback to training config for backward compat)
-        trained_with_effective_length = getattr(
-            model, "use_effective_length_for_schedule", False
-        )
-        trained_with_masking = getattr(model, "mask_padding_attention", False)
-        adapt_duration_to_conditioning = (
-            adapt_duration_to_conditioning or trained_with_masking
-        )
-        if not trained_with_effective_length or not trained_with_masking:
-            training_config = self.model_config.get("training", {})
-            if not trained_with_effective_length:
-                trained_with_effective_length = training_config.get(
-                    "use_effective_length_for_schedule", False
-                )
-            if not trained_with_masking:
-                trained_with_masking = training_config.get(
-                    "mask_padding_attention", False
-                )
-        use_effective_length_for_schedule = (
-            use_effective_length_for_schedule or trained_with_effective_length
-        )
-        mask_padding_attention = mask_padding_attention or trained_with_masking
-        # Optionally adapt sample size based on seconds_total conditioning
-        if adapt_duration_to_conditioning and conditioning is not None:
-            max_seconds = 0.0
-            for cond_dict in conditioning:
-                if "seconds_total" in cond_dict:
-                    max_seconds = max(max_seconds, cond_dict["seconds_total"])
-
-            if max_seconds > 0:
-                target_audio_samples = int(
-                    (max_seconds + duration_padding_sec) * model.sample_rate
-                )
-                latent_align = 1
-                if model.pretransform is not None:
-                    ds_ratio = model.pretransform.downsampling_ratio
-                    # Round up to nearest multiple of downsampling ratio
-                    target_audio_samples = (
-                        (target_audio_samples + ds_ratio - 1) // ds_ratio
-                    ) * ds_ratio
-                    encoder_config = self.model_config["model"]["pretransform"][
-                        "config"
-                    ]["encoder"]["config"]
-                    chunk_size = encoder_config.get("chunk_size", 32)
-                    stride = encoder_config["strides"][0]  # or min(strides) if multiple
-                    latent_align = (
-                        chunk_size // stride
-                    )  # For chunked attention with latent space, we need to align to the chunk size after downsampling
-                    align = ds_ratio * latent_align
-                    target_audio_samples = (
-                        (target_audio_samples + align - 1) // align
-                    ) * align
-
-                audio_sample_size = min(target_audio_samples, sample_size)
+        if conditioning is not None:
+            audio_sample_size = self._adapt_sample_size(
+                conditioning,
+                sample_size,
+                self.model,
+                self.model_config,
+                duration_padding_sec,
+            )
 
         # Convert audio sample size to latent size
         latent_sample_size = audio_sample_size
-        if model.pretransform is not None:
+        if self.model.pretransform is not None:
             latent_sample_size = (
-                audio_sample_size // model.pretransform.downsampling_ratio
+                audio_sample_size // self.model.pretransform.downsampling_ratio
             )
 
         # Build inpaint mask from seconds if provided
@@ -235,10 +162,12 @@ class StableAudioPipeline:
             and inpaint_mask_end_seconds is not None
         ):
             mask_start_samples = min(
-                int(inpaint_mask_start_seconds * model.sample_rate), audio_sample_size
+                int(inpaint_mask_start_seconds * self.model.sample_rate),
+                audio_sample_size,
             )
             mask_end_samples = min(
-                int(inpaint_mask_end_seconds * model.sample_rate), audio_sample_size
+                int(inpaint_mask_end_seconds * self.model.sample_rate),
+                audio_sample_size,
             )
             inpaint_mask = torch.ones(1, audio_sample_size, device=device)
             inpaint_mask[:, mask_start_samples:mask_end_samples] = 0
@@ -246,27 +175,22 @@ class StableAudioPipeline:
         if inpaint_mask is not None:
             inpaint_mask = inpaint_mask.float()
 
-        # Seed
+        # Seed and noise
         seed = seed if seed != -1 else np.random.randint(0, 2**32 - 1)
         torch.manual_seed(seed)
         noise = torch.randn(
-            [batch_size, model.io_channels, latent_sample_size], device=device
+            [batch_size, self.model.io_channels, latent_sample_size], device=device
         )
-
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
-        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
-        torch.backends.cudnn.benchmark = False
 
         # Encode conditioning
         if conditioning_tensors is None:
-            conditioning_tensors = model.conditioner(conditioning, device)
+            conditioning_tensors = self.model.conditioner(conditioning, device)
         if (
             negative_conditioning is not None
             or negative_conditioning_tensors is not None
         ):
             if negative_conditioning_tensors is None:
-                negative_conditioning_tensors = model.conditioner(
+                negative_conditioning_tensors = self.model.conditioner(
                     negative_conditioning, device
                 )
         else:
@@ -274,61 +198,16 @@ class StableAudioPipeline:
 
         # Process init audio
         if init_audio is not None:
-            in_sr, audio_data = init_audio
-            if isinstance(audio_data, np.ndarray):
-                audio_data = numpy_audio_to_tensor(audio_data)
-            in_sr, init_audio = (in_sr, audio_data)
-            io_channels = (
-                model.pretransform.io_channels
-                if model.pretransform is not None
-                else model.io_channels
+            init_audio, inpaint_mask = self._encode_audio_input(
+                init_audio, audio_sample_size, self.model, device, inpaint_mask
             )
-            init_audio = prepare_audio(
-                init_audio,
-                in_sr=in_sr,
-                target_sr=model.sample_rate,
-                target_length=audio_sample_size,
-                target_channels=io_channels,
-                device=device,
-            )
-            if model.pretransform is not None:
-                init_audio = model.pretransform.encode(init_audio)
-                if inpaint_mask is not None:
-                    inpaint_mask = interpolate(
-                        inpaint_mask.unsqueeze(1),
-                        size=init_audio.shape[-1],
-                        mode="nearest",
-                    ).squeeze(1)
             init_audio = init_audio.repeat(batch_size, 1, 1)
 
         # Process inpaint audio
         if inpaint_audio is not None:
-            inpaint_sr, inpaint_data = inpaint_audio
-            if isinstance(inpaint_data, np.ndarray):
-                inpaint_data = numpy_audio_to_tensor(inpaint_data)
-            inpaint_sr, inpaint_audio = (inpaint_sr, inpaint_data)
-            io_channels = (
-                model.pretransform.io_channels
-                if model.pretransform is not None
-                else model.io_channels
+            inpaint_audio, inpaint_mask = self._encode_audio_input(
+                inpaint_audio, audio_sample_size, self.model, device, inpaint_mask
             )
-            inpaint_audio = prepare_audio(
-                inpaint_audio,
-                in_sr=inpaint_sr,
-                target_sr=model.sample_rate,
-                target_length=audio_sample_size,
-                target_channels=io_channels,
-                device=device,
-            )
-            if model.pretransform is not None:
-                inpaint_audio = model.pretransform.encode(inpaint_audio)
-                # inpaint_audio = inpaint_audio[..., :latent_sample_size]
-                if inpaint_mask is not None:
-                    inpaint_mask = interpolate(
-                        inpaint_mask.unsqueeze(1),
-                        size=inpaint_audio.shape[-1],
-                        mode="nearest",
-                    ).squeeze(1)
             inpaint_audio = inpaint_audio.repeat(batch_size, 1, 1)
         else:
             if inpaint_mask is not None:
@@ -336,7 +215,7 @@ class StableAudioPipeline:
                     inpaint_mask.unsqueeze(1), size=latent_sample_size, mode="nearest"
                 ).squeeze(1)
 
-        # Build inpaint mask tensor
+        # Build inpaint mask tensor and masked input
         if inpaint_mask is None:
             mask = torch.zeros((batch_size, 1, latent_sample_size), device=device)
         else:
@@ -347,22 +226,22 @@ class StableAudioPipeline:
             inpaint_audio * mask.expand_as(inpaint_audio)
             if inpaint_audio is not None
             else torch.zeros(
-                (batch_size, model.io_channels, latent_sample_size), device=device
+                (batch_size, self.model.io_channels, latent_sample_size), device=device
             )
         )
 
         conditioning_tensors["inpaint_mask"] = [mask]
         conditioning_tensors["inpaint_masked_input"] = [inpaint_input]
-        conditioning_inputs = model.get_conditioning_inputs(conditioning_tensors)
+        conditioning_inputs = self.model.get_conditioning_inputs(conditioning_tensors)
 
         if negative_conditioning_tensors:
             negative_conditioning_tensors["inpaint_mask"] = [mask]
             negative_conditioning_tensors["inpaint_masked_input"] = [inpaint_input]
-            negative_conditioning_tensors = model.get_conditioning_inputs(
+            negative_conditioning_tensors = self.model.get_conditioning_inputs(
                 negative_conditioning_tensors, negative=True
             )
 
-        model_dtype = next(model.model.parameters()).dtype
+        model_dtype = next(self.model.model.parameters()).dtype
         noise = noise.type(model_dtype)
         conditioning_inputs = {
             k: v.type(model_dtype) if v is not None else v
@@ -374,21 +253,21 @@ class StableAudioPipeline:
         sampler_type = sampler_kwargs.pop("sampler_type", None)
 
         result = sample_diffusion(
-            model=model.model,
+            model=self.model.model,
             noise=noise,
             cond_inputs=cond_inputs,
-            diffusion_objective=model.diffusion_objective,
+            diffusion_objective=self.model.diffusion_objective,
             steps=steps,
             cfg_scale=cfg_scale,
             conditioning=conditioning,
-            sample_rate=model.sample_rate,
-            pretransform=model.pretransform,
-            mask_padding_attention=mask_padding_attention,
-            use_effective_length_for_schedule=use_effective_length_for_schedule,
+            sample_rate=self.model.sample_rate,
+            pretransform=self.model.pretransform,
+            mask_padding_attention=True,
+            use_effective_length_for_schedule=True,
             headroom_seconds=duration_padding_sec,
             dist_shift=dist_shift
             if dist_shift is not None
-            else model.sampling_dist_shift,
+            else self.model.sampling_dist_shift,
             sampler_type=sampler_type,
             batch_cfg=True,
             rescale_cfg=True,
@@ -398,42 +277,127 @@ class StableAudioPipeline:
             decode=not return_latents,
             **sampler_kwargs,
         )
+
         if not return_latents:
             result = result.to(torch.float32).clamp(-1, 1)
 
         if not return_latents and truncate_output_to_duration:
             if isinstance(duration, (int, float)):
-                max_length_samples = int(duration * model.sample_rate)
+                max_length_samples = int(duration * self.model.sample_rate)
                 result = result[:, :, :max_length_samples]
             else:
                 if torch.all(torch.tensor(duration) == duration[0]):
-                    max_length_samples = int(duration[0] * model.sample_rate)
+                    max_length_samples = int(duration[0] * self.model.sample_rate)
                     result = result[:, :, :max_length_samples]
                 else:
                     # Warn that we can't truncate to a single duration if the durations are different, and return the full length output
                     print(
                         "Warning: Cannot truncate output to a single duration when passing a list of different durations"
                     )
+
         return result
 
-    @staticmethod
-    def from_pretrained(model_name_or_path, model_half=False):
-        # Load the model and any necessary components here
-        ## TODO: Work with HuggingFace Hub to load models
-        if model_name_or_path == "small":
-            MODEL_CONFIG_PATH = SMALL_MODEL_CONFIG_PATH
-            CKPT_PATH = SMALL_CKPT_PATH
-        elif model_name_or_path == "medium":
-            MODEL_CONFIG_PATH = MEDIUM_MODEL_CONFIG_PATH
-            CKPT_PATH = MEDIUM_CKPT_PATH
-        with open(MODEL_CONFIG_PATH) as f:
-            model_config = json.load(f)
+    # --- generate() helpers ---
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model, model_config = StableAudioPipeline._load_model(
-            model_config, CKPT_PATH, model_half=model_half, device=device
+    @staticmethod
+    def _build_conditioning_dicts(prompt, negative_prompt, duration, batch_size):
+        """Returns (conditioning, negative_conditioning) lists of dicts."""
+        if isinstance(prompt, str):
+            conditioning = [{"prompt": prompt, "seconds_total": duration}] * batch_size
+        else:
+            assert len(prompt) == batch_size, (
+                "When passing a list of prompts, the length must match the batch size"
+            )
+            if isinstance(duration, (int, float)):
+                conditioning = [
+                    {"prompt": p, "seconds_total": duration} for p in prompt
+                ]
+            else:
+                assert len(prompt) == len(duration), (
+                    "When passing a list of prompts and durations, the length of durations must match the length of prompts"
+                )
+                conditioning = [
+                    {"prompt": p, "seconds_total": d} for p, d in zip(prompt, duration)
+                ]
+
+        negative_conditioning = None
+        if negative_prompt:
+            negative_conditioning = [
+                {"prompt": negative_prompt, "seconds_total": duration}
+            ] * batch_size
+
+        return conditioning, negative_conditioning
+
+    @staticmethod
+    def _adapt_sample_size(
+        conditioning, sample_size, model, model_config, duration_padding_sec
+    ):
+        """Returns audio_sample_size adapted from conditioning, clamped to sample_size."""
+        max_seconds = 0.0
+        for cond_dict in conditioning:
+            if "seconds_total" in cond_dict:
+                max_seconds = max(max_seconds, cond_dict["seconds_total"])
+
+        if max_seconds <= 0:
+            return sample_size
+
+        target_audio_samples = int(
+            (max_seconds + duration_padding_sec) * model.sample_rate
         )
-        return StableAudioPipeline(model, model_config, device)
+        if model.pretransform is not None:
+            ds_ratio = model.pretransform.downsampling_ratio
+            # Round up to nearest multiple of downsampling ratio
+            target_audio_samples = (
+                (target_audio_samples + ds_ratio - 1) // ds_ratio
+            ) * ds_ratio
+            encoder_config = model_config["model"]["pretransform"]["config"]["encoder"][
+                "config"
+            ]
+            chunk_size = encoder_config.get("chunk_size", 32)
+            stride = encoder_config["strides"][0]  # or min(strides) if multiple
+            # For chunked attention with latent space, align to chunk size after downsampling
+            latent_align = chunk_size // stride
+            align = ds_ratio * latent_align
+            target_audio_samples = ((target_audio_samples + align - 1) // align) * align
+
+        return min(target_audio_samples, sample_size)
+
+    @staticmethod
+    def _encode_audio_input(
+        audio_input, audio_sample_size, model, device, inpaint_mask=None
+    ):
+        """
+        Converts a (sample_rate, audio) tuple to an encoded latent tensor.
+        If model has a pretransform, encodes to latent space and downsamples inpaint_mask to match.
+        Returns (encoded_audio, updated_inpaint_mask). encoded_audio is not yet repeated to batch size.
+        """
+        in_sr, audio_data = audio_input
+        if isinstance(audio_data, np.ndarray):
+            audio_data = numpy_audio_to_tensor(audio_data)
+        io_channels = (
+            model.pretransform.io_channels
+            if model.pretransform is not None
+            else model.io_channels
+        )
+        audio = prepare_audio(
+            audio_data,
+            in_sr=in_sr,
+            target_sr=model.sample_rate,
+            target_length=audio_sample_size,
+            target_channels=io_channels,
+            device=device,
+        )
+        if model.pretransform is not None:
+            audio = model.pretransform.encode(audio)
+            if inpaint_mask is not None:
+                inpaint_mask = interpolate(
+                    inpaint_mask.unsqueeze(1),
+                    size=audio.shape[-1],
+                    mode="nearest",
+                ).squeeze(1)
+        return audio, inpaint_mask
+
+    # --- _load_model() helpers ---
 
     @staticmethod
     def _load_model(
@@ -470,65 +434,9 @@ class StableAudioPipeline:
             print("Done loading pretransform")
 
         if lora_ckpt_paths:
-            # Move to device before add_lora so SVD (for LoRA-XS) runs on GPU
-            model.to(device)
-            lora_names = []
-            for i, lora_path in enumerate(lora_ckpt_paths):
-                print(f"Loading LoRA {i} from {lora_path}")
-                lora_state_dict, lora_config_dict = load_lora_checkpoint(lora_path)
-                lora_rank = lora_config_dict.get(
-                    "rank", infer_global_rank(lora_state_dict)
-                )
-                lora_alpha = lora_config_dict.get("alpha", lora_rank)
-                lora_adapter_type = lora_config_dict.get("adapter_type", "lora")
-                lora_include = lora_config_dict.get("include", None)
-                lora_exclude = lora_config_dict.get("exclude", None)
-                lora_config = {
-                    torch.nn.Linear: {
-                        "weight": partial(
-                            LoRAParametrization.from_linear,
-                            rank=lora_rank,
-                            lora_alpha=lora_alpha,
-                            adapter_type=lora_adapter_type,
-                            lora_index=i,
-                        ),
-                    },
-                    torch.nn.Conv1d: {
-                        "weight": partial(
-                            LoRAParametrization.from_conv1d,
-                            rank=lora_rank,
-                            lora_alpha=lora_alpha,
-                            adapter_type=lora_adapter_type,
-                            lora_index=i,
-                        ),
-                    },
-                }
-                if (
-                    model_type == "diffusion_cond"
-                    or model_type == "diffusion_cond_inpaint"
-                ):
-                    add_lora(
-                        model.model,
-                        lora_config,
-                        include=lora_include,
-                        exclude=lora_exclude,
-                    )
-                    add_lora(
-                        model.conditioner,
-                        lora_config,
-                        include=lora_include,
-                        exclude=lora_exclude,
-                    )
-                # Remap state dict keys to target the correct parametrization index
-                remapped_sd = remap_lora_state_dict(lora_state_dict, i)
-                model.model.load_state_dict(remapped_sd, strict=False)
-                model.conditioner.load_state_dict(remapped_sd, strict=False)
-                # Store display name from filename
-                lora_names.append(os.path.splitext(os.path.basename(lora_path))[0])
-
-            print("lora layers:", len(get_lora_layers(model)))
-            model.use_lora = True
-            model.lora_names = lora_names
+            StableAudioPipeline._apply_lora_checkpoints(
+                model, model_type, lora_ckpt_paths, device
+            )
         else:
             model.use_lora = False
             model.lora_names = []
@@ -541,3 +449,56 @@ class StableAudioPipeline:
         print("Done loading model")
 
         return model, model_config
+
+    @staticmethod
+    def _apply_lora_checkpoints(model, model_type, lora_ckpt_paths, device):
+        """Applies all LoRA checkpoints to model in-place. Sets model.use_lora and model.lora_names."""
+        # Move to device before add_lora so SVD (for LoRA-XS) runs on GPU
+        model.to(device)
+        lora_names = []
+        for i, lora_path in enumerate(lora_ckpt_paths):
+            print(f"Loading LoRA {i} from {lora_path}")
+            lora_state_dict, lora_config_dict = load_lora_checkpoint(lora_path)
+            lora_rank = lora_config_dict.get("rank", infer_global_rank(lora_state_dict))
+            lora_alpha = lora_config_dict.get("alpha", lora_rank)
+            lora_adapter_type = lora_config_dict.get("adapter_type", "lora")
+            lora_include = lora_config_dict.get("include", None)
+            lora_exclude = lora_config_dict.get("exclude", None)
+            lora_config = {
+                torch.nn.Linear: {
+                    "weight": partial(
+                        LoRAParametrization.from_linear,
+                        rank=lora_rank,
+                        lora_alpha=lora_alpha,
+                        adapter_type=lora_adapter_type,
+                        lora_index=i,
+                    ),
+                },
+                torch.nn.Conv1d: {
+                    "weight": partial(
+                        LoRAParametrization.from_conv1d,
+                        rank=lora_rank,
+                        lora_alpha=lora_alpha,
+                        adapter_type=lora_adapter_type,
+                        lora_index=i,
+                    ),
+                },
+            }
+            if model_type in ("diffusion_cond", "diffusion_cond_inpaint"):
+                add_lora(
+                    model.model, lora_config, include=lora_include, exclude=lora_exclude
+                )
+                add_lora(
+                    model.conditioner,
+                    lora_config,
+                    include=lora_include,
+                    exclude=lora_exclude,
+                )
+            remapped_sd = remap_lora_state_dict(lora_state_dict, i)
+            model.model.load_state_dict(remapped_sd, strict=False)
+            model.conditioner.load_state_dict(remapped_sd, strict=False)
+            lora_names.append(os.path.splitext(os.path.basename(lora_path))[0])
+
+        print("lora layers:", len(get_lora_layers(model)))
+        model.use_lora = True
+        model.lora_names = lora_names

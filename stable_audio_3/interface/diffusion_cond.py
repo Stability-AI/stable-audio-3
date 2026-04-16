@@ -64,9 +64,7 @@ def generate_cond(
         inversion_steps=100,
         inversion_gamma=0.3,
         inversion_unconditional=False,
-        adapt_duration_to_conditioning=False,
         duration_padding_sec=6.0,
-        use_effective_length_for_schedule=False,
         batch_size=1,
         dist_shift=None,
         *lora_args
@@ -158,10 +156,7 @@ def generate_cond(
         "scale_phi": cfg_rescale,
         "cfg_norm_threshold": cfg_norm_threshold,
         "apg_scale": apg_scale,
-        "adapt_duration_to_conditioning": adapt_duration_to_conditioning,
         "duration_padding_sec": duration_padding_sec,
-        "use_effective_length_for_schedule": use_effective_length_for_schedule,
-        "mask_padding_attention": mask_padding_attention,
         "dist_shift": dist_shift,
     }
 
@@ -386,9 +381,7 @@ def create_sampling_ui(model_config):
                     sigma_max_slider = gr.Slider(minimum=0.0, maximum=sigma_max_max, step=0.1, value=sigma_max_default, label="Sigma max", visible=True)
 
                 with gr.Row():
-                    adapt_duration_checkbox = gr.Checkbox(label="Adapt duration to conditioning", value=trained_with_masking, info="Generate at shorter sequence length based on seconds_total + padding")
                     duration_padding_slider = gr.Slider(minimum=0.0, maximum=30.0, step=0.5, value=6.0, label="Duration padding (sec)")
-                    use_effective_length_checkbox = gr.Checkbox(label="Use effective length for distribution shift", value=trained_with_effective_length, info="Adjust timestep schedule based on seconds_total")
 
                 def build_dist_shift(shift_type, p1, p2, p3, p4):
                     """Build dist_shift from type + 4 params (meaning depends on type)."""
@@ -534,9 +527,7 @@ def create_sampling_ui(model_config):
                 inversion_steps_slider,
                 inversion_gamma_slider,
                 inversion_unconditional_checkbox,
-                adapt_duration_checkbox,
                 duration_padding_slider,
-                use_effective_length_checkbox,
                 batch_size_state,
                 dist_shift_state,
             ] + lora_ui_inputs

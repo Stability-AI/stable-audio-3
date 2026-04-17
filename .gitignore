@@ -166,3 +166,4 @@ wandb/*
 
 .gradio
 .DS_Store
+*.safetensors

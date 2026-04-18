@@ -66,7 +66,6 @@ class StableAudioPipeline:
         """Load LoRA checkpoints onto the model after construction."""
         model_type = self.model_config["model_type"]
         lora_names = []
-        breakpoint()
         for i, lora_path in enumerate(lora_ckpt_paths):
             print(f"Loading LoRA {i} from {lora_path}")
             lora_state_dict, lora_config_dict = load_lora_checkpoint(lora_path)

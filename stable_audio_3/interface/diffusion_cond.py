@@ -5,29 +5,27 @@ import re
 import subprocess
 import torch
 import torchaudio
-import threading 
+import threading
 import os, time, math
 
 from einops import rearrange
 
 from stable_audio_3.interface.aeiou import audio_spectrogram_image
-from stable_audio_3.pipeline import StableAudioPipeline
 from stable_audio_3.inference.distribution_shift import LogSNRShift, FluxDistributionShift, DistributionShift, IdentityDistributionShift
 from stable_audio_3.models.minlora import has_lora
 
-
 pipeline = None
-model_type = None
 sample_size = 5324800
 sample_rate = 44100
 n_loras = 0
+
 
 # when using a prompt in a filename
 def condense_prompt(prompt):
     pattern = r'[\\/:*?"<>|]'
     # Replace special characters with hyphens
     prompt = re.sub(pattern, '-', prompt)
-    # set a character limit 
+    # set a character limit
     prompt = prompt[:150]
     # zero length prompts may lead to filenames (ie ".wav") which seem cause problems with gradio
     if len(prompt)==0:
@@ -169,13 +167,13 @@ def generate_cond(
     audio = pipeline.generate(**generate_args)
 
     # Filenaming convention
-    prompt_condensed = condense_prompt(prompt) 
+    prompt_condensed = condense_prompt(prompt)
     if file_naming=="verbose":
         basename = prompt_condensed
         if negative_prompt:
             basename += ".neg-%s" % condense_prompt(negative_prompt)
         basename += ".cfg%s" % (cfg_scale)
-        if sigma_max not in [1.0, 100.0]: 
+        if sigma_max not in [1.0, 100.0]:
             # this is a common parameter to tweak, if it's not a default value, put it in the verbose filename
             basename += ".smx%s" % sigma_max
         basename += ".%s" % seed
@@ -183,11 +181,11 @@ def generate_cond(
         basename = prompt_condensed
     else:
         # simple e.g. "output.wav"
-        basename = "output" 
+        basename = "output"
 
     if file_format:
         filename_extension = file_format.split(" ")[0].lower()
-    else: 
+    else:
         filename_extension = "wav"
     output_filename = "%s.%s" % (basename, filename_extension)
     output_wav = "%s.wav" % basename
@@ -223,7 +221,7 @@ def generate_cond(
     if cmd:
         cmd += " -loglevel error" # make output less verbose in the cmd window
         subprocess.run(cmd, shell=True, check=True)
-    
+
     # Let's look at a nice spectrogram too
     audio_spectrogram = audio_spectrogram_image(audio, sample_rate=sample_rate)
 
@@ -233,36 +231,20 @@ def generate_cond(
 
     return ((sample_rate, audio.numpy().T), [audio_spectrogram, *preview_images])
 
-#  Asynchronously delete the given list of filenames after delay seconds. Sets up thread that sleeps for delay then deletes. 
+#  Asynchronously delete the given list of filenames after delay seconds. Sets up thread that sleeps for delay then deletes.
 def delete_files_async(filenames, delay):
     def delete_files_after_delay(filenames, delay):
         time.sleep(delay)  # Wait for the specified delay
         for filename in filenames:
             if os.path.exists(filename):
                 os.remove(filename)  # Delete the file
-    threading.Thread(target=delete_files_after_delay, args=(filenames, delay)).start() 
+    threading.Thread(target=delete_files_after_delay, args=(filenames, delay)).start()
 
-def create_sampling_ui(model_config):
-    global diffusion_objective, mask_padding_attention
-    global diffusion_objective, n_loras
-    has_inpainting = True
-
-    model_conditioning_config = model_config["model"].get("conditioning", None)
-
+def create_sampling_ui(pipeline):
+    global n_loras
     diffusion_objective = pipeline.model.diffusion_objective
     is_rf = diffusion_objective == "rectified_flow"
     is_rf_denoiser = diffusion_objective == "rf_denoiser" # includes ARC models
-
-    # Read from model wrapper (with fallback to training config for backward compat)
-    trained_with_effective_length = getattr(pipeline.model, 'use_effective_length_for_schedule', False)
-    trained_with_masking = getattr(pipeline.model, 'mask_padding_attention', False)
-    if not trained_with_effective_length or not trained_with_masking:
-        training_config = model_config.get("training", {})
-        if not trained_with_effective_length:
-            trained_with_effective_length = training_config.get("use_effective_length_for_schedule", False)
-        if not trained_with_masking:
-            trained_with_masking = training_config.get("mask_padding_attention", False)
-    mask_padding_attention = trained_with_masking
 
     # Extract default dist_shift params from model's sampling_dist_shift
     default_sampling_dist_shift = getattr(pipeline.model, 'sampling_dist_shift', None)
@@ -316,16 +298,16 @@ def create_sampling_ui(model_config):
             with gr.Row(visible = True):
                 # Timing controls
                 seconds_total_slider = gr.Slider(minimum=0, maximum=512, step=1, value=sample_size//sample_rate, label="Seconds total", visible=has_seconds_total)
-            
+
             with gr.Row():
                 # Steps slider
                 if is_rf:
                     default_steps = 50
                 elif is_rf_denoiser:
                     default_steps = 8
-                    
+
                 steps_slider = gr.Slider(minimum=1, maximum=500, step=1, value=default_steps, label="Steps")
-                # CFG scale 
+                # CFG scale
                 default_cfg_scale = 1.0 if is_rf_denoiser else 7.0
                 cfg_scale_slider = gr.Slider(minimum=0.0, maximum=25.0, step=0.1, value=default_cfg_scale, label="CFG scale")
 
@@ -373,7 +355,7 @@ def create_sampling_ui(model_config):
                         default_sampler_type = "dpmpp-3m-sde"
                         sigma_max_max = 1000.0
                         sigma_max_default = 100.0
-                        
+
                     sampler_type_dropdown = gr.Dropdown(sampler_types, label="Sampler type", value=default_sampler_type)
                     sigma_max_slider = gr.Slider(minimum=0.0, maximum=sigma_max_max, step=0.1, value=sigma_max_default, label="Sigma max", visible=True)
 
@@ -448,7 +430,7 @@ def create_sampling_ui(model_config):
                     file_format_dropdown = gr.Dropdown(["wav", "flac", "mp3 320k", "mp3 v0", "mp3 128k", "m4a aac_he_v2 64k", "m4a aac_he_v2 32k"], label="File format", value="wav")
                     file_naming_dropdown = gr.Dropdown(["verbose", "prompt", "output.wav"], label="File naming", value="verbose") # ,"prompt","verbose"
                     preview_every_slider = gr.Slider(minimum=0, maximum=100, step=1, value=0, label="Spec Preview Every")
-                
+
                     cut_to_seconds_total_checkbox = gr.Checkbox(label="Cut to seconds total", value=True)
                     autoplay_checkbox = gr.Checkbox(label="Autoplay", value=False, elem_id="autoplay")
                     infinite_radio_checkbox = gr.Checkbox(label="Infinite Radio", value=False, elem_id="infinite-radio")
@@ -481,7 +463,7 @@ def create_sampling_ui(model_config):
                     )
                 init_audio_type_radio.change(init_audio_type_switch, inputs=init_audio_type_radio, outputs=[interface_a, interface_b])
 
-            with gr.Accordion("Inpainting", open=False, visible=has_inpainting):
+            with gr.Accordion("Inpainting", open=False):
                 inpaint_audio_input = gr.Audio(label="Inpaint audio", waveform_options=gr.WaveformOptions(show_recording_waveform=False))
                 mask_maskstart_slider = gr.Slider(minimum=0.0, maximum=sample_size//sample_rate, step=0.1, value=0, label="Mask Start (sec)")
                 mask_maskend_slider = gr.Slider(minimum=0.0, maximum=sample_size//sample_rate, step=0.1, value=sample_size//sample_rate, label="Mask End (sec)")
@@ -536,26 +518,23 @@ def create_sampling_ui(model_config):
             send_to_init_button = gr.Button("Send to init audio", scale=1)
             send_to_init_button.click(fn=lambda audio: audio, inputs=[audio_output], outputs=[init_audio_input])
 
-            if has_inpainting:
-                send_to_inpaint_button = gr.Button("Send to inpaint audio", scale=1)
-                send_to_inpaint_button.click(fn=lambda audio: audio, inputs=[audio_output], outputs=[inpaint_audio_input])
-    
-    generate_button.click(fn=generate_cond, 
+            send_to_inpaint_button = gr.Button("Send to inpaint audio", scale=1)
+            send_to_inpaint_button.click(fn=lambda audio: audio, inputs=[audio_output], outputs=[inpaint_audio_input])
+
+    generate_button.click(fn=generate_cond,
         inputs=inputs,
         outputs=[
-            audio_output, 
+            audio_output,
             audio_spectrogram_output
-        ], 
+        ],
         api_name="generate")
 
-def create_diffusion_cond_ui(model_config, in_model, gradio_title=""):
-    global pipeline, sample_size, sample_rate, model_type
-    
-    device = next(in_model.parameters()).device
-    pipeline = StableAudioPipeline(in_model, model_config, device)
-    sample_size = model_config["sample_size"]
-    sample_rate = model_config["sample_rate"]
-    model_type = model_config["model_type"]
+def create_diffusion_cond_ui(pipe, gradio_title=""):
+    global sample_size, sample_rate, pipeline
+
+    sample_size = pipe.model_config["sample_size"]
+    sample_rate = pipe.model_config["sample_rate"]
+    pipeline = pipe
 
 
     js ="""function run_javascript_on_page_load(){
@@ -585,7 +564,7 @@ def create_diffusion_cond_ui(model_config, in_model, gradio_title=""):
                         // Can set window.headstart (seconds) in the dev console if you want to start generating before the song is over
                         let headstart = 1;
                         if(window.headstart) headstart = window.headstart;
-                        if (audioEl.duration - audioEl.currentTime <= headstart) {                            
+                        if (audioEl.duration - audioEl.currentTime <= headstart) {
                             generateBtn.click();
                             radioAutoStart = true;
                             audioEl.removeEventListener('timeupdate', checkAudioEnd);
@@ -631,7 +610,7 @@ def create_diffusion_cond_ui(model_config, in_model, gradio_title=""):
         if gradio_title:
             gr.Markdown("### %s" % gradio_title)
         with gr.Tab("Generation"):
-            create_sampling_ui(model_config) 
+            create_sampling_ui(pipe)
 
         # JavaScript to autoplay audio immediately after generation (if autoplay enabled)
     return ui

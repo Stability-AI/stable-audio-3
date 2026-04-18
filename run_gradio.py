@@ -12,8 +12,7 @@ def main(args):
     if args.lora_ckpt_path:
         pipe.load_lora(args.lora_ckpt_path)
     interface = create_diffusion_cond_ui(
-        pipe.model_config,
-        pipe.model,
+        pipe,
         gradio_title=args.title if args.title is not None else "Stable Audio 3",
     )
     interface.queue()

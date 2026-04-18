@@ -76,10 +76,13 @@ model = StableAudioPipeline.from_pretrained(
 
 ## Docs
 
-- [Inference guide](#)
-- [LoRA training guide](#)
-- [Prompt and control guide](#)
-- [Hardware setup](#)
+| Guide | Description |
+|-------|-------------|
+| [Inference Methods](docs/workflows/inference.md) | Overview of inference modes (text-to-audio, inpainting, etc.) |
+| [LoRA Training](docs/workflows/lora_training.md) | Fine-tune with LoRA: setup, training loop, and checkpointing |
+| [Autoencoder Workflows](docs/workflows/autoencoder.md) | Encode and decode audio with the VAE directly |
+| [Prompting Guide](docs/guides/prompting.md) | Prompt and control signal reference |
+| [Model Overview](docs/guides/model-overview.md) | Architecture and design overview |
 
 ---
 
@@ -87,14 +90,14 @@ model = StableAudioPipeline.from_pretrained(
 
 #### Output audio is a static glitch sound (affects Stable Audio 3 Medium-only)
 
-Likely an issue with flash-attention. Please make sure flash attention is installed correctly. 
+Likely an issue with flash-attention. Please make sure flash attention is installed correctly.
 You can check with
 
 ```
 python -c "import flash_attn; from flash_attn import flash_attn_func; print('Version:', flash_attn.__version__, '| flash_attn_func:', flash_attn_func)"
 ```
 
-if there are errors in any of this, flash_attn is not installed correctly. 
+if there are errors in any of this, `flash_attn` is not installed correctly.
 
 ---
 

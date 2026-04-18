@@ -8,8 +8,8 @@ from torch.nn.functional import interpolate
 
 from stable_audio_3.inference.audio_utils import prepare_audio, numpy_audio_to_tensor
 from stable_audio_3.inference.sampling import sample_diffusion
-from stable_audio_3.model import create_diffusion_cond_from_config
-from stable_audio_3.loading_utils import copy_state_dict, load_ckpt_state_dict
+from stable_audio_3.loading_utils import load_diffusion_cond
+from stable_audio_3.model_configs import all_models
 from stable_audio_3.models.minlora import (
     add_lora,
     LoRAParametrization,
@@ -21,18 +21,12 @@ from stable_audio_3.models.minlora import (
 )
 
 
-SMALL_MODEL_CONFIG_PATH = "SA3-S-ARC-CLAP.json"
-SMALL_CKPT_PATH = "SA3-S-ARC-CLAP-5k.ckpt"
-MEDIUM_MODEL_CONFIG_PATH = "SA3-M-ARC-CLAP.json"
-MEDIUM_CKPT_PATH = "SA3-M-ARC-50k.ckpt"
-SEED = 124
-
-
 class StableAudioPipeline:
-    def __init__(self, model, model_config, device):
+    def __init__(self, model, model_config, device, model_half):
         self.model = model
         self.model_config = model_config
         self.device = device
+        self.model_half = model_half
         self.same = self.model.pretransform
         self.dit = self.model.model
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -41,23 +35,95 @@ class StableAudioPipeline:
         torch.backends.cudnn.benchmark = False
 
     @staticmethod
-    def from_pretrained(model_name_or_path, model_half=False):
+    def from_pretrained(model_name_or_path, device, model_half=True):
         # Load the model and any necessary components here
         ## TODO: Work with HuggingFace Hub to load models
-        if model_name_or_path == "small":
-            MODEL_CONFIG_PATH = SMALL_MODEL_CONFIG_PATH
-            CKPT_PATH = SMALL_CKPT_PATH
-        elif model_name_or_path == "medium":
-            MODEL_CONFIG_PATH = MEDIUM_MODEL_CONFIG_PATH
-            CKPT_PATH = MEDIUM_CKPT_PATH
-        with open(MODEL_CONFIG_PATH) as f:
+
+        if not torch.cuda.is_available():
+            if model_name_or_path in ("medium", "medium-rf"):
+                print(
+                    f"Warning: You are loading the {model_name_or_path} model without a GPU. This model is not designed to run on cpu"
+                )
+            model_half = False
+
+        if model_name_or_path not in all_models:
+            raise ValueError(
+                f"Unknown model '{model_name_or_path}'. Valid models: {list(all_models)}"
+            )
+
+        model_cfg = all_models[model_name_or_path]
+        with open(model_cfg.config_path) as f:
             model_config = json.load(f)
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model, model_config = StableAudioPipeline._load_model(
-            model_config, CKPT_PATH, model_half=model_half, device=device
+        model = load_diffusion_cond(
+            model_config, model_cfg.ckpt_path, device=device, model_half=model_half
         )
-        return StableAudioPipeline(model, model_config, device)
+        model.use_lora = False
+        model.lora_names = []
+        return StableAudioPipeline(model, model_config, device, model_half)
+
+    def load_lora(self, lora_ckpt_paths):
+        """Load LoRA checkpoints onto the model after construction."""
+        model_type = self.model_config["model_type"]
+        lora_names = []
+        breakpoint()
+        for i, lora_path in enumerate(lora_ckpt_paths):
+            print(f"Loading LoRA {i} from {lora_path}")
+            lora_state_dict, lora_config_dict = load_lora_checkpoint(lora_path)
+            lora_rank = lora_config_dict.get("rank", infer_global_rank(lora_state_dict))
+            lora_alpha = lora_config_dict.get("alpha", lora_rank)
+            lora_adapter_type = lora_config_dict.get("adapter_type", "lora")
+            lora_include = lora_config_dict.get("include", None)
+            lora_exclude = lora_config_dict.get("exclude", None)
+            lora_config = {
+                torch.nn.Linear: {
+                    "weight": partial(
+                        LoRAParametrization.from_linear,
+                        rank=lora_rank,
+                        lora_alpha=lora_alpha,
+                        adapter_type=lora_adapter_type,
+                        lora_index=i,
+                    ),
+                },
+                torch.nn.Conv1d: {
+                    "weight": partial(
+                        LoRAParametrization.from_conv1d,
+                        rank=lora_rank,
+                        lora_alpha=lora_alpha,
+                        adapter_type=lora_adapter_type,
+                        lora_index=i,
+                    ),
+                },
+            }
+            if model_type in ("diffusion_cond", "diffusion_cond_inpaint"):
+                add_lora(
+                    self.model.model,
+                    lora_config,
+                    include=lora_include,
+                    exclude=lora_exclude,
+                )
+                add_lora(
+                    self.model.conditioner,
+                    lora_config,
+                    include=lora_include,
+                    exclude=lora_exclude,
+                )
+            remapped_sd = remap_lora_state_dict(lora_state_dict, i)
+            self.model.model.load_state_dict(remapped_sd, strict=False)
+            self.model.conditioner.load_state_dict(remapped_sd, strict=False)
+            lora_names.append(os.path.splitext(os.path.basename(lora_path))[0])
+
+        print("lora layers:", len(get_lora_layers(self.model)))
+        self.model.use_lora = True
+        self.model.lora_names = lora_names
+
+    def set_lora_strength(
+        self, strength: float, lora_index: int | None = None, target: str = "both"
+    ):
+        if target in ("dit", "both"):
+            set_lora_strength(self.model.model, strength, lora_index=lora_index)
+        if target in ("conditioner", "both"):
+            set_lora_strength(self.model.conditioner, strength, lora_index=lora_index)
 
     @torch.inference_mode()
     def generate(
@@ -144,8 +210,6 @@ class StableAudioPipeline:
             audio_sample_size = self._adapt_sample_size(
                 conditioning,
                 sample_size,
-                self.model,
-                self.model_config,
                 duration_padding_sec,
             )
 
@@ -199,14 +263,14 @@ class StableAudioPipeline:
         # Process init audio
         if init_audio is not None:
             init_audio, inpaint_mask = self._encode_audio_input(
-                init_audio, audio_sample_size, self.model, device, inpaint_mask
+                init_audio, audio_sample_size, inpaint_mask
             )
             init_audio = init_audio.repeat(batch_size, 1, 1)
 
         # Process inpaint audio
         if inpaint_audio is not None:
             inpaint_audio, inpaint_mask = self._encode_audio_input(
-                inpaint_audio, audio_sample_size, self.model, device, inpaint_mask
+                inpaint_audio, audio_sample_size, inpaint_mask
             )
             inpaint_audio = inpaint_audio.repeat(batch_size, 1, 1)
         else:
@@ -328,10 +392,7 @@ class StableAudioPipeline:
 
         return conditioning, negative_conditioning
 
-    @staticmethod
-    def _adapt_sample_size(
-        conditioning, sample_size, model, model_config, duration_padding_sec
-    ):
+    def _adapt_sample_size(self, conditioning, sample_size, duration_padding_sec):
         """Returns audio_sample_size adapted from conditioning, clamped to sample_size."""
         max_seconds = 0.0
         for cond_dict in conditioning:
@@ -342,17 +403,17 @@ class StableAudioPipeline:
             return sample_size
 
         target_audio_samples = int(
-            (max_seconds + duration_padding_sec) * model.sample_rate
+            (max_seconds + duration_padding_sec) * self.model.sample_rate
         )
-        if model.pretransform is not None:
-            ds_ratio = model.pretransform.downsampling_ratio
+        if self.model.pretransform is not None:
+            ds_ratio = self.model.pretransform.downsampling_ratio
             # Round up to nearest multiple of downsampling ratio
             target_audio_samples = (
                 (target_audio_samples + ds_ratio - 1) // ds_ratio
             ) * ds_ratio
-            encoder_config = model_config["model"]["pretransform"]["config"]["encoder"][
-                "config"
-            ]
+            encoder_config = self.model_config["model"]["pretransform"]["config"][
+                "encoder"
+            ]["config"]
             chunk_size = encoder_config.get("chunk_size", 32)
             stride = encoder_config["strides"][0]  # or min(strides) if multiple
             # For chunked attention with latent space, align to chunk size after downsampling
@@ -362,33 +423,31 @@ class StableAudioPipeline:
 
         return min(target_audio_samples, sample_size)
 
-    @staticmethod
-    def _encode_audio_input(
-        audio_input, audio_sample_size, model, device, inpaint_mask=None
-    ):
+    def _encode_audio_input(self, audio_input, audio_sample_size, inpaint_mask=None):
         """
         Converts a (sample_rate, audio) tuple to an encoded latent tensor.
         If model has a pretransform, encodes to latent space and downsamples inpaint_mask to match.
         Returns (encoded_audio, updated_inpaint_mask). encoded_audio is not yet repeated to batch size.
         """
+        device = str(self.device)
         in_sr, audio_data = audio_input
         if isinstance(audio_data, np.ndarray):
             audio_data = numpy_audio_to_tensor(audio_data)
         io_channels = (
-            model.pretransform.io_channels
-            if model.pretransform is not None
-            else model.io_channels
+            self.model.pretransform.io_channels
+            if self.model.pretransform is not None
+            else self.model.io_channels
         )
         audio = prepare_audio(
             audio_data,
             in_sr=in_sr,
-            target_sr=model.sample_rate,
+            target_sr=self.model.sample_rate,
             target_length=audio_sample_size,
             target_channels=io_channels,
             device=device,
         )
-        if model.pretransform is not None:
-            audio = model.pretransform.encode(audio)
+        if self.model.pretransform is not None:
+            audio = self.model.pretransform.encode(audio)
             if inpaint_mask is not None:
                 inpaint_mask = interpolate(
                     inpaint_mask.unsqueeze(1),
@@ -396,109 +455,3 @@ class StableAudioPipeline:
                     mode="nearest",
                 ).squeeze(1)
         return audio, inpaint_mask
-
-    # --- _load_model() helpers ---
-
-    @staticmethod
-    def _load_model(
-        model_config=None,
-        model_ckpt_path=None,
-        pretrained_name=None,
-        pretransform_ckpt_path=None,
-        device="cuda",
-        model_half=False,
-        lora_ckpt_paths=None,
-    ):
-        if pretrained_name is not None:
-            pass
-            # print(f"Loading pretrained model {pretrained_name}")
-            # model, model_config = get_pretrained_model(pretrained_name)
-
-        elif model_config is not None and model_ckpt_path is not None:
-            print("Creating model from config")
-            model = create_diffusion_cond_from_config(model_config)
-
-            print(f"Loading model checkpoint from {model_ckpt_path}")
-            # Load checkpoint and unwrap if it's a wrapped training checkpoint
-            state_dict = load_ckpt_state_dict(model_ckpt_path)
-            # state_dict = unwrap_state_dict(state_dict, model_config.get("model_type"))
-            copy_state_dict(model, state_dict)
-
-        model_type = model_config["model_type"]
-
-        if pretransform_ckpt_path is not None:
-            print(f"Loading pretransform checkpoint from {pretransform_ckpt_path}")
-            model.pretransform.load_state_dict(
-                load_ckpt_state_dict(pretransform_ckpt_path), strict=False
-            )
-            print("Done loading pretransform")
-
-        if lora_ckpt_paths:
-            StableAudioPipeline._apply_lora_checkpoints(
-                model, model_type, lora_ckpt_paths, device
-            )
-        else:
-            model.use_lora = False
-            model.lora_names = []
-
-        model.to(device).eval().requires_grad_(False)
-
-        if model_half:
-            model.to(torch.float16)
-
-        print("Done loading model")
-
-        return model, model_config
-
-    @staticmethod
-    def _apply_lora_checkpoints(model, model_type, lora_ckpt_paths, device):
-        """Applies all LoRA checkpoints to model in-place. Sets model.use_lora and model.lora_names."""
-        # Move to device before add_lora so SVD (for LoRA-XS) runs on GPU
-        model.to(device)
-        lora_names = []
-        for i, lora_path in enumerate(lora_ckpt_paths):
-            print(f"Loading LoRA {i} from {lora_path}")
-            lora_state_dict, lora_config_dict = load_lora_checkpoint(lora_path)
-            lora_rank = lora_config_dict.get("rank", infer_global_rank(lora_state_dict))
-            lora_alpha = lora_config_dict.get("alpha", lora_rank)
-            lora_adapter_type = lora_config_dict.get("adapter_type", "lora")
-            lora_include = lora_config_dict.get("include", None)
-            lora_exclude = lora_config_dict.get("exclude", None)
-            lora_config = {
-                torch.nn.Linear: {
-                    "weight": partial(
-                        LoRAParametrization.from_linear,
-                        rank=lora_rank,
-                        lora_alpha=lora_alpha,
-                        adapter_type=lora_adapter_type,
-                        lora_index=i,
-                    ),
-                },
-                torch.nn.Conv1d: {
-                    "weight": partial(
-                        LoRAParametrization.from_conv1d,
-                        rank=lora_rank,
-                        lora_alpha=lora_alpha,
-                        adapter_type=lora_adapter_type,
-                        lora_index=i,
-                    ),
-                },
-            }
-            if model_type in ("diffusion_cond", "diffusion_cond_inpaint"):
-                add_lora(
-                    model.model, lora_config, include=lora_include, exclude=lora_exclude
-                )
-                add_lora(
-                    model.conditioner,
-                    lora_config,
-                    include=lora_include,
-                    exclude=lora_exclude,
-                )
-            remapped_sd = remap_lora_state_dict(lora_state_dict, i)
-            model.model.load_state_dict(remapped_sd, strict=False)
-            model.conditioner.load_state_dict(remapped_sd, strict=False)
-            lora_names.append(os.path.splitext(os.path.basename(lora_path))[0])
-
-        print("lora layers:", len(get_lora_layers(model)))
-        model.use_lora = True
-        model.lora_names = lora_names

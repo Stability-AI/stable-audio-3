@@ -1,5 +1,12 @@
+import json
+
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file
+from stable_audio_3.model import (
+    create_autoencoder_from_config,
+    create_diffusion_cond_from_config,
+)
 
 
 def copy_state_dict(model, state_dict):
@@ -28,6 +35,54 @@ def copy_state_dict(model, state_dict):
             )
 
     model.load_state_dict(model_state_dict, strict=False)
+
+
+def load_autoencoder(config_path: str, ckpt_path: str, device: str = "cpu"):
+    """Load only the autoencoder from a combined DiT+autoencoder checkpoint.
+
+    For .safetensors checkpoints, only pretransform tensors are read from disk,
+    directly onto the target device.
+    For .ckpt checkpoints, the full state dict is loaded but the DiT is never instantiated.
+    """
+
+    with open(config_path) as f:
+        config = json.load(f)
+
+    autoencoder = create_autoencoder_from_config(config["model"], config["sample_rate"])
+
+    prefix = "pretransform."
+    if ckpt_path.endswith(".safetensors"):
+        with safe_open(ckpt_path, framework="pt", device=device) as f:
+            state_dict = {
+                k[len(prefix) :]: f.get_tensor(k)
+                for k in f.keys()
+                if k.startswith(prefix)
+            }
+    else:
+        full = torch.load(ckpt_path, map_location=device, weights_only=True)[
+            "state_dict"
+        ]
+        state_dict = {
+            k[len(prefix) :]: v for k, v in full.items() if k.startswith(prefix)
+        }
+
+    copy_state_dict(autoencoder, state_dict)
+    return autoencoder.to(device)
+
+
+def load_diffusion_cond(
+    model_config,
+    ckpt_path: str,
+    device: str = "cuda",
+    model_half: bool = False,
+):
+    model = create_diffusion_cond_from_config(model_config)
+    state_dict = load_ckpt_state_dict(ckpt_path)
+    copy_state_dict(model, state_dict)
+    model.to(device).eval().requires_grad_(False)
+    if model_half:
+        model.to(torch.float16)
+    return model
 
 
 def load_ckpt_state_dict(ckpt_path):

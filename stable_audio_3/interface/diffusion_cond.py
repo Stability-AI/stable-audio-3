@@ -13,16 +13,13 @@ from einops import rearrange
 from stable_audio_3.interface.aeiou import audio_spectrogram_image
 from stable_audio_3.pipeline import StableAudioPipeline
 from stable_audio_3.inference.distribution_shift import LogSNRShift, FluxDistributionShift, DistributionShift, IdentityDistributionShift
-from stable_audio_3.models.minlora import set_lora_strength, has_lora, get_lora_count
+from stable_audio_3.models.minlora import has_lora
 
 
 pipeline = None
 model_type = None
-sample_size = 2097152
+sample_size = 5324800
 sample_rate = 44100
-model_half = True
-diffusion_objective = None
-mask_padding_attention = False
 n_loras = 0
 
 # when using a prompt in a filename
@@ -93,8 +90,8 @@ def generate_cond(
             interval_min = lora_args[off + 2]
             interval_max = lora_args[off + 3]
             layer_filter = lora_args[off + 4]
-            set_lora_strength(pipeline.model.model, dit_strength, lora_index=i)
-            set_lora_strength(pipeline.model.conditioner, cond_strength, lora_index=i)
+            pipeline.set_lora_strength(dit_strength, lora_index=i, target="dit")
+            pipeline.set_lora_strength(cond_strength, lora_index=i, target="conditioner")
             lora_configs.append({
                 "lora_index": i,
                 "interval": (interval_min, interval_max),
@@ -248,7 +245,7 @@ def delete_files_async(filenames, delay):
 def create_sampling_ui(model_config):
     global diffusion_objective, mask_padding_attention
     global diffusion_objective, n_loras
-    has_inpainting = model_config["model_type"] == "diffusion_cond_inpaint"
+    has_inpainting = True
 
     model_conditioning_config = model_config["model"].get("conditioning", None)
 
@@ -551,16 +548,15 @@ def create_sampling_ui(model_config):
         ], 
         api_name="generate")
 
-def create_diffusion_cond_ui(model_config, in_model, in_model_half=True, gradio_title=""):
-    global pipeline, sample_size, sample_rate, model_type, model_half
-
+def create_diffusion_cond_ui(model_config, in_model, gradio_title=""):
+    global pipeline, sample_size, sample_rate, model_type
+    
     device = next(in_model.parameters()).device
     pipeline = StableAudioPipeline(in_model, model_config, device)
     sample_size = model_config["sample_size"]
     sample_rate = model_config["sample_rate"]
     model_type = model_config["model_type"]
 
-    model_half = in_model_half
 
     js ="""function run_javascript_on_page_load(){
         const generateBtn = Array.from(document.querySelectorAll('button'))

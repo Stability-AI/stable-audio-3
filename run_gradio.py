@@ -2,16 +2,18 @@ import torch
 from stable_audio_3.interface.diffusion_cond import create_diffusion_cond_ui
 from stable_audio_3.pipeline import StableAudioPipeline
 
-model_half = True
-
 
 def main(args):
     torch.manual_seed(42)
-    pipe = StableAudioPipeline.from_pretrained("medium")
+    model_half = args.model_half
+    pipe = StableAudioPipeline.from_pretrained(
+        args.model, "cuda", model_half=model_half
+    )
+    if args.lora_ckpt_path:
+        pipe.load_lora(args.lora_ckpt_path)
     interface = create_diffusion_cond_ui(
         pipe.model_config,
         pipe.model,
-        in_model_half=model_half,
         gradio_title=args.title if args.title is not None else "Stable Audio 3",
     )
     interface.queue()
@@ -27,7 +29,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Run gradio interface")
     parser.add_argument(
-        "--pretrained-name", type=str, help="Name of pretrained model", required=False
+        "--model", type=str, help="Name of pretrained model", required=False
     )
     parser.add_argument(
         "--model-config", type=str, help="Path to model config", required=False

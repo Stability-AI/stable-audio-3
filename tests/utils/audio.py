@@ -11,10 +11,13 @@ def sine_wave(
     channels: int = 2,
     freq: float = 440.0,
     device: str = "cpu",
+    half: bool = False,
 ) -> torch.Tensor:
     """Return a [channels, samples] sine-wave tensor in [-AMPLITUDE, AMPLITUDE]."""
     t = torch.linspace(0, duration, int(duration * sample_rate), device=device)
     wave = AMPLITUDE * torch.sin(2 * math.pi * freq * t)
+    if half:
+        wave = wave.half()
     return wave.expand(channels, -1).clone()
 
 

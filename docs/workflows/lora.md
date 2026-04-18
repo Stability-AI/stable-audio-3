@@ -1,1 +1,0 @@
-Link to CJ Lora training repo.

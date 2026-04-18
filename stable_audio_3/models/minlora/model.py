@@ -19,7 +19,7 @@ class LoRAParametrization(nn.Module):
                 adapter_type="lora", W0=None, lora_index=0
                 ):
         super().__init__()
-        dtype = torch.get_default_dtype()
+        dtype = W0.dtype if W0 is not None else torch.get_default_dtype()
         device = W0.device if W0 is not None else None
         # if weight is stored as (fan_out, fan_in), the memory layout of A & B follows (W + BA)x
         # otherwise, it's x(W + AB). This allows us to tie the weights between linear layers and embeddings
@@ -34,16 +34,16 @@ class LoRAParametrization(nn.Module):
         self.lora_index = lora_index
 
         if self.adapter_type == "lora":
-            self.lora_A = nn.Parameter(torch.zeros(self.swap((rank, fan_in)), device=device))
-            self.lora_B = nn.Parameter(torch.zeros(self.swap((fan_out, rank)), device=device))
+            self.lora_A = nn.Parameter(torch.zeros(self.swap((rank, fan_in)), dtype=dtype, device=device))
+            self.lora_B = nn.Parameter(torch.zeros(self.swap((fan_out, rank)), dtype=dtype, device=device))
             nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
             self.forward_fn = self.lora_forward
             self._adapter_forward_fn = self.forward_fn
 
         elif self.adapter_type == "dora":
             # low-rank factors (same as LoRA)
-            self.lora_A = nn.Parameter(torch.zeros(self.swap((rank, fan_in)), device=device))
-            self.lora_B = nn.Parameter(torch.zeros(self.swap((fan_out, rank)), device=device))
+            self.lora_A = nn.Parameter(torch.zeros(self.swap((rank, fan_in)), dtype=dtype, device=device))
+            self.lora_B = nn.Parameter(torch.zeros(self.swap((fan_out, rank)), dtype=dtype, device=device))
             nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
             # magnitude: one value per column, initialized from pretrained weight norms
             if W0 is not None:
@@ -70,24 +70,22 @@ class LoRAParametrization(nn.Module):
 
     def lora_forward(self, W):
         delta = torch.matmul(*self.swap((self.lora_B, self.dropout_fn(self.lora_A)))).view(W.shape)
-        delta = self.scaling * self.lora_strength * delta
-        return W + delta
-    
+        return W + (self.scaling * self.lora_strength * delta).to(W.dtype)
+
     def dora_forward(self, W):
         # work in 2D so norm/magnitude ops don't broadcast badly for Conv1d/Conv2d
         orig_shape = W.shape
         W_2d = W.view(W.shape[0], -1)
         # low-rank update on the *direction*
         delta = torch.matmul(*self.swap((self.lora_B, self.dropout_fn(self.lora_A))))
-        V = W_2d + self.scaling * self.lora_strength * delta
+        V = W_2d + (self.scaling * self.lora_strength * delta).to(W_2d.dtype)
         # normalize columns (unit direction), then scale by per-column magnitude
         V_hat = V / (V.norm(dim=0, keepdim=True) + 1e-12)
-        return (V_hat * self.magnitude).view(orig_shape)
+        return (V_hat * self.magnitude.to(V_hat.dtype)).view(orig_shape)
 
     def lora_xs_forward(self, W):
-        delta = self.U @ self.M_xs @ self.V.T
-        delta = delta.view(W.shape)
-        return W + self.scaling * self.lora_strength * delta
+        delta = (self.U.float() @ self.M_xs @ self.V.T.float()).view(W.shape)
+        return W + (self.scaling * self.lora_strength.float() * delta).to(W.dtype)
 
 
     def forward(self, X):

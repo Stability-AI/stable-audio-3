@@ -12,7 +12,9 @@ def test_encode_decode(model_pipe):
     channels = pipe.model_config.get("io_channels", 2)
     device = str(pipe.device)
 
-    audio = sine_wave(DURATION_SEC, sr, channels=channels, device=device)
+    audio = sine_wave(
+        DURATION_SEC, sr, channels=channels, device=device, half=pipe.model_half
+    )
 
     with torch.inference_mode():
         latents = pipe.same.encode(audio.unsqueeze(0))

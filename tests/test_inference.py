@@ -31,7 +31,13 @@ def test_inpainting(model_pipe, maybe_save_audio):
     inpaint_duration = 10.0
     prompt = "big trumpet solo, jazz big band, 90bpm"
 
-    base_audio = sine_wave(inpaint_duration, sr, channels=channels)
+    base_audio = sine_wave(
+        inpaint_duration,
+        sr,
+        channels=channels,
+        device=str(pipe.device),
+        half=pipe.model_half,
+    )
     audio = pipe.generate(
         prompt=prompt,
         duration=inpaint_duration,
@@ -52,7 +58,13 @@ def test_outpainting(model_pipe, maybe_save_audio):
     total_duration = 15.0
     prompt = "thunderstorm with heavy rain"
 
-    base_audio = sine_wave(init_duration, sr, channels=channels)
+    base_audio = sine_wave(
+        init_duration,
+        sr,
+        channels=channels,
+        device=str(pipe.device),
+        half=pipe.model_half,
+    )
     audio = pipe.generate(
         prompt=prompt,
         duration=total_duration,
@@ -71,7 +83,13 @@ def test_init_audio(model_pipe, maybe_save_audio):
     channels = pipe.model_config.get("io_channels", 2)
     prompt = "funky bass groove"
 
-    init = sine_wave(DURATION_SEC, sr, channels=channels)
+    init = sine_wave(
+        DURATION_SEC,
+        sr,
+        channels=channels,
+        device=str(pipe.device),
+        half=pipe.model_half,
+    )
 
     audio = pipe.generate(
         prompt=prompt,

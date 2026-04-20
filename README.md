@@ -12,14 +12,16 @@ Stable Audio 3 is the next generation of Stable Audio: a focused, streamlined pl
 
 ## Models
 
-| RF Model | Autoencoder | Hardware | Params | Latency† | Use case |
+| RF Model | Autoencoder | Hardware | Params | Use case |
 |---|---|---|---|---|---|
-| **Stable Audio 3 Small** | SAME-Small | CPU | 433M | 20ms | Lightweight inference, no GPU required |
-| **Stable Audio 3 Medium** | SAME-Large | GPU (CUDA) | 1.4B | 20ms | High Quality, Fast Inference |
-| **Stable Audio 3 Large** | SAME-Large | API only | 1.7B | 20ms | Highest quality, API only. Not supported by this repo, see the [API docs](#) |
+| **Stable Audio 3 Small** | SAME-Small | CPU | 433M | Lightweight inference, no GPU required |
+| **Stable Audio 3 Medium** | SAME-Large | GPU (CUDA) | 1.4B | High Quality, Fast Inference |
+| **Stable Audio 3 Large** | SAME-Large | API only | 1.7B | Highest quality, API only. Not supported by this repo, see the [API docs](#) |
 ---
 
-<sub>† Measured generating a 380s clip at 8 steps. Small: Apple M4 CPU. Medium: Intel x86 + NVIDIA H100.</sub>
+## Inference Times
+
+
 
 ## Features
 - SAME
@@ -50,8 +52,59 @@ Stable Audio 3 Medium requires [Flash Attention](https://github.com/Dao-AILab/fl
 
 ## Quick Start
 
+```python
+from stable_audio_3 import StableAudioPipeline
+
+pipe = StableAudioPipeline.from_pretrained("medium")
+audio = pipe.generate(
+    prompt="Lo-fi boom bap meets orchestral strings 84 BPM",
+    duration=30,
+)
+```
+
 ## Usage
 
+Stable Audio 3 supports several inference modes. For full details, see [Inference Methods](docs/workflows/inference.md).
+
+**Text-to-Audio** — Generate audio from a text prompt:
+
+```python
+audio = pipe.generate(
+    prompt="Lo-fi boom bap meets orchestral strings 84 BPM",
+    duration=30,
+)
+```
+
+**Audio-to-Audio** — Edit an existing recording using a prompt to steer style and mood:
+
+```python
+import torchaudio
+
+init_audio = torchaudio.load("/path/to/audio.wav")
+audio = pipe.generate(
+    init_audio=init_audio,
+    init_noise_level=0.9,
+    prompt="bossa nova bassline",
+    duration=30,
+)
+```
+
+**Inpainting / Outpainting** — Regenerate a specific region of an audio file while keeping the rest intact:
+
+```python
+import torchaudio
+
+inpaint_audio = torchaudio.load("/path/to/audio.wav")
+audio = pipe.generate(
+    inpaint_audio=inpaint_audio,
+    inpaint_mask_start_seconds=4.0,
+    inpaint_mask_end_seconds=8.0,
+    prompt="punchy kick drum fill",
+    duration=30,
+)
+```
+
+To extend an audio clip (outpainting), set `inpaint_mask_start_seconds` to the length of the source file and choose a longer `duration`. See [Inference Methods](docs/workflows/inference.md) for the full controls reference.
 
 ## Hardware Support
 
@@ -59,8 +112,8 @@ Stable Audio 3 scales from a laptop to a multi-GPU server. Specify your backend 
 
 ```python
 model = StableAudioPipeline.from_pretrained(
-    "stabilityai/stable-audio-3.0-small",
-    backend="tensorrt"  # or "mlx", "coreml", "openvino", "cpu"
+    "medium",
+    backend="tensorrt"  # or "mlx", "coreml", "openvino"
 )
 ```
 

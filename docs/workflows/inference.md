@@ -11,7 +11,7 @@ The most common usage is generating audio from text
 ```python
 from stable_audio_3 import StableAudioPipeline
 
-pipe = StableAudioPipeline.from_pretrained(".")
+pipe = StableAudioPipeline.from_pretrained("medium")
 audio = pipe.generate(
     prompt="120 BPM house loop", 
     negative_prompt="poor quality",
@@ -41,7 +41,7 @@ Using init audio, you can edit an existing recording to change the style, genres
 import torchaudio
 from stable_audio_3 import StableAudioPipeline
 
-pipe = StableAudioPipeline.from_pretrained(".")
+pipe = StableAudioPipeline.from_pretrained("medium")
 init_audio = torchaudio.load("/path/to/some/audio.wav")
 audio = pipe.generate(
     init_audio=init_audio,
@@ -65,7 +65,7 @@ Inpainting lets you regenerate a specific region of an existing audio file while
 import torchaudio
 from stable_audio_3 import StableAudioPipeline
 
-pipe = StableAudioPipeline.from_pretrained(".")
+pipe = StableAudioPipeline.from_pretrained("medium")
 inpaint_audio = torchaudio.load("/path/to/some/audio.wav")
 audio = pipe.generate(
     inpaint_audio=inpaint_audio,
@@ -82,7 +82,7 @@ You can also *extend* an audio by performing outpainting. Simply choose a durati
 import torchaudio
 from stable_audio_3 import StableAudioPipeline
 
-pipe = StableAudioPipeline.from_pretrained(".")
+pipe = StableAudioPipeline.from_pretrained("medium")
 inpaint_audio = torchaudio.load("/path/to/some/audio.wav") # Assume this is 10s long
 audio = pipe.generate(
     inpaint_audio=inpaint_audio,
@@ -109,14 +109,14 @@ For example, with batch_size=4:
 import torchaudio
 from stable_audio_3 import StableAudioPipeline
 
-pipe = StableAudioPipeline.from_pretrained(".")
+pipe = StableAudioPipeline.from_pretrained("medium")
 inpaint_audio = torchaudio.load("/path/to/some/audio1.wav")
 
 audio = pipe.generate(
     inpaint_audio=inpaint_audio,
     inpaint_mask_start_seconds=3
     inpaint_mask_end_seconds=10
-    prompt=["punchy kick drum fill", "guitar", "trumpet", "piano"]
+    prompt=["prompt1", "prompt2", "prompt3", "prompt4"]
     duration=[30, 25, 20, 20],
     steps=8,
     cfg_scale=1,

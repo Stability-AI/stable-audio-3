@@ -35,9 +35,16 @@ class StableAudioPipeline:
         torch.backends.cudnn.benchmark = False
 
     @staticmethod
-    def from_pretrained(model_name_or_path, device, model_half=True):
+    def from_pretrained(model_name_or_path, device=None, model_half=True):
         # Load the model and any necessary components here
         ## TODO: Work with HuggingFace Hub to load models
+
+        if device is None and torch.cuda.is_available():
+            device = "cuda"
+        elif device is None and torch.backends.mps.is_available():
+            device = "mps"
+        elif device is None:            
+            device = "cpu"
 
         if not torch.cuda.is_available():
             if model_name_or_path in ("medium", "medium-rf"):

@@ -56,7 +56,7 @@ def model_pipe(request):
         return StableAudioPipeline.from_pretrained("small", device=ACCEL_DEVICE)
 
     if name == "medium":
-        if not HAS_ACCEL:
+        if not HAS_CUDA:
             pytest.skip("Medium model requires a GPU/accelerator — none detected")
         return StableAudioPipeline.from_pretrained("medium", device=ACCEL_DEVICE)
 

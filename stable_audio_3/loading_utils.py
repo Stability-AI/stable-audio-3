@@ -57,7 +57,9 @@ def load_autoencoder(config_path: str, ckpt_path: str, device: str = "cpu"):
     if ckpt_path.endswith(".safetensors"):
         with safe_open(ckpt_path, framework="pt", device=device) as f:
             all_keys = list(f.keys())
-        effective_prefix = arc_prefix if any(k.startswith(arc_prefix) for k in all_keys) else prefix
+        effective_prefix = (
+            arc_prefix if any(k.startswith(arc_prefix) for k in all_keys) else prefix
+        )
         with safe_open(ckpt_path, framework="pt", device=device) as f:
             state_dict = {
                 k[len(effective_prefix) :]: f.get_tensor(k)
@@ -68,9 +70,13 @@ def load_autoencoder(config_path: str, ckpt_path: str, device: str = "cpu"):
         full = torch.load(ckpt_path, map_location=device, weights_only=True)[
             "state_dict"
         ]
-        effective_prefix = arc_prefix if any(k.startswith(arc_prefix) for k in full) else prefix
+        effective_prefix = (
+            arc_prefix if any(k.startswith(arc_prefix) for k in full) else prefix
+        )
         state_dict = {
-            k[len(effective_prefix) :]: v for k, v in full.items() if k.startswith(effective_prefix)
+            k[len(effective_prefix) :]: v
+            for k, v in full.items()
+            if k.startswith(effective_prefix)
         }
 
     copy_state_dict(autoencoder, state_dict)

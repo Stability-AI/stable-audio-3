@@ -61,7 +61,7 @@ def test_preprocess_list_for_encoder(autoencoder):
     sr = ae.sample_rate
     channels = ae.io_channels
 
-    clip_a = sine_wave(1, sr, channels=channels)             # 1 s
+    clip_a = sine_wave(1, sr, channels=channels)  # 1 s
     clip_b = sine_wave(DURATION_SEC, sr, channels=channels)  # 2 s
 
     batch = ae.preprocess_audio_list_for_encoder([clip_a, clip_b], in_sr_list=sr)

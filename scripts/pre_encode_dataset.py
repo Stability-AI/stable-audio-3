@@ -25,6 +25,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from stable_audio_3.loading_utils import load_autoencoder
+from stable_audio_3.model_configs import all_models
 from stable_audio_3.data.dataset import (
     LocalDatasetConfig,
     SampleDataset,
@@ -37,8 +39,6 @@ def caption_metadata_fn(info, _audio):
     if not txt.exists():
         return {"__reject__": True}
     return {"prompt": txt.read_text().strip()}
-from stable_audio_3.loading_utils import load_autoencoder
-from stable_audio_3.model_configs import all_models
 
 
 def main(args):
@@ -152,7 +152,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sample_size",
         type=int,
-        default=12582912, # 380s at 44.1kHz, 2 channels
+        default=12582912,  # 380s at 44.1kHz, 2 channels
         help="Audio samples to pad/crop to (default ~380s at 44.1kHz)",
     )
     parser.add_argument(

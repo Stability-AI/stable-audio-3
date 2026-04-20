@@ -43,7 +43,7 @@ class StableAudioPipeline:
             device = "cuda"
         elif device is None and torch.backends.mps.is_available():
             device = "mps"
-        elif device is None:            
+        elif device is None:
             device = "cpu"
 
         if not torch.cuda.is_available():

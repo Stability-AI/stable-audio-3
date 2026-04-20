@@ -7,7 +7,7 @@ def main(args):
     torch.manual_seed(42)
     model_half = args.model_half
     pipe = StableAudioPipeline.from_pretrained(
-        args.model, "cuda", model_half=model_half
+        args.model, model_half=model_half
     )
     if args.lora_ckpt_path:
         pipe.load_lora(args.lora_ckpt_path)

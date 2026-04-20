@@ -38,7 +38,6 @@ class StableAudioPipeline:
     def from_pretrained(model_name_or_path, device=None, model_half=True):
         # Load the model and any necessary components here
         ## TODO: Work with HuggingFace Hub to load models
-
         if device is None and torch.cuda.is_available():
             device = "cuda"
         elif device is None and torch.backends.mps.is_available():

@@ -24,9 +24,13 @@ Stable Audio 3 is the next generation of Stable Audio: a focused, streamlined pl
 
 
 ## Features
-- SAME
-- Hardware
-
+- ⚡ **Fast, state-of-the-art generation** - Generate minutes of audio in milliseconds
+- 🎛️ **Three inference modes** — text-to-audio, audio-to-audio editing, and inpainting/outpainting (new in Stable Audio 3)
+- ↔️ **Variable-length generation** — handles generation of a variety of sequences without wasting inference on unused latents
+- 🎯 **LoRA fine-tuning** — adapt any model to a target style; stackable, adjustable at runtime
+- 💻 **Broad hardware support** — CPU (Small), CUDA/TensorRT (Medium), Apple Silicon via MLX/CoreML, Intel via OpenVINO
+- 📈 **Scales from laptop to server** — 433M param CPU model up to 2.7B param API model
+- 🎵 **SAME autoencoder** — new Semantic-Acoustic Music Encoder; stereo, 44.1 kHz, 256-dimensional latents optimized for both generative tractability and high-quality reconstruction
 
 
 ## Installation

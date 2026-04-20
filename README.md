@@ -19,10 +19,6 @@ Stable Audio 3 is the next generation of Stable Audio: a focused, streamlined pl
 | **Stable Audio 3 Large** | SAME-Large | API only | 1.7B | Highest quality, API only. Not supported by this repo, see the [API docs](#) |
 ---
 
-## Inference Times
-
-
-
 ## Features
 - ⚡ **Fast, state-of-the-art generation** - Generate minutes of audio in milliseconds
 - 🎛️ **Three inference modes** — text-to-audio, audio-to-audio editing, and inpainting/outpainting (new in Stable Audio 3)
@@ -77,7 +73,7 @@ Stable Audio 3 supports several inference modes. For full details, see [Inferenc
 ```python
 audio = pipe.generate(
     prompt="Lo-fi boom bap meets orchestral strings 84 BPM",
-    duration=30,
+    duration=180,
 )
 ```
 
@@ -130,6 +126,10 @@ model = StableAudioPipeline.from_pretrained(
 | `coreml` | Apple Neural Engine |
 | `openvino` | Intel CPU / GPU |
 | `cpu` | Any (via LiteRT / XNNPACK) |
+
+### Inference Times
+
+TBD
 
 ---
 

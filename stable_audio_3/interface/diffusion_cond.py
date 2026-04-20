@@ -11,6 +11,7 @@ import os, time, math
 from einops import rearrange
 
 from stable_audio_3.interface.aeiou import audio_spectrogram_image
+from stable_audio_3.interface.reprompt import reprompt as _reprompt_fn
 from stable_audio_3.inference.distribution_shift import LogSNRShift, FluxDistributionShift, DistributionShift, IdentityDistributionShift
 from stable_audio_3.models.minlora import has_lora
 
@@ -291,6 +292,7 @@ def create_sampling_ui(pipeline):
         with gr.Column(scale=6):
             prompt = gr.Textbox(show_label=False, placeholder="Prompt")
             negative_prompt = gr.Textbox(show_label=False, placeholder="Negative prompt")
+        prompt_assistant_button = gr.Button("Prompt Assistant", scale=1)
         generate_button = gr.Button("Generate", variant='primary', scale=1)
 
     with gr.Row(equal_height=False):
@@ -528,6 +530,29 @@ def create_sampling_ui(pipeline):
             audio_spectrogram_output
         ],
         api_name="generate")
+
+
+    _LENGTH_EXTRACT_RE = re.compile(r' Length: (\d+) seconds\.?\s*$')
+
+    _TRACK_TYPE_PREFIXES = {
+        "music":      "TrackType: Music. VocalType: Instrumental. ",
+        "instrument": "TrackType: Instrument. ",
+        "sfx":        "TrackType: SFX. ",
+    }
+
+    def _prompt_assistant(text):
+        _, result, category = _reprompt_fn(text, "Auto", "", "Qwen/Qwen3.5-2B", 128, 1.11)
+        m = _LENGTH_EXTRACT_RE.search(result)
+        if m:
+            seconds = int(m.group(1))
+            result = result[:m.start()]
+        else:
+            seconds = gr.update()  # leave slider unchanged
+        prefix = _TRACK_TYPE_PREFIXES.get(category, "")
+        return prefix + result, seconds
+
+    prompt_assistant_button.click(fn=_prompt_assistant, inputs=[prompt], outputs=[prompt, seconds_total_slider])
+
 
 def create_diffusion_cond_ui(pipe, gradio_title=""):
     global sample_size, sample_rate, pipeline

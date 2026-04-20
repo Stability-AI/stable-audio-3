@@ -12,14 +12,15 @@ Dataset layout:
 Saves .npy files for latents and .json files for metadata, compatible with train_lora.py --encoded_dir.
 
 Usage:
-  python pre_encode_dataset.py --model small-rf --data_dir ./my_data --output_path ./latents_out
-  python pre_encode_dataset.py --model medium-rf --data_dir ./my_data --output_path ./latents_out --batch_size 4
+  python pre_encode_dataset.py --model small --data_dir ./my_data --output_path ./latents_out
+  python pre_encode_dataset.py --model medium --data_dir ./my_data --output_path ./latents_out --batch_size 4
 """
 
 import argparse
 import gc
 import json
 import os
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -27,9 +28,15 @@ import torch
 from stable_audio_3.data.dataset import (
     LocalDatasetConfig,
     SampleDataset,
-    caption_metadata_fn,
     collation_fn,
 )
+
+
+def caption_metadata_fn(info, _audio):
+    txt = Path(info["path"]).with_suffix(".txt")
+    if not txt.exists():
+        return {"__reject__": True}
+    return {"prompt": txt.read_text().strip()}
 from stable_audio_3.loading_utils import load_autoencoder
 from stable_audio_3.model_configs import all_models
 
@@ -145,8 +152,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sample_size",
         type=int,
-        default=2097152,
-        help="Audio samples to pad/crop to (default ~47s at 44.1kHz)",
+        default=12582912, # 380s at 44.1kHz, 2 channels
+        help="Audio samples to pad/crop to (default ~380s at 44.1kHz)",
     )
     parser.add_argument(
         "--model_half", action="store_true", help="Run autoencoder in fp16"

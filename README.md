@@ -52,14 +52,16 @@ Stable Audio 3 Medium requires [Flash Attention](https://github.com/Dao-AILab/fl
 
 ## Quick Start
 
-```python
-from stable_audio_3 import StableAudioPipeline
+Launch the Gradio UI:
 
-pipe = StableAudioPipeline.from_pretrained("medium")
-audio = pipe.generate(
-    prompt="Lo-fi boom bap meets orchestral strings 84 BPM",
-    duration=30,
-)
+```bash
+uv run python run_gradio.py --model medium
+```
+
+This starts a local web interface with a shareable link. To load a LoRA checkpoint:
+
+```bash
+uv run python run_gradio.py --model medium --lora-ckpt-path path/to/lora.ckpt
 ```
 
 ## Usage

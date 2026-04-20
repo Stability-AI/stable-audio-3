@@ -50,20 +50,27 @@ def load_autoencoder(config_path: str, ckpt_path: str, device: str = "cpu"):
 
     autoencoder = create_autoencoder_from_config(config["model"], config["sample_rate"])
 
+    # ARC checkpoints store autoencoder weights under pretransform.model.*
+    # while RF checkpoints use pretransform.* directly. Detect which is present.
     prefix = "pretransform."
+    arc_prefix = "pretransform.model."
     if ckpt_path.endswith(".safetensors"):
         with safe_open(ckpt_path, framework="pt", device=device) as f:
+            all_keys = list(f.keys())
+        effective_prefix = arc_prefix if any(k.startswith(arc_prefix) for k in all_keys) else prefix
+        with safe_open(ckpt_path, framework="pt", device=device) as f:
             state_dict = {
-                k[len(prefix) :]: f.get_tensor(k)
-                for k in f.keys()
-                if k.startswith(prefix)
+                k[len(effective_prefix) :]: f.get_tensor(k)
+                for k in all_keys
+                if k.startswith(effective_prefix)
             }
     else:
         full = torch.load(ckpt_path, map_location=device, weights_only=True)[
             "state_dict"
         ]
+        effective_prefix = arc_prefix if any(k.startswith(arc_prefix) for k in full) else prefix
         state_dict = {
-            k[len(prefix) :]: v for k, v in full.items() if k.startswith(prefix)
+            k[len(effective_prefix) :]: v for k, v in full.items() if k.startswith(effective_prefix)
         }
 
     copy_state_dict(autoencoder, state_dict)

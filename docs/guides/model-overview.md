@@ -102,6 +102,4 @@ Stable Audio supports LoRA fine-tuning as an easy way to adapt models toward spe
 Note: LoRAs are trained on the RF base checkpoint. Once trained, they can be imported onto the ARC model and will work as expected.
 
 ## Training Data
-
-- [Freesound](https://freesound.org/)
-- [AudioSparx](https://www.audiosparx.com/)
+All models were trained on a combination of licensed ([AudioSparx](https://www.audiosparx.com/)) and CC0 ([Freesound](https://freesound.org/) data)

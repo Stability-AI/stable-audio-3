@@ -129,3 +129,45 @@ This currently works for the following parameters:
 - `prompt`
 - `negative prompt`
 - `duration`
+
+## Inference with LoRA
+
+Load one or more LoRA checkpoints onto the pipeline before generating:
+
+```python
+from stable_audio_3 import StableAudioPipeline
+
+pipe = StableAudioPipeline.from_pretrained("medium")
+pipe.load_lora(["path/to/lora.safetensors"])
+
+audio = pipe.generate(
+    prompt="Lo-fi boom bap meets orchestral strings 84 BPM",
+    duration=30,
+)
+```
+
+Multiple LoRAs can be stacked by passing additional paths:
+
+```python
+pipe.load_lora(["style_a.safetensors", "style_b.safetensors"])
+```
+
+### Adjusting LoRA strength
+
+Control how strongly the LoRA influences the output at runtime:
+
+```python
+pipe.set_lora_strength(0.5)              # Half-strength on all LoRAs
+pipe.set_lora_strength(1.5)              # Amplify the effect
+pipe.set_lora_strength(0.0)              # Disable without unloading
+
+# With multiple LoRAs, target by index:
+pipe.set_lora_strength(1.0, lora_index=0)
+pipe.set_lora_strength(0.3, lora_index=1)
+
+# Target only the DiT backbone or conditioner independently:
+pipe.set_lora_strength(1.0, target="dit")
+pipe.set_lora_strength(0.0, target="conditioner")
+```
+
+For full details on LoRA training and inference knobs, see [LoRA Training](lora_training.md).

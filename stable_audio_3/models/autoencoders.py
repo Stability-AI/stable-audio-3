@@ -577,8 +577,8 @@ class AudioAutoencoder(nn.Module):
             for i in range(0, total_size - chunk_size + 1, hop_size):
                 chunk = audio[:,:,i:i+chunk_size]
                 chunks.append(chunk)
-            if i+chunk_size != total_size:
-                # Final chunk
+            if not chunks or i+chunk_size != total_size:
+                # Final chunk (also handles audio shorter than one chunk)
                 chunk = audio[:,:,-chunk_size:]
                 chunks.append(chunk)
             chunks = torch.stack(chunks)
@@ -641,8 +641,8 @@ class AudioAutoencoder(nn.Module):
             for i in range(0, total_size - chunk_size + 1, hop_size):
                 chunk = latents[:,:,i:i+chunk_size]
                 chunks.append(chunk)
-            if i+chunk_size != total_size:
-                # Final chunk
+            if not chunks or i+chunk_size != total_size:
+                # Final chunk (also handles latents shorter than one chunk)
                 chunk = latents[:,:,-chunk_size:]
                 chunks.append(chunk)
             chunks = torch.stack(chunks)

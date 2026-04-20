@@ -230,6 +230,8 @@ def save_checkpoint(model, args, step, lora_alpha):
         "rank": args.rank,
         "alpha": lora_alpha,
         "adapter_type": args.adapter_type,
+        "include": args.include,
+        "exclude": args.exclude,
     }
     out = Path(args.output_dir) / f"lora_step{step}.safetensors"
     save_lora_safetensors(state_dict, lora_config, out)

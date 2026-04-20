@@ -26,7 +26,7 @@ Where `W` is the frozen pre-trained weight, `A` is a `(rank, fan_in)` matrix, an
 
 `A` is initialized with Kaiming uniform initialization and `B` is initialized to zeros, so the LoRA update starts at zero and the model begins training from its pre-trained behavior.
 
-## DoRA
+## DoRA (default)
 
 DoRA (Weight-Decomposed Low-Rank Adaptation) extends standard LoRA by separating weight updates into direction and magnitude components:
 
@@ -59,10 +59,10 @@ Because LoRA-XS computes SVD during initialization, placing the model on GPU bef
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `rank` | 8 | LoRA rank. Lower = fewer parameters, higher = more expressive. |
+| `rank` | 16 | LoRA rank. Lower = fewer parameters, higher = more expressive. |
 | `alpha` | same as `rank` | Scaling factor. The effective scaling is `alpha / rank`. Setting `alpha = rank` gives a scaling of 1.0. |
-| `adapter_type` | `"lora"` | One of `"lora"`, `"dora"`, or `"lora-xs"`. |
-| `dropout` | 0.0 | Dropout probability applied to LoRA inputs during training. Only used in ARC config. |
+| `adapter_type` | `"dora"` | One of `"lora"`, `"dora"`, or `"lora-xs"`. |
+| `dropout` | 0.0 | Dropout probability applied to LoRA inputs during training. |
 | `include` | `null` (all layers) | List of substring patterns. Only modules whose name contains at least one pattern get LoRA. Supports bracket expansion. |
 | `exclude` | `null` (no exclusions) | List of substring patterns. Modules matching any pattern are skipped, even if they match an include pattern. Supports bracket expansion. |
 
@@ -75,37 +75,27 @@ When `include` is specified, only layers whose fully-qualified name contains at 
 ### Examples
 
 Exclude the `seconds_total` conditioner (prevents conditioner hijacking on small datasets):
-```json
-{
-    "rank": 8,
-    "alpha": 8,
-    "adapter_type": "lora-xs",
-    "exclude": ["seconds_total"]
-}
+```bash
+python train_lora.py --model medium-rf --data_dir ./my_data \
+    --rank 16 --adapter_type lora-xs --exclude seconds_total
 ```
 
 Only apply LoRA to transformer layers:
-```json
-{
-    "rank": 8,
-    "include": ["transformer.layers"]
-}
+```bash
+python train_lora.py --model medium-rf --data_dir ./my_data \
+    --include transformer.layers
 ```
 
 Only the first 12 transformer layers:
-```json
-{
-    "rank": 8,
-    "include": ["layers[0-11]"]
-}
+```bash
+python train_lora.py --model medium-rf --data_dir ./my_data \
+    --include "layers[0-11]"
 ```
 
 Everything except local embedding and seconds_total conditioner:
-```json
-{
-    "rank": 8,
-    "exclude": ["to_local_embed", "seconds_total"]
-}
+```bash
+python train_lora.py --model medium-rf --data_dir ./my_data \
+    --exclude to_local_embed seconds_total
 ```
 
 Layer names are matched against the module's fully-qualified name relative to the submodel root. For the diffusion backbone these look like `transformer.layers.0.self_attn.to_qkv`, `to_timestep_embed.0`, etc. For the conditioner: `conditioners.seconds_total.embedder.embedding.1`, etc.
@@ -134,10 +124,10 @@ Use the `--lora-ckpt-path` argument when running the Gradio interface. You can l
 
 ```bash
 # Single LoRA
-python run_gradio.py --model-config config.json --ckpt-path model.ckpt --lora-ckpt-path lora.safetensors
+python run_gradio.py --model medium --lora-ckpt-path lora.safetensors
 
 # Multiple LoRAs
-python run_gradio.py --model-config config.json --ckpt-path model.ckpt \
+python run_gradio.py --model medium \
     --lora-ckpt-path style_a.safetensors style_b.safetensors
 ```
 

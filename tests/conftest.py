@@ -6,6 +6,8 @@ import torch
 import torchaudio
 
 from stable_audio_3 import StableAudioPipeline
+from stable_audio_3.loading_utils import load_autoencoder
+from stable_audio_3.model_configs import all_models
 
 # ---------------------------------------------------------------------------
 # Hardware detection — used by fixtures and tests to gate GPU-only paths
@@ -59,6 +61,22 @@ def model_pipe(request):
         if not HAS_CUDA:
             pytest.skip("Medium model requires a GPU/accelerator — none detected")
         return StableAudioPipeline.from_pretrained("medium", device=ACCEL_DEVICE)
+
+
+@pytest.fixture(scope="session", params=["small", "medium"])
+def autoencoder(request):
+    """Session-scoped autoencoder fixture loaded directly via load_autoencoder.
+
+    Parametrized over model sizes; medium requires a GPU/accelerator.
+    """
+    name = request.param
+    if name == "medium" and not HAS_CUDA:
+        pytest.skip("Medium model requires a GPU/accelerator — none detected")
+
+    cfg = all_models[name]
+    ae = load_autoencoder(cfg.config_path, cfg.ckpt_path, device=ACCEL_DEVICE)
+    ae.eval().requires_grad_(False)
+    return ae
 
 
 @pytest.fixture

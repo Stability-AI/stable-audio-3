@@ -106,7 +106,7 @@ with torch.no_grad():
 For LoRA training, it is much faster to pre-encode your dataset once and train from the saved latents. Use the provided script:
 
 ```bash
-python scripts/pre_encode_dataset.py \
+uv run python scripts/pre_encode_dataset.py \
   --model small \
   --data_dir ./my_data \
   --output_path ./latents_out \

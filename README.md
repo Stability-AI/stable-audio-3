@@ -1,10 +1,10 @@
 # Stable Audio 3
 
-**A state-of-the-art open platform for fast, high-quality generated audio and music.** (WIP tagline)
+**A state-of-the-art open platform for fast, high-quality generated audio and music.** 
 
 TBD Paper/blog links
 
-Image(s) TBD
+
 
 Stable Audio 3 is the next generation of Stable Audio: a focused, streamlined platform for inference and fine-tuning, built on lessons from [stable-audio-tools](https://github.com/Stability-AI/stable-audio-tools). If you're doing foundational research or working with previous Stable Audio models, that repo is still the place to go.
 

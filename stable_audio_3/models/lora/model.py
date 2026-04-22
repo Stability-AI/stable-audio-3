@@ -182,26 +182,27 @@ class LoRAParametrization(nn.Module):
     def lora_forward(self, W):
         delta = torch.matmul(*self.swap((self.lora_B, self.dropout_fn(self.lora_A)))).view(W.shape)
         delta = self.scaling * self.lora_strength * delta
-        return W + delta
+        return (W + delta.to(W.dtype))
     
     def dora_forward(self, W):
         if self.lora_strength == 0:
             return W
         # work in 2D so norm/magnitude ops don't broadcast badly for Conv1d/Conv2d
+        # Upcast W to LoRA param dtype for stable norm computation, cast result back.
         orig_shape = W.shape
-        W_2d = W.view(W.shape[0], -1)
+        W_2d = W.view(W.shape[0], -1).to(self.lora_A.dtype)
         # low-rank update on the *direction*
         delta = torch.matmul(*self.swap((self.lora_B, self.dropout_fn(self.lora_A))))
         V = W_2d + self.scaling * self.lora_strength * delta
         # normalize along _norm_dim, then scale by per-element magnitude
         V_hat = V / (V.norm(dim=self._norm_dim, keepdim=True) + 1e-12)
-        return (V_hat * self.magnitude.unsqueeze(self._norm_dim)).view(orig_shape)
+        return (V_hat * self.magnitude.unsqueeze(self._norm_dim)).view(orig_shape).to(W.dtype)
 
     def bora_forward(self, W):
         if self.lora_strength == 0:
             return W
         orig_shape = W.shape
-        W_2d = W.view(W.shape[0], -1)
+        W_2d = W.view(W.shape[0], -1).to(self.lora_A.dtype)
         delta = torch.matmul(*self.swap((self.lora_B, self.dropout_fn(self.lora_A))))
         V = W_2d + self.scaling * self.lora_strength * delta
         # Row-normalize, then scale by row magnitudes
@@ -209,34 +210,34 @@ class LoRAParametrization(nn.Module):
         intermediate = self.magnitude_r.unsqueeze(1) * V_r
         # Column-normalize, then scale by column magnitudes
         H_c = intermediate / (intermediate.norm(dim=0, keepdim=True) + 1e-12)
-        return (H_c * self.magnitude_c.unsqueeze(0)).view(orig_shape)
+        return (H_c * self.magnitude_c.unsqueeze(0)).view(orig_shape).to(W.dtype)
 
     def lora_xs_forward(self, W):
         delta = self.U @ self.M_xs.to(self.U.dtype) @ self.V.T
         delta = delta.view(W.shape)
-        return W + self.scaling * self.lora_strength * delta
+        return (W + (self.scaling * self.lora_strength * delta).to(W.dtype))
 
     def dora_xs_forward(self, W):
         if self.lora_strength == 0:
             return W
         orig_shape = W.shape
-        W_2d = W.view(W.shape[0], -1)
+        W_2d = W.view(W.shape[0], -1).to(self.U.dtype)
         delta = self.U @ self.M_xs.to(self.U.dtype) @ self.V.T
         V = W_2d + self.scaling * self.lora_strength * delta
         V_hat = V / (V.norm(dim=self._norm_dim, keepdim=True) + 1e-12)
-        return (V_hat * self.magnitude.unsqueeze(self._norm_dim)).view(orig_shape)
+        return (V_hat * self.magnitude.unsqueeze(self._norm_dim)).view(orig_shape).to(W.dtype)
 
     def bora_xs_forward(self, W):
         if self.lora_strength == 0:
             return W
         orig_shape = W.shape
-        W_2d = W.view(W.shape[0], -1)
+        W_2d = W.view(W.shape[0], -1).to(self.U.dtype)
         delta = self.U @ self.M_xs.to(self.U.dtype) @ self.V.T
         V = W_2d + self.scaling * self.lora_strength * delta
         V_r = V / (V.norm(dim=1, keepdim=True) + 1e-12)
         intermediate = self.magnitude_r.unsqueeze(1) * V_r
         H_c = intermediate / (intermediate.norm(dim=0, keepdim=True) + 1e-12)
-        return (H_c * self.magnitude_c.unsqueeze(0)).view(orig_shape)
+        return (H_c * self.magnitude_c.unsqueeze(0)).view(orig_shape).to(W.dtype)
 
     def forward(self, X):
         return self.forward_fn(X)

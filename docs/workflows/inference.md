@@ -130,6 +130,7 @@ This currently works for the following parameters:
 - `negative prompt`
 - `duration`
 
+# LoRA
 ## Inference with LoRA
 
 Load one or more LoRA checkpoints onto the pipeline before generating:

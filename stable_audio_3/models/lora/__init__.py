@@ -1,4 +1,4 @@
-from .model import LoRAParametrization, add_lora, default_lora_config, merge_lora, remove_lora, set_lora_strength
+from .model import LoRAParametrization, add_lora, default_lora_config, merge_lora, remove_lora, remove_lora_by_index, set_lora_strength
 from .utils import (
     apply_to_lora,
     convert_lora_ckpt_to_safetensors,
@@ -19,5 +19,10 @@ from .utils import (
     select_lora,
     tie_weights,
     untie_weights,
-    infer_global_rank
+    infer_global_rank,
+    cast_base_to_precision,
+    detect_dora_variant,
+    prepare_dora_state_dict,
+    resolve_adapter_type
 )
+from .loader import load_and_apply_loras

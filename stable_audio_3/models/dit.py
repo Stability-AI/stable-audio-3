@@ -8,7 +8,7 @@ from torch.nn import functional as F
 
 from .blocks import FourierFeatures, ExpoFourierFeatures
 from .transformer import ContinuousTransformer        
-from .minlora import LoRAParametrization, set_lora_strength, has_lora, enable_lora, disable_lora, filter_lora_layers
+from .lora import LoRAParametrization, set_lora_strength, has_lora, enable_lora, disable_lora, filter_lora_layers
 
 class DiffusionTransformer(nn.Module):
     def __init__(self,

@@ -451,7 +451,7 @@ def sample_diffusion(
             padding_mask = create_padding_mask_from_lengths(valid_lengths, latent_seq_len)
 
     # Determine sigma_max for schedule
-    sigma_max = init_noise_level if init_data is not None else 1.0
+    sigma_max = init_noise_level if init_data is not None else sampler_kwargs.get("sigma_max", 1.0)
 
     if init_data is not None:
         # RF objectives: linear interpolation

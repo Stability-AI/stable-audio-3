@@ -186,7 +186,7 @@ Each LoRA's interval and layer filter are evaluated independently at each sampli
 The `set_lora_strength()` function adjusts the LoRA contribution at runtime without modifying the LoRA weights:
 
 ```python
-from stable_audio_3.models.minlora import set_lora_strength
+from stable_audio_3.models.lora import set_lora_strength
 
 set_lora_strength(model, 0.5)   # Half-strength on all LoRAs
 set_lora_strength(model, 0.0)   # Effectively disable all LoRAs
@@ -204,7 +204,7 @@ This works by scaling the `lora_strength` buffer in each LoRA layer, which multi
 You can merge multiple LoRA checkpoints with different weights into a single base model:
 
 ```python
-from stable_audio_3.models.minlora.utils import merge_loras_into_base_model
+from stable_audio_3.models.lora.utils import merge_loras_into_base_model
 
 lora_configurations = [
     {
@@ -229,18 +229,10 @@ This computes the weighted sum of LoRA deltas and applies them directly to the b
 For models where the input embedding and output projection share weights, LoRA supports weight tying:
 
 ```python
-from stable_audio_3.models.minlora.utils import tie_weights, untie_weights
+from stable_audio_3.models.lora.utils import tie_weights, untie_weights
 
 tie_weights(linear_layer, embedding_layer)   # Share LoRA params
 untie_weights(linear_layer, embedding_layer) # Create independent copies
 ```
 
 This is only supported for standard LoRA (not DoRA or LoRA-XS).
-
-# Implementation Reference
-
-The LoRA implementation lives in `stable_audio_3/models/minlora/`:
-
-- `model.py` - `LoRAParametrization` class with all three adapter types, `add_lora()`, `merge_lora()`, `remove_lora()`, `set_lora_strength()`. Each parametrization carries a `lora_index` for multi-LoRA targeting.
-- `utils.py` - Parameter collection (`get_lora_params`, `get_lora_state_dict`), layer filtering, multi-LoRA support (`get_lora_count`, `remap_lora_state_dict`), rank inference, merging utilities
-- `__init__.py` - Public API exports

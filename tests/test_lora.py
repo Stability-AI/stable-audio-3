@@ -3,7 +3,7 @@ import torch
 from functools import partial
 
 from stable_audio_3 import StableAudioPipeline
-from stable_audio_3.models.minlora import (
+from stable_audio_3.models.lora import (
     LoRAParametrization,
     add_lora,
     get_lora_state_dict,

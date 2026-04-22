@@ -11,9 +11,10 @@ import os, time, math
 from einops import rearrange
 
 from stable_audio_3.interface.aeiou import audio_spectrogram_image
+from stable_audio_3.verbose import vprint
 from stable_audio_3.interface.reprompt import reprompt as _reprompt_fn
 from stable_audio_3.inference.distribution_shift import LogSNRShift, FluxDistributionShift, DistributionShift, IdentityDistributionShift
-from stable_audio_3.models.minlora import has_lora
+from stable_audio_3.models.lora import has_lora
 
 pipeline = None
 sample_size = 5324800
@@ -78,19 +79,17 @@ def generate_cond(
         preview_every = None
 
     # Parse per-LoRA controls from trailing args
-    # Each LoRA has 5 controls: dit_strength, cond_strength, interval_min, interval_max, layer_filter
+    # Each LoRA has 5 controls: strength, interval_min, interval_max, layer_filter
     lora_configs = None
-    if n_loras > 0 and len(lora_args) >= n_loras * 5:
+    if n_loras > 0 and len(lora_args) >= n_loras * 4:
         lora_configs = []
         for i in range(n_loras):
-            off = i * 5
-            dit_strength = lora_args[off]
-            cond_strength = lora_args[off + 1]
-            interval_min = lora_args[off + 2]
-            interval_max = lora_args[off + 3]
-            layer_filter = lora_args[off + 4]
-            pipeline.set_lora_strength(dit_strength, lora_index=i, target="dit")
-            pipeline.set_lora_strength(cond_strength, lora_index=i, target="conditioner")
+            off = i * 4
+            strength = lora_args[off]
+            interval_min = lora_args[off + 1]
+            interval_max = lora_args[off + 2]
+            layer_filter = lora_args[off + 3]
+            pipeline.set_lora_strength(strength, lora_index=i)
             lora_configs.append({
                 "lora_index": i,
                 "interval": (interval_min, interval_max),
@@ -287,10 +286,13 @@ def create_sampling_ui(pipeline):
     lora_names = getattr(pipeline.model, 'lora_names', [])
     n_loras = len(lora_names)
 
+    if default_prompt is None:
+        default_prompt = ""
+
 
     with gr.Row():
         with gr.Column(scale=6):
-            prompt = gr.Textbox(show_label=False, placeholder="Prompt")
+            prompt = gr.Textbox(show_label=False, placeholder="Prompt", value=default_prompt)
             negative_prompt = gr.Textbox(show_label=False, placeholder="Negative prompt")
         prompt_assistant_button = gr.Button("Prompt Assistant", scale=1)
         generate_button = gr.Button("Generate", variant='primary', scale=1)
@@ -319,13 +321,12 @@ def create_sampling_ui(pipeline):
                 for i, lora_name in enumerate(lora_names):
                     with gr.Accordion("LoRA {}: {}".format(i + 1, lora_name), open=(i == 0)):
                         with gr.Row():
-                            dit_str = gr.Slider(minimum=0.0, maximum=10.0, step=0.1, value=1.0, label="DiT strength")
-                            cond_str = gr.Slider(minimum=0.0, maximum=10.0, step=0.1, value=1.0, label="Conditioner strength")
+                            strength = gr.Slider(minimum=0.0, maximum=10.0, step=0.1, value=1.0, label="strength")
                         with gr.Row():
                             int_min = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.0, label="Interval min")
                             int_max = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=1.0, label="Interval max")
                             lyr_filt = gr.Textbox(label="Layer filter", placeholder="")
-                        lora_ui_inputs.extend([dit_str, cond_str, int_min, int_max, lyr_filt])
+                        lora_ui_inputs.extend([strength, int_min, int_max, lyr_filt])
 
             with gr.Accordion("Sampler params", open=False):
                 with gr.Row():
@@ -554,7 +555,7 @@ def create_sampling_ui(pipeline):
     prompt_assistant_button.click(fn=_prompt_assistant, inputs=[prompt], outputs=[prompt, seconds_total_slider])
 
 
-def create_diffusion_cond_ui(pipe, gradio_title=""):
+def create_diffusion_cond_ui(pipe, gradio_title="", default_prompt=None):
     global sample_size, sample_rate, pipeline
 
     sample_size = pipe.model_config["sample_size"]
@@ -635,7 +636,7 @@ def create_diffusion_cond_ui(pipe, gradio_title=""):
         if gradio_title:
             gr.Markdown("### %s" % gradio_title)
         with gr.Tab("Generation"):
-            create_sampling_ui(pipe)
+            create_sampling_ui(pipe, default_prompt=default_prompt)
 
         # JavaScript to autoplay audio immediately after generation (if autoplay enabled)
     return ui

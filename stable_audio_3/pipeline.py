@@ -2,22 +2,15 @@ import json
 import numpy as np
 import torch
 import typing as tp
-import os
-from functools import partial
 from torch.nn.functional import interpolate
 
 from stable_audio_3.inference.audio_utils import prepare_audio, numpy_audio_to_tensor
 from stable_audio_3.inference.sampling import sample_diffusion
 from stable_audio_3.loading_utils import load_diffusion_cond
 from stable_audio_3.model_configs import all_models
-from stable_audio_3.models.minlora import (
-    add_lora,
-    LoRAParametrization,
-    set_lora_strength,
-    infer_global_rank,
-    get_lora_layers,
-    load_lora_checkpoint,
-    remap_lora_state_dict,
+from stable_audio_3.models.lora import (
+    set_lora_strength as _set_lora_strength,
+    load_and_apply_loras,
 )
 
 
@@ -71,64 +64,14 @@ class StableAudioPipeline:
     def load_lora(self, lora_ckpt_paths):
         """Load LoRA checkpoints onto the model after construction."""
         model_type = self.model_config["model_type"]
-        lora_names = []
-        for i, lora_path in enumerate(lora_ckpt_paths):
-            print(f"Loading LoRA {i} from {lora_path}")
-            lora_state_dict, lora_config_dict = load_lora_checkpoint(lora_path)
-            lora_rank = lora_config_dict.get("rank", infer_global_rank(lora_state_dict))
-            lora_alpha = lora_config_dict.get("alpha", lora_rank)
-            lora_adapter_type = lora_config_dict.get("adapter_type", "lora")
-            lora_include = lora_config_dict.get("include", None)
-            lora_exclude = lora_config_dict.get("exclude", None)
-            lora_config = {
-                torch.nn.Linear: {
-                    "weight": partial(
-                        LoRAParametrization.from_linear,
-                        rank=lora_rank,
-                        lora_alpha=lora_alpha,
-                        adapter_type=lora_adapter_type,
-                        lora_index=i,
-                    ),
-                },
-                torch.nn.Conv1d: {
-                    "weight": partial(
-                        LoRAParametrization.from_conv1d,
-                        rank=lora_rank,
-                        lora_alpha=lora_alpha,
-                        adapter_type=lora_adapter_type,
-                        lora_index=i,
-                    ),
-                },
-            }
-            if model_type in ("diffusion_cond", "diffusion_cond_inpaint"):
-                add_lora(
-                    self.model.model,
-                    lora_config,
-                    include=lora_include,
-                    exclude=lora_exclude,
-                )
-                add_lora(
-                    self.model.conditioner,
-                    lora_config,
-                    include=lora_include,
-                    exclude=lora_exclude,
-                )
-            remapped_sd = remap_lora_state_dict(lora_state_dict, i)
-            self.model.model.load_state_dict(remapped_sd, strict=False)
-            self.model.conditioner.load_state_dict(remapped_sd, strict=False)
-            lora_names.append(os.path.splitext(os.path.basename(lora_path))[0])
+        svd_bases_path = self.model_config.get("svd_bases_path")
+        load_and_apply_loras(
+            self.model, lora_ckpt_paths, model_type, svd_bases_path=svd_bases_path
+        )
 
-        print("lora layers:", len(get_lora_layers(self.model)))
-        self.model.use_lora = True
-        self.model.lora_names = lora_names
-
-    def set_lora_strength(
-        self, strength: float, lora_index: int | None = None, target: str = "both"
-    ):
-        if target in ("dit", "both"):
-            set_lora_strength(self.model.model, strength, lora_index=lora_index)
-        if target in ("conditioner", "both"):
-            set_lora_strength(self.model.conditioner, strength, lora_index=lora_index)
+    def set_lora_strength(self, strength: float, lora_index: int | None = None):
+        _set_lora_strength(self.model.model, strength, lora_index=lora_index)
+        _set_lora_strength(self.model.conditioner, strength, lora_index=lora_index)
 
     @torch.inference_mode()
     def generate(
@@ -245,7 +188,7 @@ class StableAudioPipeline:
             inpaint_mask = inpaint_mask.float()
 
         # Seed and noise
-        seed = seed if seed != -1 else np.random.randint(0, 2**32 - 1)
+        seed = seed if seed != -1 else np.random.randint(0, 99999)
         torch.manual_seed(seed)
         noise = torch.randn(
             [batch_size, self.model.io_channels, latent_sample_size], device=device

@@ -6,6 +6,7 @@ from safetensors.torch import save_file as _st_save_file
 from torch import nn
 
 from .model import LoRAParametrization, _expand
+from ...verbose import vprint
 
 def apply_to_lora(fn):
     """apply a function to LoRAParametrization layers, designed to be used with model.apply"""
@@ -49,7 +50,7 @@ def has_lora(model):
 
 def filter_lora_layers(model, lora_layer_filter, lora_index=None):
     """Enable/disable LoRA layers by name filter. If lora_index is specified, only affects that index."""
-    lora_layer_filter = lora_layer_filter.strip()
+    lora_layer_filter = (lora_layer_filter or "").strip()
     # lora_layer_filter: logical OR on comma separated substrings
     # e.g. ".transformer.layers, .to_global_embed."
     def is_filtered(layer_name):
@@ -76,7 +77,7 @@ def name_is_lora(name):
     return (
         len(name.split(".")) >= 4
         and (name.split(".")[-4]) == "parametrizations"
-        and name.split(".")[-1] in ["lora_A", "lora_B", "M_xs", "magnitude"]
+        and name.split(".")[-1] in ["lora_A", "lora_B", "M_xs", "magnitude", "magnitude_r", "magnitude_c"]
     )
 
 
@@ -104,6 +105,31 @@ def get_lora_state_dict(model):
     return {k: v for k, v in model.state_dict().items() if name_is_lora(k)}
 
 
+def cast_base_to_precision(model, precision):
+    """Cast frozen base weights to lower precision, keeping LoRA params in fp32.
+
+    Args:
+        model: Model with LoRA parametrizations applied.
+        precision: One of "bf16", "bfloat16", "fp16", "float16".
+    """
+    import torch
+
+    dtype_map = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+                 "fp16": torch.float16, "float16": torch.float16}
+    target_dtype = dtype_map.get(precision)
+    if target_dtype is None:
+        print(f"Unknown base_precision={precision!r}, keeping fp32")
+        return
+    vprint(f"Casting frozen base weights to {target_dtype}")
+    model.to(target_dtype)
+    # Restore LoRA params to fp32 — optimizer needs full precision
+    n_restored = 0
+    for p in get_lora_params(model):
+        p.data = p.data.to(torch.float32)
+        n_restored += 1
+    vprint(f"  Restored {n_restored} LoRA params to fp32")
+
+
 # ------------------- helper function for loading LoRa at inference -------------------
 
 def infer_global_rank(lora_sd: dict) -> int:
@@ -125,6 +151,50 @@ def infer_global_rank(lora_sd: dict) -> int:
     return r
 
 
+def detect_dora_variant(state_dict):
+    """Detect DoRA variant from a state dict.
+
+    Returns "dora-cols" (dim=0, per-input-feature) or "dora-rows" (dim=1,
+    per-output-neuron) based on the shape of the first .magnitude tensor
+    found. Returns None if no magnitude tensors exist or axis is ambiguous.
+    """
+    for key, val in state_dict.items():
+        if not key.endswith(".magnitude"):
+            continue
+        if val.dim() == 2:
+            if val.shape[0] == 1:
+                return "dora-cols"   # old format: (1, fan_in)
+            elif val.shape[1] == 1:
+                return "dora-rows"   # (fan_out, 1)
+        # 1D magnitude — can't determine axis without model context
+        return None
+    return None
+
+
+def prepare_dora_state_dict(state_dict):
+    """Squeeze 2D DoRA magnitude tensors to 1D for loading. Modifies in-place."""
+    for key in list(state_dict.keys()):
+        if key.endswith(".magnitude") and state_dict[key].dim() == 2:
+            state_dict[key] = state_dict[key].squeeze()
+
+
+def resolve_adapter_type(adapter_type, state_dict=None):
+    """Resolve legacy "dora" adapter_type to the correct variant.
+
+    If adapter_type is "dora" and a checkpoint state_dict is provided,
+    attempts to detect dora-rows vs dora-cols from magnitude tensor shapes.
+    Falls back to "dora-rows" (paper-correct default).
+    All other adapter types are returned unchanged.
+    """
+    if adapter_type != "dora":
+        return adapter_type
+    if state_dict is not None:
+        detected = detect_dora_variant(state_dict)
+        if detected:
+            return detected
+    return "dora-rows"
+
+
 # ------------------- helper functions for safetensors LoRA checkpoints -------------------
 
 
@@ -140,7 +210,8 @@ def save_lora_safetensors(state_dict, lora_config, path):
         path: Output file path (should end in .safetensors).
     """
     metadata = {"lora_config": json.dumps(lora_config)}
-    _st_save_file(state_dict, str(path), metadata=metadata)
+    fp16_dict = {k: v.half() if v.is_floating_point() else v for k, v in state_dict.items()}
+    _st_save_file(fp16_dict, str(path), metadata=metadata)
 
 
 def load_lora_checkpoint(path):
@@ -224,10 +295,16 @@ def _get_adapter_param_names(lora_layer):
     """Return the list of trainable parameter names for this adapter type."""
     if lora_layer.adapter_type == "lora":
         return ["lora_A", "lora_B"]
-    elif lora_layer.adapter_type == "dora":
+    elif lora_layer.adapter_type in ("dora", "dora-rows", "dora-cols"):
         return ["lora_A", "lora_B", "magnitude"]
+    elif lora_layer.adapter_type == "bora":
+        return ["lora_A", "lora_B", "magnitude_r", "magnitude_c"]
     elif lora_layer.adapter_type == "lora-xs":
         return ["M_xs"]
+    elif lora_layer.adapter_type in ("dora-rows-xs", "dora-cols-xs"):
+        return ["M_xs", "magnitude"]
+    elif lora_layer.adapter_type == "bora-xs":
+        return ["M_xs", "magnitude_r", "magnitude_c"]
     return []
 
 

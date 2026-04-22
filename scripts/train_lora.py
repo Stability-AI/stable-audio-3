@@ -36,11 +36,14 @@ from stable_audio_3.data.dataset import (
 from stable_audio_3.loading_utils import copy_state_dict, load_ckpt_state_dict
 from stable_audio_3.model import create_diffusion_cond_from_config
 from stable_audio_3.model_configs import rf_models
-from stable_audio_3.models.minlora import (
+from stable_audio_3.models.lora import (
     LoRAParametrization,
     add_lora,
+    cast_base_to_precision,
     get_lora_params,
     get_lora_state_dict,
+    prepare_dora_state_dict,
+    resolve_adapter_type,
     save_lora_safetensors,
 )
 
@@ -71,7 +74,9 @@ def apply_lora(
     dropout: float = 0.0,
     include=None,
     exclude=None,
+    svd_bases=None,
 ):
+    adapter_type = resolve_adapter_type(adapter_type)
     lora_cfg = {
         torch.nn.Linear: {
             "weight": partial(
@@ -92,8 +97,16 @@ def apply_lora(
             ),
         },
     }
-    add_lora(model.model, lora_cfg, include=include, exclude=exclude)
-    add_lora(model.conditioner, lora_cfg, include=include, exclude=exclude)
+    add_lora(
+        model.model, lora_cfg, include=include, exclude=exclude, svd_bases=svd_bases
+    )
+    add_lora(
+        model.conditioner,
+        lora_cfg,
+        include=include,
+        exclude=exclude,
+        svd_bases=svd_bases,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +138,14 @@ def train(args):
     sample_size = (int(args.duration * sample_rate) // ds_ratio) * ds_ratio
 
     lora_alpha = args.lora_alpha if args.lora_alpha is not None else args.rank
+
+    svd_bases = None
+    if args.svd_bases_path is not None:
+        print(f"Loading SVD bases from {args.svd_bases_path}")
+        svd_bases = torch.load(
+            args.svd_bases_path, map_location="cpu", weights_only=True
+        )
+
     apply_lora(
         model,
         rank=args.rank,
@@ -133,13 +154,34 @@ def train(args):
         dropout=args.dropout,
         include=args.include,
         exclude=args.exclude,
+        svd_bases=svd_bases,
     )
+
+    if args.lora_checkpoint is not None:
+        print(f"Loading LoRA checkpoint from {args.lora_checkpoint}")
+        from stable_audio_3.models.lora import load_lora_checkpoint
+
+        lora_sd = load_lora_checkpoint(args.lora_checkpoint)
+        prepare_dora_state_dict(lora_sd)
+        model.model.load_state_dict(lora_sd, strict=False)
+        model.conditioner.load_state_dict(lora_sd, strict=False)
+
     lora_params = list(get_lora_params(model.model)) + list(
         get_lora_params(model.conditioner)
     )
     # LoRA params train in fp32; base model stays in bf16
     for p in lora_params:
         p.data = p.data.float()
+
+    if args.base_precision:
+        cast_base_to_precision(model.model, args.base_precision)
+        cast_base_to_precision(model.conditioner, args.base_precision)
+        if model.pretransform is not None:
+            model.pretransform.to(
+                torch.bfloat16
+                if args.base_precision in ("bf16", "bfloat16")
+                else torch.float16
+            )
     print(f"Trainable LoRA params: {sum(p.numel() for p in lora_params):,}")
 
     optimizer = AdamW(lora_params, lr=args.lr)
@@ -286,6 +328,22 @@ def main():
         nargs="*",
         default=None,
         help="Skip modules whose name contains one of these substrings",
+    )
+    p.add_argument(
+        "--svd_bases_path",
+        default=None,
+        help="Path to pre-computed SVD bases (.pt) for -XS adapter types",
+    )
+    p.add_argument(
+        "--base_precision",
+        choices=["bf16", "bfloat16", "fp16", "float16"],
+        default=None,
+        help="Cast frozen base weights to lower precision (LoRA params stay fp32)",
+    )
+    p.add_argument(
+        "--lora_checkpoint",
+        default=None,
+        help="Path to an existing LoRA .safetensors checkpoint to resume from",
     )
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--steps", type=int, default=1000)

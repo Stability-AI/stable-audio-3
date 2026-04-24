@@ -12,7 +12,7 @@ from einops import rearrange
 
 from stable_audio_3.interface.aeiou import audio_spectrogram_image
 from stable_audio_3.verbose import vprint
-from stable_audio_3.interface.reprompt import reprompt as _reprompt_fn
+from stable_audio_3.interface.reprompt import reprompt as _reprompt_fn, is_model_cached as _reprompt_model_cached
 from stable_audio_3.inference.distribution_shift import LogSNRShift, FluxDistributionShift, DistributionShift, IdentityDistributionShift
 from stable_audio_3.models.lora import has_lora
 
@@ -240,7 +240,7 @@ def delete_files_async(filenames, delay):
                 os.remove(filename)  # Delete the file
     threading.Thread(target=delete_files_after_delay, args=(filenames, delay)).start()
 
-def create_sampling_ui(pipeline):
+def create_sampling_ui(pipeline, default_prompt=None):
     global n_loras
     diffusion_objective = pipeline.model.diffusion_objective
     is_rf = diffusion_objective == "rectified_flow"
@@ -290,12 +290,18 @@ def create_sampling_ui(pipeline):
         default_prompt = ""
 
 
+    _PA_MODEL_ID = "Qwen/Qwen3.5-2B"
+    _pa_cached = _reprompt_model_cached(_PA_MODEL_ID)
+
     with gr.Row():
         with gr.Column(scale=6):
             prompt = gr.Textbox(show_label=False, placeholder="Prompt", value=default_prompt)
             negative_prompt = gr.Textbox(show_label=False, placeholder="Negative prompt")
-        prompt_assistant_button = gr.Button("Prompt Assistant", scale=1)
-        generate_button = gr.Button("Generate", variant='primary', scale=1)
+        with gr.Column(scale=3):
+            with gr.Row():
+                prompt_assistant_button = gr.Button("Prompt Assistant", scale=1, interactive=_pa_cached)
+                generate_button = gr.Button("Generate", variant='primary', scale=1)
+            download_pa_button = gr.Button("Download Prompt Assistant (~4.5GB)", scale=1, visible=not _pa_cached)
 
     with gr.Row(equal_height=False):
         with gr.Column():
@@ -542,7 +548,7 @@ def create_sampling_ui(pipeline):
     }
 
     def _prompt_assistant(text):
-        _, result, category = _reprompt_fn(text, "Auto", "", "Qwen/Qwen3.5-2B", 128, 1.11)
+        _, result, category = _reprompt_fn(text, "Auto", "", _PA_MODEL_ID, 128, 1.11)
         m = _LENGTH_EXTRACT_RE.search(result)
         if m:
             seconds = int(m.group(1))
@@ -552,7 +558,14 @@ def create_sampling_ui(pipeline):
         prefix = _TRACK_TYPE_PREFIXES.get(category, "")
         return prefix + result, seconds
 
+    def _download_prompt_assistant():
+        yield gr.update(value="Downloading...", interactive=False), gr.update()
+        from stable_audio_3.interface.reprompt import get_model
+        get_model(_PA_MODEL_ID)
+        yield gr.update(visible=False), gr.update(interactive=True)
+
     prompt_assistant_button.click(fn=_prompt_assistant, inputs=[prompt], outputs=[prompt, seconds_total_slider])
+    download_pa_button.click(fn=_download_prompt_assistant, inputs=[], outputs=[download_pa_button, prompt_assistant_button])
 
 
 def create_diffusion_cond_ui(pipe, gradio_title="", default_prompt=None):

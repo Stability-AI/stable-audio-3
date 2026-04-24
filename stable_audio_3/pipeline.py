@@ -8,11 +8,7 @@ from stable_audio_3.inference.audio_utils import prepare_audio, numpy_audio_to_t
 from stable_audio_3.inference.sampling import sample_diffusion
 from stable_audio_3.loading_utils import load_diffusion_cond
 from stable_audio_3.model_configs import all_models
-from stable_audio_3.models.lora import (
-    set_lora_strength as _set_lora_strength,
-    load_and_apply_loras,
-)
-
+from stable_audio_3.models.lora import set_lora_strength as _set_lora_strength, load_and_apply_loras
 
 class StableAudioPipeline:
     def __init__(self, model, model_config, device, model_half):
@@ -65,9 +61,7 @@ class StableAudioPipeline:
         """Load LoRA checkpoints onto the model after construction."""
         model_type = self.model_config["model_type"]
         svd_bases_path = self.model_config.get("svd_bases_path")
-        load_and_apply_loras(
-            self.model, lora_ckpt_paths, model_type, svd_bases_path=svd_bases_path
-        )
+        load_and_apply_loras(self.model, lora_ckpt_paths, model_type, svd_bases_path=svd_bases_path)
 
     def set_lora_strength(self, strength: float, lora_index: int | None = None):
         _set_lora_strength(self.model.model, strength, lora_index=lora_index)

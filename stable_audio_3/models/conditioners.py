@@ -104,16 +104,16 @@ class NumberConditioner(Conditioner):
 
 class T5GemmaConditioner(Conditioner):
 
-    T5GEMMA_MODELS = ["google/t5gemma-b-b-ul2"]
+    T5GEMMA_MODELS = ["stabilityai/t5gemma-b-b-ul2"]
 
     T5GEMMA_MODEL_DIMS = {
-        "google/t5gemma-b-b-ul2": 768,
+        "stabilityai/t5gemma-b-b-ul2": 768,
     }
 
     def __init__(
             self,
             output_dim: int,
-            model_name: str = "google/t5gemma-b-b-ul2",
+            model_name: str = "stabilityai/t5gemma-b-b-ul2",
             max_length: str = 128,
             enable_grad: bool = False,
             project_out: bool = False,

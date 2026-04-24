@@ -346,6 +346,19 @@ Examples:
 _cache = {"model_id": None, "tokenizer": None, "model": None}
 
 
+def is_model_cached(model_id: str) -> bool:
+    """Return True if the model weights are already present in the local HF cache."""
+    # Already loaded in this session
+    if _cache["model"] is not None and _cache["model_id"] == model_id:
+        return True
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        result = try_to_load_from_cache(model_id, "config.json")
+        return result is not None
+    except Exception:
+        return False
+
+
 def get_model(model_id):
     if model_id != _cache["model_id"]:
         print(f"[Loading] {model_id}")

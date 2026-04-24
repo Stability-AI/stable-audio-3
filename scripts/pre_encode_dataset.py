@@ -45,12 +45,13 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     cfg = all_models[args.model]
-    autoencoder = load_autoencoder(cfg.config_path, cfg.ckpt_path, device=str(device))
+    local_config, local_ckpt = cfg.resolve()
+    autoencoder = load_autoencoder(local_config, local_ckpt, device=str(device))
     autoencoder.eval().requires_grad_(False)
     if args.model_half:
         autoencoder = autoencoder.half()
 
-    with open(cfg.config_path) as f:
+    with open(local_config) as f:
         sample_rate = json.load(f)["sample_rate"]
 
     dataset = SampleDataset(

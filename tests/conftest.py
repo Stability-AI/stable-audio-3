@@ -49,8 +49,6 @@ def model_pipe(request):
 
     small  — loads via from_pretrained("small"); runs on CPU or accelerator.
     medium — requires a GPU/accelerator; skipped otherwise.
-             Update from_pretrained to point at the HuggingFace medium checkpoint
-             when it becomes available.
     """
     name = request.param
 
@@ -74,7 +72,8 @@ def autoencoder(request):
         pytest.skip("Medium model requires a GPU/accelerator — none detected")
 
     cfg = all_models[name]
-    ae = load_autoencoder(cfg.config_path, cfg.ckpt_path, device=ACCEL_DEVICE)
+    local_config, local_ckpt = cfg.resolve()
+    ae = load_autoencoder(local_config, local_ckpt, device=ACCEL_DEVICE)
     ae.eval().requires_grad_(False)
     return ae
 

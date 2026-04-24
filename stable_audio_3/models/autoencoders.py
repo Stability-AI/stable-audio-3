@@ -561,61 +561,37 @@ class AudioAutoencoder(nn.Module):
         The chunk_size vs memory tradeoff isn't linear, and possibly depends on the GPU and CUDA version
         For example, on a A6000 chunk_size 128 is overall faster than 256 and 512 even though it has more chunks
         '''
-        if not chunked:
-            # default behavior. Encode the entire audio in parallel
+        samples_per_latent = int(self.downsampling_ratio)
+        if not chunked or audio.shape[-1] < chunk_size * samples_per_latent:
             return self.encode(audio, **kwargs)
-        else:
-            # CHUNKED ENCODING
-            # samples_per_latent is just the downsampling ratio (which is also the upsampling ratio)
-            samples_per_latent = int(self.downsampling_ratio)
-            total_size = audio.shape[2] # in samples
-            batch_size = audio.shape[0]
-            chunk_size *= samples_per_latent # converting metric in latents to samples
-            overlap *= samples_per_latent # converting metric in latents to samples
-            hop_size = chunk_size - overlap
-            chunks = []
-            for i in range(0, total_size - chunk_size + 1, hop_size):
-                chunk = audio[:,:,i:i+chunk_size]
-                chunks.append(chunk)
-            if not chunks or i+chunk_size != total_size:
-                # Final chunk (also handles audio shorter than one chunk)
-                chunk = audio[:,:,-chunk_size:]
-                chunks.append(chunk)
-            chunks = torch.stack(chunks)
-            num_chunks = chunks.shape[0]
-            # Note: y_size might be a different value from the latent length used in diffusion training
-            # because we can encode audio of varying lengths
-            # However, the audio should've been padded to a multiple of samples_per_latent by now.
-            y_size = total_size // samples_per_latent
-            # Create an empty latent, we will populate it with chunks as we encode them
-            y_final = torch.zeros((batch_size,self.latent_dim,y_size), dtype = chunks.dtype).to(audio.device)
-            for i in range(num_chunks):
-                x_chunk = chunks[i,:]
-                # encode the chunk
-                y_chunk = self.encode(x_chunk)
-                # figure out where to put the audio along the time domain
-                if i == num_chunks-1:
-                    # final chunk always goes at the end
-                    t_end = y_size
-                    t_start = t_end - y_chunk.shape[2]
-                else:
-                    t_start = i * hop_size // samples_per_latent
-                    t_end = t_start + chunk_size // samples_per_latent
-                #  remove the edges of the overlaps
-                ol = overlap//samples_per_latent//2
-                chunk_start = 0
-                chunk_end = y_chunk.shape[2]
-                if i > 0:
-                    # no overlap for the start of the first chunk
-                    t_start += ol
-                    chunk_start += ol
-                if i < num_chunks-1:
-                    # no overlap for the end of the last chunk
-                    t_end -= ol
-                    chunk_end -= ol
-                # paste the chunked audio into our y_final output audio
-                y_final[:,:,t_start:t_end] = y_chunk[:,:,chunk_start:chunk_end]
-            return y_final
+
+        # chunk_size/overlap are in latent units; scale to samples for slicing.
+        chunk_size_samples = chunk_size * samples_per_latent
+        hop_samples = (chunk_size - overlap) * samples_per_latent
+        total_samples = audio.shape[-1]
+
+        # Anchor the final chunk to the signal end (may overlap more than `overlap`).
+        chunk_starts = list(range(0, total_samples - chunk_size_samples + 1, hop_samples))
+        if chunk_starts[-1] != total_samples - chunk_size_samples:
+            chunk_starts.append(total_samples - chunk_size_samples)
+
+        encoded_chunks = [self.encode(audio[..., s:s + chunk_size_samples]) for s in chunk_starts]
+
+        total_latents = total_samples // samples_per_latent
+        half_overlap_latents = overlap // 2
+        output = audio.new_zeros(*encoded_chunks[0].shape[:-1], total_latents)
+        num_chunks = len(chunk_starts)
+
+        # Trim half the overlap off inner edges (edges facing a neighbour chunk).
+        for i, (start_sample, chunk) in enumerate(zip(chunk_starts, encoded_chunks)):
+            is_first = i == 0
+            is_last = i == num_chunks - 1
+            out_start = (total_latents - chunk_size) if is_last else (start_sample // samples_per_latent)
+            left  = 0 if is_first else half_overlap_latents
+            right = chunk_size if is_last else chunk_size - half_overlap_latents
+            output[..., out_start + left : out_start + right] = chunk[..., left:right]
+
+        return output
     
     def decode_audio(self, latents, chunked=False, overlap=32, chunk_size=128, **kwargs):
         '''
@@ -629,56 +605,35 @@ class AudioAutoencoder(nn.Module):
         The chunk_size vs memory tradeoff isn't linear, and possibly depends on the GPU and CUDA version
         For example, on a A6000 chunk_size 128 is overall faster than 256 and 512 even though it has more chunks
         '''
-        if not chunked:
-            # default behavior. Decode the entire latent in parallel
+        if not chunked or latents.shape[-1] < chunk_size:
             return self.decode(latents, **kwargs)
-        else:
-            # chunked decoding
-            hop_size = chunk_size - overlap
-            total_size = latents.shape[2]
-            batch_size = latents.shape[0]
-            chunks = []
-            for i in range(0, total_size - chunk_size + 1, hop_size):
-                chunk = latents[:,:,i:i+chunk_size]
-                chunks.append(chunk)
-            if not chunks or i+chunk_size != total_size:
-                # Final chunk (also handles latents shorter than one chunk)
-                chunk = latents[:,:,-chunk_size:]
-                chunks.append(chunk)
-            chunks = torch.stack(chunks)
-            num_chunks = chunks.shape[0]
-            # samples_per_latent is just the downsampling ratio
-            samples_per_latent = int(self.downsampling_ratio)
-            # Create an empty waveform, we will populate it with chunks as decode them
-            y_size = total_size * samples_per_latent
-            y_final = torch.zeros((batch_size,self.out_channels,y_size), dtype = chunks.dtype).to(latents.device)
-            for i in range(num_chunks):
-                x_chunk = chunks[i,:]
-                # decode the chunk
-                y_chunk = self.decode(x_chunk)
-                # figure out where to put the audio along the time domain
-                if i == num_chunks-1:
-                    # final chunk always goes at the end
-                    t_end = y_size
-                    t_start = t_end - y_chunk.shape[2]
-                else:
-                    t_start = i * hop_size * samples_per_latent
-                    t_end = t_start + chunk_size * samples_per_latent
-                #  remove the edges of the overlaps
-                ol = (overlap//2) * samples_per_latent
-                chunk_start = 0
-                chunk_end = y_chunk.shape[2]
-                if i > 0:
-                    # no overlap for the start of the first chunk
-                    t_start += ol
-                    chunk_start += ol
-                if i < num_chunks-1:
-                    # no overlap for the end of the last chunk
-                    t_end -= ol
-                    chunk_end -= ol
-                # paste the chunked audio into our y_final output audio
-                y_final[:,:,t_start:t_end] = y_chunk[:,:,chunk_start:chunk_end]
-            return y_final
 
-    
+        # chunk_size/overlap are in latent units — same as `latents`, no scaling.
+        samples_per_latent = int(self.downsampling_ratio)
+        hop_latents = chunk_size - overlap
+        total_latents = latents.shape[-1]
+
+        # Anchor the final chunk to the signal end (may overlap more than `overlap`).
+        chunk_starts = list(range(0, total_latents - chunk_size + 1, hop_latents))
+        if chunk_starts[-1] != total_latents - chunk_size:
+            chunk_starts.append(total_latents - chunk_size)
+
+        decoded_chunks = [self.decode(latents[..., s:s + chunk_size]) for s in chunk_starts]
+
+        total_samples = total_latents * samples_per_latent
+        chunk_size_samples = chunk_size * samples_per_latent
+        half_overlap_samples = (overlap // 2) * samples_per_latent
+        output = latents.new_zeros(*decoded_chunks[0].shape[:-1], total_samples)
+        num_chunks = len(chunk_starts)
+
+        # Trim half the overlap off inner edges (edges facing a neighbour chunk).
+        for i, (start_latent, chunk) in enumerate(zip(chunk_starts, decoded_chunks)):
+            is_first = i == 0
+            is_last = i == num_chunks - 1
+            out_start = (total_samples - chunk_size_samples) if is_last else (start_latent * samples_per_latent)
+            left  = 0 if is_first else half_overlap_samples
+            right = chunk_size_samples if is_last else chunk_size_samples - half_overlap_samples
+            output[..., out_start + left : out_start + right] = chunk[..., left:right]
+
+        return output
         

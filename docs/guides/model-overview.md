@@ -97,16 +97,20 @@ TODO: fill this in.
 
 At inference time, Stable Audio 3 turns your inputs (text prompt and duration) into audio through a two-stage process: latent generation with the DiT, followed by waveform reconstruction with SAME.
 
-1. Conditioning setup
+**1. Conditioning setup**
+ 
 Your prompt is encoded into a dense embedding using T5Gemma, while the duration is converted into a sinusoidal embedding that represents the desired output length. If inpainting is used, the provided audio is first encoded into SAME latents and combined with a temporal mask indicating where generation should occur.
 
-2. Latent initialization
+**2. Latent initialization**
+
 A sequence of Gaussian noise is initialized in the SAME latent space. The length of this sequence is determined directly from the requested duration, thanks to the model’s variable-length training.
 
-3. Iterative denoising (DiT sampling)
+**3. Iterative denoising (DiT sampling)**
+
 The DiT progressively transforms this noise into structured latents over a series of steps. At each step, the model predicts how to move the current latent state closer to a valid audio representation while staying consistent with the conditioning (text, duration, and optional inpainting signal). Because the model is trained with rectified flow and ARC, we can reduce the number of steps needed down to 8 while maintaining high quality. 
 
-4. Latent → audio decoding (SAME)
+**4. Latent → audio decoding (SAME)**
+
 Once the final latent sequence is produced, it is passed through the SAME decoder. This reconstructs a full-resolution 44.1 kHz stereo waveform, restoring both fine acoustic details and higher-level musical structure.
 
 

@@ -12,8 +12,8 @@ Dataset layout:
 Saves .safetensors LoRA checkpoints compatible with the inference pipeline and run_gradio.py.
 
 Usage:
-  python train_lora.py --model medium-rf --data_dir ./my_data --output_dir ./lora_out
-  python train_lora.py --model medium-rf --data_dir ./my_data --steps 500 --rank 8
+  uv run python train_lora.py --model medium-rf --data_dir ./my_data --output_dir ./lora_out
+  uv run python train_lora.py --model medium-rf --data_dir ./my_data --steps 500 --rank 8
 """
 
 import argparse

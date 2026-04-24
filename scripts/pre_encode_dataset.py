@@ -12,8 +12,8 @@ Dataset layout:
 Saves .npy files for latents and .json files for metadata, compatible with train_lora.py --encoded_dir.
 
 Usage:
-  python pre_encode_dataset.py --model small --data_dir ./my_data --output_path ./latents_out
-  python pre_encode_dataset.py --model medium --data_dir ./my_data --output_path ./latents_out --batch_size 4
+  uv run python pre_encode_dataset.py --model small --data_dir ./my_data --output_path ./latents_out
+  uv run python pre_encode_dataset.py --model medium --data_dir ./my_data --output_path ./latents_out --batch_size 4
 """
 
 import argparse

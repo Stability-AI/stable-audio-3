@@ -58,10 +58,11 @@ def load_model(model_name: str, device: torch.device):
             f"LoRA training only supports RF models. Got '{model_name}', valid: {list(rf_models)}"
         )
     model_cfg = rf_models[model_name]
-    with open(model_cfg.config_path) as f:
+    local_config, local_ckpt = model_cfg.resolve()
+    with open(local_config) as f:
         model_config = json.load(f)
     model = create_diffusion_cond_from_config(model_config)
-    copy_state_dict(model, load_ckpt_state_dict(model_cfg.ckpt_path))
+    copy_state_dict(model, load_ckpt_state_dict(local_ckpt))
     model.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
     return model, model_config
 

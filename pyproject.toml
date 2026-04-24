@@ -17,6 +17,7 @@ dependencies = [
     "dill>=0.4.1",
     "tqdm>=4.67.3",
     "accelerate>=1.13.0",
+    "huggingface-hub>=1.7.1",
 ]
 [project.optional-dependencies]
 flash-attn = [

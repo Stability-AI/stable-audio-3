@@ -104,9 +104,7 @@ Your prompt is encoded into a dense embedding using T5Gemma, while the duration 
 A sequence of Gaussian noise is initialized in the SAME latent space. The length of this sequence is determined directly from the requested duration, thanks to the model’s variable-length training.
 
 3. Iterative denoising (DiT sampling)
-The DiT progressively transforms this noise into structured latents over a series of steps. At each step, the model predicts how to move the current latent state closer to a valid audio representation while staying consistent with the conditioning (text, duration, and optional inpainting signal).
-
-Because the model is trained with rectified flow and ARC, we can reduce the number of steps needed down to 8 while maintaining high quality. 
+The DiT progressively transforms this noise into structured latents over a series of steps. At each step, the model predicts how to move the current latent state closer to a valid audio representation while staying consistent with the conditioning (text, duration, and optional inpainting signal). Because the model is trained with rectified flow and ARC, we can reduce the number of steps needed down to 8 while maintaining high quality. 
 
 4. Latent → audio decoding (SAME)
 Once the final latent sequence is produced, it is passed through the SAME decoder. This reconstructs a full-resolution 44.1 kHz stereo waveform, restoring both fine acoustic details and higher-level musical structure.

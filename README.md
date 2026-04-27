@@ -160,7 +160,7 @@ if there are errors in any of this, `flash_attn` is not installed correctly.
 This project is licensed under the **MIT License** — see [LICENSE](LICENSE) for details.
 
 **Model Weights:** The model weights in this repository are also MIT licensed
-for individuals and organizations with annual gross revenue under **$1,000,000 USD**.
+for individuals and organizations with annual gross revenue under **$1M USD**.
 Organizations exceeding this threshold require a commercial license.
 
 To use these models commercially, please refer to the 

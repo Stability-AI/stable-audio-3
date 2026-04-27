@@ -110,6 +110,8 @@ To extend an audio clip (outpainting), set `inpaint_mask_start_seconds` to the l
 
 ## Hardware Support
 
+*COMING SOON*
+
 Stable Audio 3 scales from a laptop to a multi-GPU server. Specify your backend at load time:
 
 ```python
@@ -119,13 +121,6 @@ model = StableAudioPipeline.from_pretrained(
 )
 ```
 
-| Backend | Hardware |
-|---|---|
-| `cuda` + TensorRT | NVIDIA GPU |
-| `mlx` | Apple Silicon (Metal) |
-| `coreml` | Apple Neural Engine |
-| `openvino` | Intel CPU / GPU |
-| `cpu` | Any (via LiteRT / XNNPACK) |
 
 ### Inference Times
 
@@ -162,10 +157,14 @@ if there are errors in any of this, `flash_attn` is not installed correctly.
 
 ## License
 
-[Stability AI Community License](#)
+This project is licensed under the **MIT License** — see [LICENSE](LICENSE) for details.
 
+**Model Weights:** The model weights in this repository are also MIT licensed
+for individuals and organizations with annual gross revenue under **$1,000,000 USD**.
+Organizations exceeding this threshold require a commercial license.
 
-To use this model commercially, please refer to https://stability.ai/license
+To use these models commercially, please refer to the 
+[Stability AI Community License](https://stability.ai/license)
 
 
 ## Testing

@@ -91,7 +91,16 @@ There are three DiT variants:
 
 ## Provided Checkpoints
 Checkpoints aka weights are the saved model artifacts that you use for inference.
-TODO: fill this in.
+
+Three families of checkpoints are provided, each with Small and Medium variants:
+
+| Key | Family | Purpose |
+|---|---|---|
+| `small`, `medium` | ARC | Primary inference checkpoints. Use these for generation. |
+| `small-rf`, `medium-rf` | RF | Pre-ARC base checkpoints. Used as the starting point for LoRA training. |
+| `same-s`, `same-l` | SAME | Standalone autoencoder checkpoints. Use these if you only need encoding/decoding without the DiT. |
+
+ARC checkpoints have no suffix because they are the default choice for inference — the `-rf` suffix on the RF checkpoints distinguishes them as the earlier-stage base. SAME checkpoints will reuse a locally cached ARC or RF checkpoint automatically if one is already present, avoiding a redundant download.
 
 ## How inference works
 

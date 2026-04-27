@@ -50,16 +50,22 @@ def load_autoencoder(config_path: str, ckpt_path: str, device: str = "cpu"):
 
     autoencoder = create_autoencoder_from_config(config["model"], config["sample_rate"])
 
-    # ARC checkpoints store autoencoder weights under pretransform.model.*
-    # while RF checkpoints use pretransform.* directly. Detect which is present.
+    # ARC checkpoints store autoencoder weights under pretransform.model.*,
+    # RF checkpoints use pretransform.* directly, and standalone AE-only checkpoints
+    # (e.g. from stabilityai/SAME-L / SAME-S) have no prefix at all.
     prefix = "pretransform."
     arc_prefix = "pretransform.model."
     if ckpt_path.endswith(".safetensors"):
         with safe_open(ckpt_path, framework="pt", device=device) as f:
             all_keys = list(f.keys())
-        effective_prefix = (
-            arc_prefix if any(k.startswith(arc_prefix) for k in all_keys) else prefix
-        )
+        if any(k.startswith(arc_prefix) for k in all_keys):
+            effective_prefix = arc_prefix
+        elif any(k.startswith(prefix) for k in all_keys):
+            effective_prefix = prefix
+        else:
+            effective_prefix = (
+                ""  # standalone AE checkpoint — all keys belong to the AE
+            )
         with safe_open(ckpt_path, framework="pt", device=device) as f:
             state_dict = {
                 k[len(effective_prefix) :]: f.get_tensor(k)
@@ -70,9 +76,12 @@ def load_autoencoder(config_path: str, ckpt_path: str, device: str = "cpu"):
         full = torch.load(ckpt_path, map_location=device, weights_only=True)[
             "state_dict"
         ]
-        effective_prefix = (
-            arc_prefix if any(k.startswith(arc_prefix) for k in full) else prefix
-        )
+        if any(k.startswith(arc_prefix) for k in full):
+            effective_prefix = arc_prefix
+        elif any(k.startswith(prefix) for k in full):
+            effective_prefix = prefix
+        else:
+            effective_prefix = ""
         state_dict = {
             k[len(effective_prefix) :]: v
             for k, v in full.items()

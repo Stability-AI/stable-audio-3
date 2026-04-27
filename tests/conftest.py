@@ -61,15 +61,17 @@ def model_pipe(request):
         return StableAudioPipeline.from_pretrained("medium", device=ACCEL_DEVICE)
 
 
-@pytest.fixture(scope="session", params=["small", "medium"])
+@pytest.fixture(scope="session", params=["small", "medium", "same-s", "same-l"])
 def autoencoder(request):
     """Session-scoped autoencoder fixture loaded directly via load_autoencoder.
 
-    Parametrized over model sizes; medium requires a GPU/accelerator.
+    Parametrized over model sizes; medium/same-l require a GPU/accelerator.
+    same-s and same-l use stabilityai/SAME-S and SAME-L, falling back to any
+    already-cached SA3 full checkpoint automatically.
     """
     name = request.param
-    if name == "medium" and not HAS_CUDA:
-        pytest.skip("Medium model requires a GPU/accelerator — none detected")
+    if name in ("medium", "same-l") and not HAS_CUDA:
+        pytest.skip(f"{name} requires a GPU/accelerator — none detected")
 
     cfg = all_models[name]
     local_config, local_ckpt = cfg.resolve()

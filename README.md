@@ -70,6 +70,9 @@ Stable Audio 3 supports several inference modes. For full details, see [Inferenc
 **Text-to-Audio** — Generate audio from a text prompt:
 
 ```python
+from stable_audio_3 import StableAudioPipeline
+
+pipe = StableAudioPipeline.from_pretrained("medium")
 audio = pipe.generate(
     prompt="Lo-fi boom bap meets orchestral strings 84 BPM",
     duration=180,
@@ -80,7 +83,9 @@ audio = pipe.generate(
 
 ```python
 import torchaudio
+from stable_audio_3 import StableAudioPipeline
 
+pipe = StableAudioPipeline.from_pretrained("medium")
 init_audio = torchaudio.load("/path/to/audio.wav")
 audio = pipe.generate(
     init_audio=init_audio,
@@ -94,6 +99,9 @@ audio = pipe.generate(
 
 ```python
 import torchaudio
+from stable_audio_3 import StableAudioPipeline
+
+pipe = StableAudioPipeline.from_pretrained("medium")
 
 inpaint_audio = torchaudio.load("/path/to/audio.wav")
 audio = pipe.generate(

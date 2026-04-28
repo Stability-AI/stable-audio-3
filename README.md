@@ -155,7 +155,7 @@ Likely an issue with flash-attention. Please make sure flash attention is instal
 You can check with
 
 ```
-python -c "import flash_attn; from flash_attn import flash_attn_func; print('Version:', flash_attn.__version__, '| flash_attn_func:', flash_attn_func)"
+uv run python -c "import flash_attn; from flash_attn import flash_attn_func; print('Version:', flash_attn.__version__, '| flash_attn_func:', flash_attn_func)"
 ```
 
 if there are errors in any of this, `flash_attn` is not installed correctly.

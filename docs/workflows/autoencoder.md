@@ -8,11 +8,11 @@ Stable Audio 3 uses a audio autoencoder to compress waveforms into a compact con
 import json
 import torch
 from stable_audio_3.loading_utils import load_autoencoder
-from stable_audio_3.model_configs import all_models
+from stable_audio_3.model_configs import ae_models
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-cfg = all_models["small"]  # "small", "small-rf", "medium", "medium-rf", "same-s", "same-l"
+cfg = ae_models["same-l"]  # "same-s" (small), "same-l" (medium/large)
 local_config, local_ckpt = cfg.resolve()
 autoencoder = load_autoencoder(local_config, local_ckpt, device=device)
 autoencoder.eval().requires_grad_(False)
@@ -140,7 +140,7 @@ Pass the output directory to `train_lora.py` via `--encoded_dir`. See [LoRA trai
 
 | Flag | Default | Description |
 |---|---|---|
-| `--model` | `same-l` | Model variant: `small`, `small-rf`, `medium`, `medium-rf`, `same-s`, `same-l` |
+| `--model` | `same-l` | Autoencoder variant: `same-s` (small), `same-l` (medium/large) |
 | `--data_dir` | — | Folder containing audio + `.txt` pairs |
 | `--output_path` | — | Where to write `.npy`/`.json` latent pairs |
 | `--batch_size` | `1` | Audio clips to encode per forward pass |

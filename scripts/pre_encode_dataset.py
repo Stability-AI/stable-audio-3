@@ -26,7 +26,7 @@ import numpy as np
 import torch
 
 from stable_audio_3.loading_utils import load_autoencoder
-from stable_audio_3.model_configs import all_models
+from stable_audio_3.model_configs import ae_models
 from stable_audio_3.data.dataset import (
     LocalDatasetConfig,
     SampleDataset,
@@ -44,7 +44,7 @@ def caption_metadata_fn(info, _audio):
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    cfg = all_models[args.model]
+    cfg = ae_models[args.model]
     local_config, local_ckpt = cfg.resolve()
     autoencoder = load_autoencoder(local_config, local_ckpt, device=str(device))
     autoencoder.eval().requires_grad_(False)
@@ -140,7 +140,7 @@ def resize_padding_mask(padding_mask: torch.Tensor, target_length: int) -> torch
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pre-encode audio dataset to latents")
-    parser.add_argument("--model", choices=list(all_models), default="same-l")
+    parser.add_argument("--model", choices=list(ae_models), default="same-l")
     parser.add_argument(
         "--data_dir",
         required=True,

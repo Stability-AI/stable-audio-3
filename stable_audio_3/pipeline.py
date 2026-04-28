@@ -184,6 +184,28 @@ class StableAudioPipeline:
             inpaint_mask = torch.ones(1, audio_sample_size, device=device)
             inpaint_mask[:, mask_start_samples:mask_end_samples] = 0
 
+        # If the caller passed a prebuilt mask sized to the un-adapted sample_size (or
+        # anything longer than audio_sample_size), truncate to audio_sample_size so the
+        # downstream nearest-neighbor interpolation preserves the mask's time-domain
+        # positions instead of squashing the mask region.
+        if inpaint_mask is not None and inpaint_mask.shape[-1] > audio_sample_size:
+            inpaint_mask = inpaint_mask[:, :audio_sample_size]
+
+        # Match training: when mask_padding_attention is used, random_inpaint_mask
+        # zeroes the mask past real_sequence_length (models/inpainting.py). Apply the
+        # same convention here so the mask matches the training distribution, whether
+        # it was built from seconds above or passed in by the caller.
+        if inpaint_mask is not None and conditioning is not None:
+            max_seconds = max(
+                (c.get("seconds_total", 0.0) for c in conditioning), default=0.0
+            )
+            if max_seconds > 0:
+                effective_audio_len = int(max_seconds * self.model.sample_rate)
+                mask_len = inpaint_mask.shape[-1]
+                if effective_audio_len < mask_len:
+                    inpaint_mask = inpaint_mask.clone()
+                    inpaint_mask[:, effective_audio_len:] = 0
+
         if inpaint_mask is not None:
             inpaint_mask = inpaint_mask.float()
 

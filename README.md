@@ -12,20 +12,19 @@ Stable Audio 3 is the next generation of Stable Audio: a focused, streamlined pl
 
 ## Models
 
-| RF Model | Autoencoder | Hardware | Params | Use case |
-|---|---|---|---|---|
-| **Stable Audio 3 Small** | SAME-Small | CPU | 433M | Lightweight inference, no GPU required |
-| **Stable Audio 3 Medium** | SAME-Large | GPU (CUDA) | 1.4B | High Quality, Fast Inference |
-| **Stable Audio 3 Large** | SAME-Large | API only | 1.7B | Highest quality, API only. Not supported by this repo, see the [API docs](#) |
+| RF Model | Autoencoder | Hardware | Params | Max length | Use case |
+|---|---|---|---|---|---|
+| **Stable Audio 3 Small** | SAME-Small | CPU | 433M | 120s | Lightweight inference, no GPU required |
+| **Stable Audio 3 Medium** | SAME-Large | GPU (CUDA) | 1.4B | 380s | High Quality, Fast Inference |
+| **Stable Audio 3 Large** | SAME-Large | API only | 1.7B | 380s | Highest quality, API only. Not supported by this repo, see the [API docs](#) |
 ---
 
 ## Features
 - ⚡ **Fast, state-of-the-art generation** - Generate minutes of audio in milliseconds
 - 🎛️ **Three inference modes** — text-to-audio, audio-to-audio editing, and inpainting/outpainting (new in Stable Audio 3)
 - ↔️ **Variable-length generation** — handles generation of a variety of sequences without wasting inference on unused latents
-- 🎯 **LoRA fine-tuning** — adapt any model to a target style; stackable, adjustable at runtime
+- 🎯 **Personalization through LoRA fine-tuning** — adapt any model to a target style; stackable, adjustable at runtime
 - 💻 **Broad hardware support** — CPU (Small), CUDA/TensorRT (Medium), Apple Silicon via MLX/CoreML, Intel via OpenVINO
-- 📈 **Scales from laptop to server** — 433M param CPU model up to 2.7B param API model
 - 🎵 **SAME autoencoder** — new Semantic-Acoustic Music Encoder; stereo, 44.1 kHz, 256-dimensional latents optimized for both generative tractability and high-quality reconstruction
 
 

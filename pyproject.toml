@@ -1,7 +1,7 @@
 [project]
 name = "stable-audio-3"
 version = "0.1.0"
-description = "Add your description here"
+description = "Stable Audio 3: A state-of-the-art open platform for fast, high-quality generated audio and music"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

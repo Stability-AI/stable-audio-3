@@ -192,7 +192,7 @@ class StableAudioPipeline:
             inpaint_mask = inpaint_mask[:, :audio_sample_size]
 
         # Match training: when mask_padding_attention is used, random_inpaint_mask
-        # zeroes the mask past real_sequence_length (models/inpainting.py). Apply the
+        # zeroes the mask past real_sequence_length. Apply the
         # same convention here so the mask matches the training distribution, whether
         # it was built from seconds above or passed in by the caller.
         if inpaint_mask is not None and conditioning is not None:

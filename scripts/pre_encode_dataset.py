@@ -12,8 +12,8 @@ Dataset layout:
 Saves .npy files for latents and .json files for metadata, compatible with train_lora.py --encoded_dir.
 
 Usage:
-  uv run python pre_encode_dataset.py --model small --data_dir ./my_data --output_path ./latents_out
-  uv run python pre_encode_dataset.py --model medium --data_dir ./my_data --output_path ./latents_out --batch_size 4
+  uv run python pre_encode_dataset.py --model same-s --data_dir ./my_data --output_path ./latents_out
+  uv run python pre_encode_dataset.py --model same-l --data_dir ./my_data --output_path ./latents_out --batch_size 4
 """
 
 import argparse
@@ -140,7 +140,7 @@ def resize_padding_mask(padding_mask: torch.Tensor, target_length: int) -> torch
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pre-encode audio dataset to latents")
-    parser.add_argument("--model", choices=list(all_models), default="medium-rf")
+    parser.add_argument("--model", choices=list(all_models), default="same-l")
     parser.add_argument(
         "--data_dir",
         required=True,

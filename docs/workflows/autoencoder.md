@@ -12,11 +12,12 @@ from stable_audio_3.model_configs import all_models
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-cfg = all_models["small"]  # "small", "medium"
-autoencoder = load_autoencoder(cfg.config_path, cfg.ckpt_path, device=device)
+cfg = all_models["small"]  # "small", "small-rf", "medium", "medium-rf", "same-s", "same-l"
+local_config, local_ckpt = cfg.resolve()
+autoencoder = load_autoencoder(local_config, local_ckpt, device=device)
 autoencoder.eval().requires_grad_(False)
 
-with open(cfg.config_path) as f:
+with open(local_config) as f:
     sample_rate = json.load(f)["sample_rate"]  # 44100
 ```
 
@@ -139,7 +140,7 @@ Pass the output directory to `train_lora.py` via `--encoded_dir`. See [LoRA trai
 
 | Flag | Default | Description |
 |---|---|---|
-| `--model` | `medium` | Model variant: `small`, `medium`, |
+| `--model` | `same-l` | Model variant: `small`, `small-rf`, `medium`, `medium-rf`, `same-s`, `same-l` |
 | `--data_dir` | — | Folder containing audio + `.txt` pairs |
 | `--output_path` | — | Where to write `.npy`/`.json` latent pairs |
 | `--batch_size` | `1` | Audio clips to encode per forward pass |

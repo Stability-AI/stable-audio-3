@@ -460,13 +460,7 @@ def sample_diffusion(
                             "k-dpm-fast", "k-dpm-adaptive", "dpmpp-2m-sde", "dpmpp-3m-sde", "dpmpp-2m"}
 
     if init_data is not None:
-        if diffusion_objective == "v" and sampler_type not in k_diff_sampler_types:
-            # v-diffusion DDIM: pre-mix noise and init_data
-            alpha, sigma = t_to_alpha_sigma(torch.tensor(sigma_max))
-            noise = init_data * alpha + noise * sigma
-        elif diffusion_objective in ["rectified_flow", "rf_denoiser"]:
-            # RF objectives: linear interpolation
-            noise = init_data * (1 - sigma_max) + noise * sigma_max
+        noise = init_data * (1 - sigma_max) + noise * sigma_max
 
     # Build common sampler kwargs (conditioning + model-level params only).
     # disable_tqdm and callback are passed explicitly to samplers that use them,
@@ -488,44 +482,7 @@ def sample_diffusion(
         torch.cuda.synchronize()
     _t_diffusion = time.perf_counter()
 
-    if diffusion_objective == "v":
-        if sampler_type in k_diff_sampler_types or sampler_type in ["v-ddim", "v-ddim-cfgpp"]:
-            # Route through sample_k which handles k-diffusion and v-ddim samplers
-            # sample_k uses its own schedule (polyexponential for k-diff, internal for v-ddim)
-            k_init_data = init_data if sampler_type in k_diff_sampler_types else None
-
-            # Determine sigma_max for sample_k:
-            # - k-diffusion samplers: default 100 for schedule, or init_noise_level for variations
-            # - v-ddim: sigma_max is the noise level (0-1), our sigma_max variable
-            if sampler_type in k_diff_sampler_types:
-                k_sigma_max = sigma_max if init_data is not None else common_kwargs.pop("sigma_max", 100)
-            else:
-                k_sigma_max = sigma_max  # v-ddim: already 0-1 range
-            # Pop sigma_max from common_kwargs to avoid passing it twice
-            common_kwargs.pop("sigma_max", None)
-
-            sampled = sample_k(
-                model, noise,
-                init_data=k_init_data,
-                steps=steps,
-                sampler_type=sampler_type,
-                sigma_min=common_kwargs.pop("sigma_min", 0.01),
-                sigma_max=k_sigma_max,
-                rho=common_kwargs.pop("rho", 1.0),
-                device=device,
-                callback=callback,
-                **common_kwargs
-            )
-        else:
-            # DDIM-style sampler with pre-computed schedule
-            t = build_schedule(
-                steps=steps, sigma_max=sigma_max,
-                dist_shift=dist_shift, effective_seq_len=effective_seq_len,
-                fallback_seq_len=latent_seq_len, include_endpoint=False, device=device
-            )
-            sampled = sample_v(model, noise, sigmas=t, callback=callback, disable_tqdm=disable_tqdm, **common_kwargs)
-
-    elif diffusion_objective in ["rectified_flow", "rf_denoiser"]:
+    if diffusion_objective in ["rectified_flow", "rf_denoiser"]:
         # Remove v-diffusion-specific kwargs that don't apply to RF
         common_kwargs.pop("sigma_min", None)
         common_kwargs.pop("sigma_max", None)
@@ -553,10 +510,6 @@ def sample_diffusion(
     else:
         raise ValueError(f"Unknown diffusion_objective: {diffusion_objective}")
 
-    if sampled.device.type == "cuda":
-        torch.cuda.synchronize()
-    print(f"[profile] diffusion sampling: {time.perf_counter() - _t_diffusion:.3f}s")
-
     # Decode if requested
     if decode and pretransform is not None:
         if sampled.device.type == "cuda":
@@ -565,10 +518,6 @@ def sample_diffusion(
 
         sampled = sampled.to(next(pretransform.parameters()).dtype)
         sampled = pretransform.decode(sampled)
-
-        if sampled.device.type == "cuda":
-            torch.cuda.synchronize()
-        print(f"[profile] pretransform.decode: {time.perf_counter() - _t0:.3f}s")
 
         # Zero out audio beyond valid region (padding positions decode to garbage)
         if padding_mask is not None:

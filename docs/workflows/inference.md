@@ -191,4 +191,4 @@ pipe.set_lora_strength(1.0, target="dit")
 pipe.set_lora_strength(0.0, target="conditioner")
 ```
 
-For full details on LoRA training and inference knobs, see [LoRA Training](lora.md).
+For full details on LoRA training see [LoRA Training](lora.md).

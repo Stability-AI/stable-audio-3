@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 
 from stable_audio_3 import AutoencoderPipeline
 from stable_audio_3.model_configs import ae_models
@@ -69,6 +70,18 @@ def main(args):
 
     os.makedirs(args.output_path, exist_ok=True)
 
+    silence_path = os.path.join(args.output_path, "silence.npy")
+    if not os.path.exists(silence_path):
+        print("Saving silence latent")
+        silence_audio = torch.zeros(
+            1, ae.autoencoder.io_channels, args.sample_size, device=device
+        )
+        if args.model_half:
+            silence_audio = silence_audio.half()
+        with torch.no_grad():
+            silence_latent = ae.encode(silence_audio, ae.sample_rate)
+        np.save(silence_path, silence_latent.cpu().numpy())
+
     for nb, (audio, metadata) in enumerate(loader):
         print(f"Processing batch {nb}")
 
@@ -86,12 +99,27 @@ def main(args):
             latent_np = latent.cpu().numpy()
             latent_id = f"{nb:06d}{i:04d}"
 
+            md = dict(metadata[i])
+            padding_mask = (
+                F.interpolate(
+                    md["padding_mask"].unsqueeze(0).unsqueeze(1).float(),
+                    size=latent_np.shape[-1],
+                    mode="nearest",
+                )
+                .squeeze(0)
+                .squeeze(0)
+                .int()
+            )
+            if args.no_pad:
+                padding_np = padding_mask.cpu().numpy()
+                valid_indices = np.where(padding_np == 1)[0]
+                if len(valid_indices) > 0:
+                    valid_length = valid_indices[-1] + 1
+                    latent_np = latent_np[:, :valid_length]
+                    padding_mask = padding_mask[:valid_length]
+
             np.save(os.path.join(args.output_path, f"{latent_id}.npy"), latent_np)
 
-            md = dict(metadata[i])
-            padding_mask = resize_padding_mask(
-                md["padding_mask"], latent_np.shape[-1]
-            ).int()
             md["padding_mask"] = padding_mask.cpu().numpy().tolist()
             for k, v in md.items():
                 if isinstance(v, torch.Tensor):
@@ -101,34 +129,6 @@ def main(args):
                 json.dump(md, f)
 
     print("Done")
-
-
-def resize_padding_mask(padding_mask: torch.Tensor, target_length: int) -> torch.Tensor:
-    """Resize a padding mask to target_length using ceiling-based length scaling.
-
-    Unlike F.interpolate(mode="nearest"), this ensures any target position
-    that partially overlaps valid audio is marked valid (rounds up).
-    """
-    if padding_mask.ndim == 1:
-        valid_length = padding_mask.sum()
-        source_length = padding_mask.shape[0]
-        valid_target_length = (
-            torch.ceil(valid_length.float() * target_length / source_length)
-            .long()
-            .clamp(max=target_length)
-        )
-        positions = torch.arange(target_length, device=padding_mask.device)
-        return positions < valid_target_length
-    else:
-        valid_lengths = padding_mask.sum(dim=-1)  # (B,)
-        source_length = padding_mask.shape[-1]
-        valid_target_lengths = (
-            torch.ceil(valid_lengths.float() * target_length / source_length)
-            .long()
-            .clamp(max=target_length)
-        )
-        positions = torch.arange(target_length, device=padding_mask.device).unsqueeze(0)
-        return positions < valid_target_lengths.unsqueeze(1)
 
 
 if __name__ == "__main__":
@@ -152,5 +152,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_half", action="store_true", help="Run autoencoder in fp16"
     )
+    parser.add_argument(
+        "--no_pad",
+        action="store_true",
+        help="Trim latents to valid audio length (variable-length mode); requires --batch_size 1",
+    )
     args = parser.parse_args()
+
+    if args.no_pad and args.batch_size > 1:
+        parser.error(
+            "--no_pad requires --batch_size 1 (variable-length samples cannot be batched)"
+        )
+
     main(args)

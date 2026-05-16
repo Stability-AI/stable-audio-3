@@ -110,7 +110,7 @@ def main(args):
                 .squeeze(0)
                 .int()
             )
-            if args.no_pad:
+            if not args.pad:
                 padding_np = padding_mask.cpu().numpy()
                 valid_indices = np.where(padding_np == 1)[0]
                 if len(valid_indices) > 0:
@@ -153,13 +153,13 @@ if __name__ == "__main__":
         "--model_half", action="store_true", help="Run autoencoder in fp16"
     )
     parser.add_argument(
-        "--no_pad", action="store_true", help="Do not pad audio samples"
+        "--pad", action="store_true", help="Pad audio samples to --sample_size"
     )
     args = parser.parse_args()
 
-    if args.no_pad and args.batch_size > 1:
+    if not args.pad and args.batch_size > 1:
         parser.error(
-            "--no_pad requires --batch_size 1 (variable-length samples cannot be batched)"
+            "padding is required for batch_size > 1; pass --pad or use --batch_size 1"
         )
 
     main(args)

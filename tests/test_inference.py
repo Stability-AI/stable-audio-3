@@ -8,12 +8,12 @@ DURATION_SEC = 10
 STEPS = 8
 
 
-def test_text_to_audio(model_pipe, maybe_save_audio):
-    pipe = model_pipe
-    sr = pipe.model_config["sample_rate"]
+def test_text_to_audio(sa3_model, maybe_save_audio):
+    model = sa3_model
+    sr = model.model_config["sample_rate"]
     prompt = "trap drums, hip hop beat, 120bpm"
 
-    audio = pipe.generate(
+    audio = model.generate(
         prompt=prompt,
         negative_prompt="low-quality",
         duration=DURATION_SEC,
@@ -24,10 +24,10 @@ def test_text_to_audio(model_pipe, maybe_save_audio):
     assert_audio_valid(audio, DURATION_SEC, sr)
 
 
-def test_inpainting(model_pipe, maybe_save_audio):
-    pipe = model_pipe
-    sr = pipe.model_config["sample_rate"]
-    channels = pipe.model_config.get("io_channels", 2)
+def test_inpainting(sa3_model, maybe_save_audio):
+    model = sa3_model
+    sr = model.model_config["sample_rate"]
+    channels = model.model_config.get("io_channels", 2)
     inpaint_duration = 10.0
     prompt = "big trumpet solo, jazz big band, 90bpm"
 
@@ -35,10 +35,10 @@ def test_inpainting(model_pipe, maybe_save_audio):
         inpaint_duration,
         sr,
         channels=channels,
-        device=str(pipe.device),
-        half=pipe.model_half,
+        device=str(model.device),
+        half=model.model_half,
     )
-    audio = pipe.generate(
+    audio = model.generate(
         prompt=prompt,
         duration=inpaint_duration,
         steps=STEPS,
@@ -50,10 +50,10 @@ def test_inpainting(model_pipe, maybe_save_audio):
     assert_audio_valid(audio, inpaint_duration, sr)
 
 
-def test_continuation(model_pipe, maybe_save_audio):
-    pipe = model_pipe
-    sr = pipe.model_config["sample_rate"]
-    channels = pipe.model_config.get("io_channels", 2)
+def test_continuation(sa3_model, maybe_save_audio):
+    model = sa3_model
+    sr = model.model_config["sample_rate"]
+    channels = model.model_config.get("io_channels", 2)
     init_duration = 5.0
     total_duration = 15.0
     prompt = "thunderstorm with heavy rain"
@@ -62,10 +62,10 @@ def test_continuation(model_pipe, maybe_save_audio):
         init_duration,
         sr,
         channels=channels,
-        device=str(pipe.device),
-        half=pipe.model_half,
+        device=str(model.device),
+        half=model.model_half,
     )
-    audio = pipe.generate(
+    audio = model.generate(
         prompt=prompt,
         duration=total_duration,
         steps=STEPS,
@@ -77,21 +77,21 @@ def test_continuation(model_pipe, maybe_save_audio):
     assert_audio_valid(audio, total_duration, sr)
 
 
-def test_init_audio(model_pipe, maybe_save_audio):
-    pipe = model_pipe
-    sr = pipe.model_config["sample_rate"]
-    channels = pipe.model_config.get("io_channels", 2)
+def test_init_audio(sa3_model, maybe_save_audio):
+    model = sa3_model
+    sr = model.model_config["sample_rate"]
+    channels = model.model_config.get("io_channels", 2)
     prompt = "funky bass groove"
 
     init = sine_wave(
         DURATION_SEC,
         sr,
         channels=channels,
-        device=str(pipe.device),
-        half=pipe.model_half,
+        device=str(model.device),
+        half=model.model_half,
     )
 
-    audio = pipe.generate(
+    audio = model.generate(
         prompt=prompt,
         duration=DURATION_SEC,
         steps=STEPS,
@@ -102,24 +102,24 @@ def test_init_audio(model_pipe, maybe_save_audio):
     assert_audio_valid(audio, DURATION_SEC, sr)
 
 
-def test_init_audio_float32_into_half_model(model_pipe, maybe_save_audio):
-    pipe = model_pipe
-    if not pipe.model_half:
+def test_init_audio_float32_into_half_model(sa3_model, maybe_save_audio):
+    model = sa3_model
+    if not model.model_half:
         pytest.skip(
             "model_half is False — dtype mismatch only occurs on half-precision models"
         )
 
-    sr = pipe.model_config["sample_rate"]
-    channels = pipe.model_config.get("io_channels", 2)
+    sr = model.model_config["sample_rate"]
+    channels = model.model_config.get("io_channels", 2)
     prompt = "funky bass groove"
 
     # Deliberately float32, regardless of model dtype — this was the bug trigger
     init = sine_wave(
-        DURATION_SEC, sr, channels=channels, device=str(pipe.device), half=False
+        DURATION_SEC, sr, channels=channels, device=str(model.device), half=False
     )
     assert init.dtype == torch.float32
 
-    audio = pipe.generate(
+    audio = model.generate(
         prompt=prompt,
         duration=DURATION_SEC,
         steps=STEPS,
@@ -130,25 +130,25 @@ def test_init_audio_float32_into_half_model(model_pipe, maybe_save_audio):
     assert_audio_valid(audio, DURATION_SEC, sr)
 
 
-def test_inpaint_audio_float32_into_half_model(model_pipe, maybe_save_audio):
-    pipe = model_pipe
-    if not pipe.model_half:
+def test_inpaint_audio_float32_into_half_model(sa3_model, maybe_save_audio):
+    model = sa3_model
+    if not model.model_half:
         pytest.skip(
             "model_half is False — dtype mismatch only occurs on half-precision models"
         )
 
-    sr = pipe.model_config["sample_rate"]
-    channels = pipe.model_config.get("io_channels", 2)
+    sr = model.model_config["sample_rate"]
+    channels = model.model_config.get("io_channels", 2)
     inpaint_duration = 10.0
     prompt = "big trumpet solo, jazz big band, 90bpm"
 
     # Deliberately float32, regardless of model dtype — this was the bug trigger
     base_audio = sine_wave(
-        inpaint_duration, sr, channels=channels, device=str(pipe.device), half=False
+        inpaint_duration, sr, channels=channels, device=str(model.device), half=False
     )
     assert base_audio.dtype == torch.float32
 
-    audio = pipe.generate(
+    audio = model.generate(
         prompt=prompt,
         duration=inpaint_duration,
         steps=STEPS,
@@ -161,9 +161,9 @@ def test_inpaint_audio_float32_into_half_model(model_pipe, maybe_save_audio):
 
 
 @pytest.mark.skipif(not HAS_ACCEL, reason="Batch inference requires a GPU/accelerator")
-def test_batch_inference(model_pipe, maybe_save_audio):
-    pipe = model_pipe
-    sr = pipe.model_config["sample_rate"]
+def test_batch_inference(sa3_model, maybe_save_audio):
+    model = sa3_model
+    sr = model.model_config["sample_rate"]
     batch_size = 3
     prompts = ["ocean waves", "summer breeze", "city traffic"]
 
@@ -171,14 +171,14 @@ def test_batch_inference(model_pipe, maybe_save_audio):
     durations = [2, 5, 20]
     duration_padding_sec = 6  # Default, just defining here for clarity
 
-    audio_same_durations = pipe.generate(
+    audio_same_durations = model.generate(
         prompt=prompts,
         negative_prompt=neg_prompts,
         duration=DURATION_SEC,
         steps=STEPS,
         batch_size=batch_size,
     )
-    audio_different_durations = pipe.generate(
+    audio_different_durations = model.generate(
         prompt=prompts,
         negative_prompt=neg_prompts,
         duration=durations,

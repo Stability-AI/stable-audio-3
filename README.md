@@ -16,7 +16,8 @@ Stable Audio 3 is the next generation of Stable Audio: a focused, streamlined pl
 
 | RF Model | Autoencoder | Hardware | Params | Max length | Use case |
 |---|---|---|---|---|---|
-| **Stable Audio 3 Small** | SAME-Small | CPU | 433M | 120s | Lightweight inference, no GPU required |
+| **Stable Audio 3 Small-Music** | SAME-Small | CPU | 433M | 120s | Lightweight music-only inference, no GPU required |
+| **Stable Audio 3 Small-SFX** | SAME-Small | CPU | 433M | 120s | Lightweight sound effects-only inference, no GPU required |
 | **Stable Audio 3 Medium** | SAME-Large | GPU (CUDA) | 1.4B | 380s | High Quality, Fast Inference |
 | **Stable Audio 3 Large** | SAME-Large | API only | 2.7B | 380s | Highest quality, API only. Not supported by this repo, see the [API docs](#) |
 ---
@@ -35,18 +36,29 @@ Stable Audio 3 is the next generation of Stable Audio: a focused, streamlined pl
 Stable Audio 3 uses [uv](https://github.com/astral-sh/uv) for fast, lightweight installs. Install only what you need.
 
 ```bash
-# Base install
+# Base install (Python API only)
 uv sync
-
-# With CUDA support
-uv sync --extra cuda
 
 # With Gradio UI
 uv sync --extra ui
 
-# Multiple extras
-uv sync --extra cuda --extra ui
+# With LoRA training support
+uv sync --extra lora
+
+# Everything
+uv sync --extra ui --extra lora
 ```
+
+### CUDA Version
+
+By default, `uv sync` installs PyTorch built against CUDA 12.6. If you need a different CUDA version, install torch and torchaudio manually first, then sync without reinstalling them, for example:
+
+```bash
+uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
+uv sync --no-install-package torch --no-install-package torchaudio
+```
+
+Replace `cu118` with your target version (`cu121`, `cu124`, etc.). See the [PyTorch install page](https://pytorch.org/get-started/locally/) for the full list.
 
 ### Flash Attention
 Stable Audio 3 Medium requires [Flash Attention](https://github.com/Dao-AILab/flash-attention), follow the instructions from there to install.
@@ -72,10 +84,10 @@ Stable Audio 3 supports several inference modes. For full details, see [Inferenc
 **Text-to-Audio** — Generate audio from a text prompt:
 
 ```python
-from stable_audio_3 import StableAudioPipeline
+from stable_audio_3 import StableAudioModel
 
-pipe = StableAudioPipeline.from_pretrained("medium")
-audio = pipe.generate(
+model = StableAudioModel.from_pretrained("medium")
+audio = model.generate(
     prompt="Lo-fi boom bap meets orchestral strings 84 BPM",
     duration=180,
 )
@@ -85,11 +97,11 @@ audio = pipe.generate(
 
 ```python
 import torchaudio
-from stable_audio_3 import StableAudioPipeline
+from stable_audio_3 import StableAudioModel
 
-pipe = StableAudioPipeline.from_pretrained("medium")
+model = StableAudioModel.from_pretrained("medium")
 init_audio = torchaudio.load("/path/to/audio.wav")
-audio = pipe.generate(
+audio = model.generate(
     init_audio=init_audio,
     init_noise_level=0.9,
     prompt="bossa nova bassline",
@@ -101,12 +113,12 @@ audio = pipe.generate(
 
 ```python
 import torchaudio
-from stable_audio_3 import StableAudioPipeline
+from stable_audio_3 import StableAudioModel
 
-pipe = StableAudioPipeline.from_pretrained("medium")
+model = StableAudioModel.from_pretrained("medium")
 
 inpaint_audio = torchaudio.load("/path/to/audio.wav")
-audio = pipe.generate(
+audio = model.generate(
     inpaint_audio=inpaint_audio,
     inpaint_mask_start_seconds=4.0,
     inpaint_mask_end_seconds=8.0,
@@ -122,9 +134,9 @@ To extend an audio clip (continuation), set `inpaint_mask_start_seconds` to the 
 
 ```python
 import torchaudio
-from stable_audio_3 import AutoencoderPipeline
+from stable_audio_3 import AutoencoderModel
 
-ae = AutoencoderPipeline.from_pretrained("same-l")
+ae = AutoencoderModel.from_pretrained("same-l")
 waveform, sr = torchaudio.load("audio.wav")
 latents = ae.encode(waveform, sr)
 audio_out = ae.decode(latents)
@@ -139,7 +151,7 @@ See [Autoencoder Workflows](docs/workflows/autoencoder.md) for encoding batches,
 Stable Audio 3 scales from a laptop to a multi-GPU server. Specify your backend at load time:
 
 ```python
-model = StableAudioPipeline.from_pretrained(
+model = StableAudioModel.from_pretrained(
     "medium",
     backend="tensorrt"  # or "mlx", "coreml", "openvino"
 )

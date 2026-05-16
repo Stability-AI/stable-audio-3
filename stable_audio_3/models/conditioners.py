@@ -155,28 +155,26 @@ class NumberConditioner(Conditioner):
 
 class T5GemmaConditioner(Conditioner):
 
-    T5GEMMA_MODELS = ["stabilityai/t5gemma-b-b-ul2"]
-
-    T5GEMMA_MODEL_DIMS = {
-        "stabilityai/t5gemma-b-b-ul2": 768,
-    }
+    T5GEMMA_HIDDEN_DIM = 768
 
     def __init__(
             self,
             output_dim: int,
-            model_name: str = "stabilityai/t5gemma-b-b-ul2",
+            repo_id: str,
+            subfolder: tp.Optional[str] = None,
             max_length: str = 128,
             enable_grad: bool = False,
             project_out: bool = False,
             padding_mode: str = "zero"
     ):
-        assert model_name in self.T5GEMMA_MODELS, f"Unknown T5 model name: {model_name}"
-        super().__init__(self.T5GEMMA_MODEL_DIMS[model_name], output_dim, project_out=project_out, padding_mode=padding_mode)
+        super().__init__(self.T5GEMMA_HIDDEN_DIM, output_dim, project_out=project_out, padding_mode=padding_mode)
 
         import os
 
         self.max_length = max_length
         self.enable_grad = enable_grad
+
+        subfolder_kwargs = {"subfolder": subfolder} if subfolder is not None else {}
 
         # Set environment variables to disable progress bars BEFORE importing transformers
         # This is the most reliable way to suppress HuggingFace progress bars
@@ -193,10 +191,10 @@ class T5GemmaConditioner(Conditioner):
             warnings.simplefilter("ignore")
             try:
                 from transformers import T5GemmaEncoderModel, AutoTokenizer, AutoConfig
-                self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-                config = AutoConfig.from_pretrained(model_name)
+                self.tokenizer = AutoTokenizer.from_pretrained(repo_id, **subfolder_kwargs)
+                config = AutoConfig.from_pretrained(repo_id, **subfolder_kwargs)
                 config.is_encoder_decoder = False
-                model = T5GemmaEncoderModel.from_pretrained(model_name, config=config).train(enable_grad).requires_grad_(enable_grad)
+                model = T5GemmaEncoderModel.from_pretrained(repo_id, config=config, **subfolder_kwargs).train(enable_grad).requires_grad_(enable_grad)
 
             finally:
                 logging.disable(previous_level)

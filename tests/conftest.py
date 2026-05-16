@@ -5,7 +5,7 @@ import pytest
 import torch
 import torchaudio
 
-from stable_audio_3 import AutoencoderPipeline, StableAudioPipeline
+from stable_audio_3 import AutoencoderModel, StableAudioModel
 from stable_audio_3.model_configs import ae_models
 
 # ---------------------------------------------------------------------------
@@ -42,27 +42,28 @@ def device():
     return ACCEL_DEVICE
 
 
-@pytest.fixture(scope="session", params=["small", "medium"])
-def model_pipe(request):
-    """Session-scoped pipeline fixture parametrized over model sizes.
+@pytest.fixture(scope="session", params=["small-music", "small-sfx", "medium"])
+def sa3_model(request):
+    """Session-scoped model fixture parametrized over model sizes.
 
-    small  — loads via from_pretrained("small"); runs on CPU or accelerator.
-    medium — requires a CUDA GPU; skipped otherwise.
+    small-music — loads via from_pretrained("small-music"); runs on CPU or accelerator.
+    small-sfx   — loads via from_pretrained("small-sfx"); runs on CPU or accelerator.
+    medium      — requires a CUDA GPU; skipped otherwise.
     """
     name = request.param
 
-    if name == "small":
-        return StableAudioPipeline.from_pretrained("small", device=ACCEL_DEVICE)
+    if name in ("small-music", "small-sfx"):
+        return StableAudioModel.from_pretrained(name, device=ACCEL_DEVICE)
 
     if name == "medium":
         if not HAS_CUDA:
             pytest.skip("Medium model requires a CUDA GPU — none detected")
-        return StableAudioPipeline.from_pretrained("medium", device=ACCEL_DEVICE)
+        return StableAudioModel.from_pretrained("medium", device=ACCEL_DEVICE)
 
 
 @pytest.fixture(scope="session", params=list(ae_models))
 def autoencoder(request):
-    """Session-scoped AutoencoderPipeline fixture parametrized over AE model sizes.
+    """Session-scoped autoencoder model fixture parametrized over AE model sizes.
 
     same-l requires a CUDA GPU; skipped otherwise.
     """
@@ -70,7 +71,7 @@ def autoencoder(request):
     if name == "same-l" and not HAS_CUDA:
         pytest.skip(f"{name} requires a CUDA GPU — none detected")
 
-    return AutoencoderPipeline.from_pretrained(name, device=ACCEL_DEVICE)
+    return AutoencoderModel.from_pretrained(name, device=ACCEL_DEVICE)
 
 
 @pytest.fixture
@@ -78,8 +79,8 @@ def maybe_save_audio(request):
     """Return a callable that saves audio to disk when --save-audio is passed.
 
     Usage in tests:
-        def test_foo(model_pipe, maybe_save_audio):
-            audio = pipe.generate(prompt="drums", ...)
+        def test_foo(sa3_model, maybe_save_audio):
+            audio = sa3_model.generate(prompt="drums", ...)
             maybe_save_audio(audio, sr, "drums")
 
     Files are written to test_audio_outputs/{test_name[param]}_{prompt_slug}.wav.
@@ -108,9 +109,9 @@ def maybe_save_audio(request):
 @pytest.mark.skipif(
     not HAS_ACCEL, reason="Flash attention check requires a GPU/accelerator"
 )
-def test_flash_attention_available(model_pipe, request):
+def test_flash_attention_available(sa3_model, request):
     """Verify flash_attn is importable on GPU environments (medium model only)."""
-    if request.node.callspec.params.get("model_pipe") != "medium":
+    if request.node.callspec.params.get("sa3_model") != "medium":
         pytest.skip("Flash attention check is medium-model only")
 
     try:

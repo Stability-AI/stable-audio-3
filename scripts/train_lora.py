@@ -18,7 +18,7 @@ Two dataset modes (exactly one required):
       000000000001.npy
       000000000001.json
 
-Saves .safetensors LoRA checkpoints compatible with the inference pipeline and run_gradio.py.
+Saves .safetensors LoRA checkpoints compatible with the inference model and run_gradio.py.
 
 Usage:
   uv run python scripts/train_lora.py --model medium-rf --data_dir ./my_data --save_dir ./lora_out
@@ -48,7 +48,7 @@ from stable_audio_3.data.dataset import (
 )
 from stable_audio_3.loading_utils import copy_state_dict, load_ckpt_state_dict
 from stable_audio_3.model_configs import rf_models
-from stable_audio_3.model import create_diffusion_cond_from_config
+from stable_audio_3.factory import create_diffusion_cond_from_config
 from stable_audio_3.training.diffusion import (
     DiffusionCondTrainingWrapper,
     DiffusionCondInpaintDemoCallback,

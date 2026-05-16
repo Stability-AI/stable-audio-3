@@ -15,7 +15,7 @@ from stable_audio_3.verbose import vprint
 from stable_audio_3.inference.distribution_shift import LogSNRShift, FluxDistributionShift, DistributionShift, IdentityDistributionShift
 from stable_audio_3.models.lora import has_lora
 
-pipeline = None
+stable_audio_3_model = None
 sample_size = 5324800
 sample_rate = 44100
 n_loras = 0
@@ -88,7 +88,7 @@ def generate_cond(
             interval_min = lora_args[off + 1]
             interval_max = lora_args[off + 2]
             layer_filter = lora_args[off + 3]
-            pipeline.set_lora_strength(strength, lora_index=i)
+            stable_audio_3_model.set_lora_strength(strength, lora_index=i)
             lora_configs.append({
                 "lora_index": i,
                 "interval": (interval_min, interval_max),
@@ -113,8 +113,8 @@ def generate_cond(
         log_snr = math.log(((1 - sigma) / sigma) + 1e-6)
 
         if (current_step - 1) % preview_every == 0:
-            if pipeline.model.pretransform is not None:
-                denoised = pipeline.model.pretransform.decode(denoised)
+            if stable_audio_3_model.model.pretransform is not None:
+                denoised = stable_audio_3_model.model.pretransform.decode(denoised)
             denoised = rearrange(denoised, "b d n -> d (b n)")
             denoised = denoised.clamp(-1, 1).mul(32767).to(torch.int16).cpu()
             audio_spectrogram = audio_spectrogram_image(denoised, sample_rate=sample_rate)
@@ -163,7 +163,7 @@ def generate_cond(
             "inpaint_mask_end_seconds": mask_maskend,
         })
 
-    audio = pipeline.generate(**generate_args)
+    audio = stable_audio_3_model.generate(**generate_args)
 
     # Filenaming convention
     prompt_condensed = condense_prompt(prompt)
@@ -239,14 +239,14 @@ def delete_files_async(filenames, delay):
                 os.remove(filename)  # Delete the file
     threading.Thread(target=delete_files_after_delay, args=(filenames, delay)).start()
 
-def create_sampling_ui(pipeline, default_prompt=None):
+def create_sampling_ui(stable_audio_3_model, default_prompt=None):
     global n_loras
-    diffusion_objective = pipeline.model.diffusion_objective
+    diffusion_objective = stable_audio_3_model.model.diffusion_objective
     is_rf = diffusion_objective == "rectified_flow"
     is_rf_denoiser = diffusion_objective == "rf_denoiser" # includes ARC models
 
     # Extract default dist_shift params from model's sampling_dist_shift
-    default_sampling_dist_shift = getattr(pipeline.model, 'sampling_dist_shift', None)
+    default_sampling_dist_shift = getattr(stable_audio_3_model.model, 'sampling_dist_shift', None)
     default_dist_shift_type = "LogSNR"
     default_logsnr_params = {"anchor_length": 2000, "anchor_logsnr": -6.2, "rate": 0.0, "logsnr_end": 2.0}
     default_flux_params = {"min_length": 256, "max_length": 4096, "alpha_min": 6.93, "alpha_max": 6.93}
@@ -281,8 +281,8 @@ def create_sampling_ui(pipeline, default_prompt=None):
 
     has_seconds_total = True
 
-    use_lora = has_lora(pipeline.model)
-    lora_names = getattr(pipeline.model, 'lora_names', [])
+    use_lora = has_lora(stable_audio_3_model.model)
+    lora_names = getattr(stable_audio_3_model.model, 'lora_names', [])
     n_loras = len(lora_names)
 
     if default_prompt is None:
@@ -534,12 +534,12 @@ def create_sampling_ui(pipeline, default_prompt=None):
         api_name="generate")
 
 
-def create_diffusion_cond_ui(pipe, gradio_title="", default_prompt=None):
-    global sample_size, sample_rate, pipeline
+def create_diffusion_cond_ui(model, gradio_title="", default_prompt=None):
+    global sample_size, sample_rate, stable_audio_3_model
 
-    sample_size = pipe.model_config["sample_size"]
-    sample_rate = pipe.model_config["sample_rate"]
-    pipeline = pipe
+    sample_size = model.model_config["sample_size"]
+    sample_rate = model.model_config["sample_rate"]
+    stable_audio_3_model = model
 
 
     js ="""function run_javascript_on_page_load(){
@@ -615,7 +615,7 @@ def create_diffusion_cond_ui(pipe, gradio_title="", default_prompt=None):
         if gradio_title:
             gr.Markdown("### %s" % gradio_title)
         with gr.Tab("Generation"):
-            create_sampling_ui(pipe, default_prompt=default_prompt)
+            create_sampling_ui(model, default_prompt=default_prompt)
 
         # JavaScript to autoplay audio immediately after generation (if autoplay enabled)
     return ui

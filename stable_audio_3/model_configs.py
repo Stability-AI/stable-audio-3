@@ -52,10 +52,15 @@ class AutoencoderModelConfig:
 
 
 rf_models: dict[str, ModelConfig] = {
-    "small-rf": ModelConfig(
-        "stabilityai/stable-audio-3-small",
-        "stable-audio-3-small-RF.json",
-        "stable-audio-3-small-RF.safetensors",
+    "small-music-rf": ModelConfig(
+        "stabilityai/stable-audio-3-small-music",
+        "stable-audio-3-small-music-RF.json",
+        "stable-audio-3-small-music-RF.safetensors",
+    ),
+    "small-sfx-rf": ModelConfig(
+        "stabilityai/stable-audio-3-small-sfx",
+        "stable-audio-3-small-sfx-RF.json",
+        "stable-audio-3-small-sfx-RF.safetensors",
     ),
     "medium-rf": ModelConfig(
         "stabilityai/stable-audio-3-medium",
@@ -65,10 +70,15 @@ rf_models: dict[str, ModelConfig] = {
 }
 
 arc_models: dict[str, ModelConfig] = {
-    "small": ModelConfig(
-        "stabilityai/stable-audio-3-small",
-        "stable-audio-3-small-ARC.json",
-        "stable-audio-3-small-ARC.safetensors",
+    "small-music": ModelConfig(
+        "stabilityai/stable-audio-3-small-music",
+        "stable-audio-3-small-music-ARC.json",
+        "stable-audio-3-small-music-ARC.safetensors",
+    ),
+    "small-sfx": ModelConfig(
+        "stabilityai/stable-audio-3-small-sfx",
+        "stable-audio-3-small-sfx-ARC.json",
+        "stable-audio-3-small-sfx-ARC.safetensors",
     ),
     "medium": ModelConfig(
         "stabilityai/stable-audio-3-medium",
@@ -80,8 +90,10 @@ arc_models: dict[str, ModelConfig] = {
 # Stable Audio 3 full-model configs to probe (in order) before downloading the AE-only repo.
 # Both ARC and RF variants share the same autoencoder, so either can supply the weights.
 _small_stable_audio_3: tuple[ModelConfig, ...] = (
-    arc_models["small"],
-    rf_models["small-rf"],
+    arc_models["small-music"],
+    rf_models["small-music-rf"],
+    arc_models["small-sfx"],
+    rf_models["small-sfx-rf"],
 )
 _medium_stable_audio_3: tuple[ModelConfig, ...] = (
     arc_models["medium"],

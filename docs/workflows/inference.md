@@ -4,11 +4,11 @@ An overview of the different inference modes. The python interface is shown, but
 > New to diffusion/RF models? See [Model Overview](../guides/how-inference-works.md)
 > for a conceptual overview before diving in.
 
-## Loading the Pipeline
+## Loading the Model
 
 ```python
-from stable_audio_3 import StableAudioPipeline
-pipe = StableAudioPipeline.from_pretrained("medium", device="cuda")  # device is optional, defaults to cuda → mps → cpu
+from stable_audio_3 import StableAudioModel
+model = StableAudioModel.from_pretrained("medium", device="cuda")  # device is optional, defaults to cuda → mps → cpu
 ```
 
 The first argument selects the model to load. Available models:
@@ -16,9 +16,11 @@ The first argument selects the model to load. Available models:
 | Model | Type |
 |---|---|
 | `medium` | ARC |
-| `small` | ARC |
+| `small-music` | ARC |
+| `small-sfx` | ARC |
 | `medium-rf` | RF |
-| `small-rf` | RF |
+| `small-music-rf` | RF |
+| `small-sfx-rf` | RF |
 
 For inference, you will want to use ARC models as the RF models are slower and of worse quality. RF models are best used for [LoRA Training](docs/workflows/lora_training.md).
 
@@ -27,10 +29,10 @@ For inference, you will want to use ARC models as the RF models are slower and o
 ## Text-to-Audio
 The most common usage is generating audio from text
 ```python
-from stable_audio_3 import StableAudioPipeline
+from stable_audio_3 import StableAudioModel
 
-pipe = StableAudioPipeline.from_pretrained("medium")
-audio = pipe.generate(
+model = StableAudioModel.from_pretrained("medium")
+audio = model.generate(
     prompt="120 BPM house loop", 
     negative_prompt="poor quality",
     duration=30,
@@ -59,11 +61,11 @@ Using init audio, you can edit an existing recording to change the style, genres
 
 ```python
 import torchaudio
-from stable_audio_3 import StableAudioPipeline
+from stable_audio_3 import StableAudioModel
 
-pipe = StableAudioPipeline.from_pretrained("medium")
+model = StableAudioModel.from_pretrained("medium")
 init_audio = torchaudio.load("/path/to/some/audio.wav")
-audio = pipe.generate(
+audio = model.generate(
     init_audio=init_audio,
     init_noise_level=0.9,
     prompt="bossa nova bassline",
@@ -83,11 +85,11 @@ Inpainting lets you regenerate a specific region of an existing audio file while
 
 ```python
 import torchaudio
-from stable_audio_3 import StableAudioPipeline
+from stable_audio_3 import StableAudioModel
 
-pipe = StableAudioPipeline.from_pretrained("medium")
+model = StableAudioModel.from_pretrained("medium")
 inpaint_audio = torchaudio.load("/path/to/some/audio.wav")
-audio = pipe.generate(
+audio = model.generate(
     inpaint_audio=inpaint_audio,
     inpaint_mask_start_seconds=4.0,
     inpaint_mask_end_seconds=8.0,
@@ -100,11 +102,11 @@ You can also *extend* an audio by performing continuation. Simply choose a durat
 
 ```python
 import torchaudio
-from stable_audio_3 import StableAudioPipeline
+from stable_audio_3 import StableAudioModel
 
-pipe = StableAudioPipeline.from_pretrained("medium")
+model = StableAudioModel.from_pretrained("medium")
 inpaint_audio = torchaudio.load("/path/to/some/audio.wav") # Assume this is 10s long
-audio = pipe.generate(
+audio = model.generate(
     inpaint_audio=inpaint_audio,
     inpaint_mask_start_seconds=10.0,
     inpaint_mask_end_seconds=18.0,
@@ -127,12 +129,12 @@ For example, with batch_size=4:
 
 ```python
 import torchaudio
-from stable_audio_3 import StableAudioPipeline
+from stable_audio_3 import StableAudioModel
 
-pipe = StableAudioPipeline.from_pretrained("medium")
+model = StableAudioModel.from_pretrained("medium")
 inpaint_audio = torchaudio.load("/path/to/some/audio1.wav")
 
-audio = pipe.generate(
+audio = model.generate(
     inpaint_audio=inpaint_audio,
     inpaint_mask_start_seconds=3
     inpaint_mask_end_seconds=10
@@ -153,15 +155,15 @@ This currently works for the following parameters:
 # LoRA
 ## Inference with LoRA
 
-Load one or more LoRA checkpoints onto the pipeline before generating:
+Load one or more LoRA checkpoints onto the model before generating:
 
 ```python
-from stable_audio_3 import StableAudioPipeline
+from stable_audio_3 import StableAudioModel
 
-pipe = StableAudioPipeline.from_pretrained("medium")
-pipe.load_lora(["path/to/lora.safetensors"])
+model = StableAudioModel.from_pretrained("medium")
+model.load_lora(["path/to/lora.safetensors"])
 
-audio = pipe.generate(
+audio = model.generate(
     prompt="Lo-fi boom bap meets orchestral strings 84 BPM",
     duration=30,
 )
@@ -170,7 +172,7 @@ audio = pipe.generate(
 Multiple LoRAs can be stacked by passing additional paths:
 
 ```python
-pipe.load_lora(["style_a.safetensors", "style_b.safetensors"])
+model.load_lora(["style_a.safetensors", "style_b.safetensors"])
 ```
 
 ### Adjusting LoRA strength
@@ -178,17 +180,17 @@ pipe.load_lora(["style_a.safetensors", "style_b.safetensors"])
 Control how strongly the LoRA influences the output at runtime:
 
 ```python
-pipe.set_lora_strength(0.5)              # Half-strength on all LoRAs
-pipe.set_lora_strength(1.5)              # Amplify the effect
-pipe.set_lora_strength(0.0)              # Disable without unloading
+model.set_lora_strength(0.5)              # Half-strength on all LoRAs
+model.set_lora_strength(1.5)              # Amplify the effect
+model.set_lora_strength(0.0)              # Disable without unloading
 
 # With multiple LoRAs, target by index:
-pipe.set_lora_strength(1.0, lora_index=0)
-pipe.set_lora_strength(0.3, lora_index=1)
+model.set_lora_strength(1.0, lora_index=0)
+model.set_lora_strength(0.3, lora_index=1)
 
 # Target only the DiT backbone or conditioner independently:
-pipe.set_lora_strength(1.0, target="dit")
-pipe.set_lora_strength(0.0, target="conditioner")
+model.set_lora_strength(1.0, target="dit")
+model.set_lora_strength(0.0, target="conditioner")
 ```
 
 For full details on LoRA training see [LoRA Training](lora.md).

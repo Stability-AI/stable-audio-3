@@ -51,14 +51,14 @@ uv sync --extra ui --extra lora
 
 ### CUDA Version
 
-By default, `uv sync` installs PyTorch built against CUDA 12.6. If you need a different CUDA version, install torch and torchaudio manually first, then sync without reinstalling them, for example:
+By default, `uv sync` installs PyTorch built against CUDA 12.6. If you need a different CUDA version, install torch and torchaudio manually first (pinning the same version as `pyproject.toml`), then sync without reinstalling them, for example:
 
 ```bash
-uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
+uv pip install torch==2.7.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu118
 uv sync --no-install-package torch --no-install-package torchaudio
 ```
 
-Replace `cu118` with your target version (`cu121`, `cu124`, etc.). See the [PyTorch install page](https://pytorch.org/get-started/locally/) for the full list.
+Replace `cu118` with your target version. For torch 2.7.1, available CUDA variants are `cu118`, `cu126`, and `cu128`. Not all versions are published for every CUDA channel — check the [PyTorch install page](https://pytorch.org/get-started/locally/) to confirm your target is available.
 
 ### Flash Attention
 Stable Audio 3 Medium requires [Flash Attention](https://github.com/Dao-AILab/flash-attention), follow the instructions from there to install.

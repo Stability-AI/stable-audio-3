@@ -110,12 +110,13 @@ def main(args):
                 .squeeze(0)
                 .int()
             )
-            padding_np = padding_mask.cpu().numpy()
-            valid_indices = np.where(padding_np == 1)[0]
-            if len(valid_indices) > 0:
-                valid_length = valid_indices[-1] + 1
-                latent_np = latent_np[:, :valid_length]
-                padding_mask = padding_mask[:valid_length]
+            if args.no_pad:
+                padding_np = padding_mask.cpu().numpy()
+                valid_indices = np.where(padding_np == 1)[0]
+                if len(valid_indices) > 0:
+                    valid_length = valid_indices[-1] + 1
+                    latent_np = latent_np[:, :valid_length]
+                    padding_mask = padding_mask[:valid_length]
 
             np.save(os.path.join(args.output_path, f"{latent_id}.npy"), latent_np)
 
@@ -151,9 +152,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_half", action="store_true", help="Run autoencoder in fp16"
     )
+    parser.add_argument(
+        "--no_pad", action="store_true", help="Do not pad audio samples"
+    )
     args = parser.parse_args()
 
-    if args.batch_size != 1:
+    if args.no_pad and args.batch_size > 1:
         parser.error(
             "--batch_size must be 1 (variable-length latents cannot be batched)"
         )

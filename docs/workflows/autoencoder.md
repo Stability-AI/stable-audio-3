@@ -111,6 +111,6 @@ Pass the output directory to `train_lora.py` via `--encoded_dir`. See [LoRA trai
 | `--model` | `same-l` | Autoencoder variant: `same-s` (small), `same-l` (medium/large) |
 | `--data_dir` | — | Folder containing audio + `.txt` pairs |
 | `--output_path` | — | Where to write `.npy`/`.json` latent pairs |
-| `--batch_size` | `1` | Must be `1` (variable-length latents cannot be batched) |
+| `--batch_size` | `1` | Must be `1` for variable-length latents |
 | `--sample_size` | `12582912` | Samples to pad/crop to (default ~380s at 44.1kHz)|
 | `--model_half` | off | Run the autoencoder in fp16 to reduce memory |

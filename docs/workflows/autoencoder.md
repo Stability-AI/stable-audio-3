@@ -6,9 +6,9 @@ Stable Audio 3 uses a 44.1k stereo audio autoencoder to compress waveforms into 
 
 ```python
 import torchaudio
-from stable_audio_3 import AutoencoderPipeline
+from stable_audio_3 import AutoencoderModel
 
-ae = AutoencoderPipeline.from_pretrained("same-l")  # "same-s" (small), "same-l" (medium/large)
+ae = AutoencoderModel.from_pretrained("same-l")  # "same-s" (small), "same-l" (medium/large)
 waveform, sr = torchaudio.load("audio.wav")
 latents = ae.encode(waveform, sr)
 # → (1, latent_dim, latent_time)
@@ -27,9 +27,9 @@ latents = ae.encode([waveform_a, waveform_b], sr=[44100, 22050])
 
 ```python
 import torchaudio
-from stable_audio_3 import AutoencoderPipeline
+from stable_audio_3 import AutoencoderModel
 
-ae = AutoencoderPipeline.from_pretrained("same-l")
+ae = AutoencoderModel.from_pretrained("same-l")
 audio_out = ae.decode(latents)
 # → (1, 2, samples)
 
@@ -42,9 +42,9 @@ For audio that is too long to encode or decode in a single forward pass, pass `c
 
 ```python
 import torchaudio
-from stable_audio_3 import AutoencoderPipeline
+from stable_audio_3 import AutoencoderModel
 
-ae = AutoencoderPipeline.from_pretrained("same-l")
+ae = AutoencoderModel.from_pretrained("same-l")
 waveform, sr = torchaudio.load("audio.wav")
 
 latents = ae.encode(waveform, sr, chunked=True, chunk_size=128, overlap=32)
@@ -58,9 +58,9 @@ The overlap should be at least as large as the model's receptive field. A value 
 ```python
 import numpy as np
 import torch
-from stable_audio_3 import AutoencoderPipeline
+from stable_audio_3 import AutoencoderModel
 
-ae = AutoencoderPipeline.from_pretrained("same-l")
+ae = AutoencoderModel.from_pretrained("same-l")
 
 # Save
 np.save("latents.npy", latents[0].cpu().numpy())  # (latent_dim, latent_time)
@@ -76,7 +76,7 @@ For LoRA training, if you have a large dataset, it is much faster to pre-encode 
 
 ```bash
 uv run python scripts/pre_encode_dataset.py \
-  --model small \
+  --model same-s \
   --data_dir ./my_data \
   --output_path ./latents_out \
   --batch_size 1
@@ -92,7 +92,7 @@ my_data/
   clip2.txt
 ```
 
-Each encoded clip is written as a `.npy` latent and a `.json` metadata file (which includes a padding mask tracking the valid audio region before padding):
+Each encoded clip is written as a `.npy` latent and a `.json` metadata file. When `--pad` is used, the metadata includes a padding mask tracking the valid audio region:
 
 ```
 latents_out/
@@ -111,6 +111,7 @@ Pass the output directory to `train_lora.py` via `--encoded_dir`. See [LoRA trai
 | `--model` | `same-l` | Autoencoder variant: `same-s` (small), `same-l` (medium/large) |
 | `--data_dir` | — | Folder containing audio + `.txt` pairs |
 | `--output_path` | — | Where to write `.npy`/`.json` latent pairs |
-| `--batch_size` | `1` | Audio clips to encode per forward pass |
+| `--batch_size` | `1` | Must be `1` for variable-length latents |
 | `--sample_size` | `12582912` | Samples to pad/crop to (default ~380s at 44.1kHz)|
 | `--model_half` | off | Run the autoencoder in fp16 to reduce memory |
+| `--pad` | off | Pad/crop audio to `--sample_size` (required for `--batch_size > 1`) |

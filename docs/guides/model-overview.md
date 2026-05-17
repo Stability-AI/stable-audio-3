@@ -5,7 +5,7 @@ Stable Audio 3 is a family of text-conditioned audio generation models.
 
 ## Using the Model
 
-Both configurations (Small and Medium) share the same interface — see the [model table](#) for hardware requirements and generation speed.
+All configurations (Small-Music, Small-SFX, and Medium) share the same interface — see the [model table](#) for hardware requirements and generation speed.
 
 | Input | Description |
 |---|---|
@@ -85,7 +85,8 @@ There are three DiT variants:
 
 | Model | Quality | Max Duration | Params | Autoencoder | Available |
 |---|---|---|---|---|---|
-| Small | Good | ~2min | 433M | SAME-S | This repo |
+| Small-Music | Good | ~2min | 433M | SAME-S | This repo |
+| Small-SFX | Good | ~2min | 433M | SAME-S | This repo |
 | Medium | High | ~4.75min | 1.4B | SAME-L | This repo |
 | Large | Highest | ~6.3min | 2.7B | SAME-L | [API only](#) |
 
@@ -96,11 +97,11 @@ Three families of checkpoints are provided, each with Small and Medium variants:
 
 | Key | Family | Purpose |
 |---|---|---|
-| `small`, `medium` | ARC | Primary inference checkpoints. Use these for generation. |
-| `small-rf`, `medium-rf` | RF | Pre-ARC base checkpoints. Used as the starting point for LoRA training. |
+| `small-music`, `small-sfx`, `medium` | Post-trained | Primary inference checkpoints. Use these for generation. |
+| `small-music-base`, `small-sfx-base`, `medium-base` | Base | RF base checkpoints. Used as the starting point for LoRA training. |
 | `same-s`, `same-l` | SAME | Standalone autoencoder checkpoints. Use these if you only need encoding/decoding without the DiT. |
 
-ARC checkpoints have no suffix because they are the default choice for inference — the `-rf` suffix on the RF checkpoints distinguishes them as the earlier-stage base. SAME checkpoints will reuse a locally cached ARC or RF checkpoint automatically if one is already present, avoiding a redundant download.
+Post-trained checkpoints have no suffix because they are the default choice for inference — the `-base` suffix distinguishes the earlier-stage RF base checkpoints. SAME checkpoints will reuse a locally cached post-trained or base checkpoint automatically if one is already present, avoiding a redundant download.
 
 ## How inference works
 
@@ -127,7 +128,7 @@ Once the final latent sequence is produced, it is passed through the SAME decode
 
 Stable Audio supports LoRA fine-tuning as an easy way to adapt models toward specific styles. See the [LoRA guide](docs/workflows/lora.md).
 
-Note: LoRAs are trained on the RF base checkpoint. Once trained, they can be imported onto the ARC model and will work as expected.
+Note: LoRAs are trained on the base checkpoint. Once trained, they can be applied to the post-trained model and will work as expected.
 
 ## Training Data
 All models were trained on a combination of licensed ([AudioSparx](https://www.audiosparx.com/)) and CC0 ([Freesound](https://freesound.org/) data)

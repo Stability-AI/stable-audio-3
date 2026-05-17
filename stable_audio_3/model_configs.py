@@ -51,60 +51,66 @@ class AutoencoderModelConfig:
         return local_config, local_ckpt
 
 
-rf_models: dict[str, ModelConfig] = {
-    "small-rf": ModelConfig(
-        "stabilityai/stable-audio-3-small",
-        "stable-audio-3-small-RF.json",
-        "stable-audio-3-small-RF.safetensors",
+models: dict[str, ModelConfig] = {
+    "small-music": ModelConfig(
+        "stabilityai/stable-audio-3-small-music",
+        "model_config.json",
+        "model.safetensors",
     ),
-    "medium-rf": ModelConfig(
-        "stabilityai/stable-audio-3-medium",
-        "stable-audio-3-medium-RF.json",
-        "stable-audio-3-medium-RF.safetensors",
+    "small-music-base": ModelConfig(
+        "stabilityai/stable-audio-3-small-music-base",
+        "model_config.json",
+        "model.safetensors",
     ),
-}
-
-arc_models: dict[str, ModelConfig] = {
-    "small": ModelConfig(
-        "stabilityai/stable-audio-3-small",
-        "stable-audio-3-small-ARC.json",
-        "stable-audio-3-small-ARC.safetensors",
+    "small-sfx": ModelConfig(
+        "stabilityai/stable-audio-3-small-sfx",
+        "model_config.json",
+        "model.safetensors",
+    ),
+    "small-sfx-base": ModelConfig(
+        "stabilityai/stable-audio-3-small-sfx-base",
+        "model_config.json",
+        "model.safetensors",
     ),
     "medium": ModelConfig(
         "stabilityai/stable-audio-3-medium",
-        "stable-audio-3-medium-ARC.json",
-        "stable-audio-3-medium-ARC.safetensors",
+        "model_config.json",
+        "model.safetensors",
+    ),
+    "medium-base": ModelConfig(
+        "stabilityai/stable-audio-3-medium-base",
+        "model_config.json",
+        "model.safetensors",
     ),
 }
 
 # Stable Audio 3 full-model configs to probe (in order) before downloading the AE-only repo.
-# Both ARC and RF variants share the same autoencoder, so either can supply the weights.
 _small_stable_audio_3: tuple[ModelConfig, ...] = (
-    arc_models["small"],
-    rf_models["small-rf"],
+    models["small-music"],
+    models["small-sfx"],
 )
-_medium_stable_audio_3: tuple[ModelConfig, ...] = (
-    arc_models["medium"],
-    rf_models["medium-rf"],
-)
+_medium_stable_audio_3: tuple[ModelConfig, ...] = (models["medium"],)
 
 ae_models: dict[str, AutoencoderModelConfig] = {
     "same-s": AutoencoderModelConfig(
         ae_repo_id="stabilityai/SAME-S",
-        ae_config_path="SAME-S.json",
-        ae_ckpt_path="SAME-S.safetensors",
+        ae_config_path="model_config.json",
+        ae_ckpt_path="model.safetensors",
         stable_audio_3=_small_stable_audio_3,
     ),
     "same-l": AutoencoderModelConfig(
         ae_repo_id="stabilityai/SAME-L",
-        ae_config_path="SAME-L.json",
-        ae_ckpt_path="SAME-L.safetensors",
+        ae_config_path="model_config.json",
+        ae_ckpt_path="model.safetensors",
         stable_audio_3=_medium_stable_audio_3,
     ),
 }
 
+base_models: dict[str, ModelConfig] = {
+    k: v for k, v in models.items() if k.endswith("-base")
+}
+
 all_models: dict[str, ModelConfig | AutoencoderModelConfig] = {
-    **rf_models,
-    **arc_models,
+    **models,
     **ae_models,
 }

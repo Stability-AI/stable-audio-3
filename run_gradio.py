@@ -1,6 +1,6 @@
 import torch
 from stable_audio_3.interface.diffusion_cond import create_diffusion_cond_ui
-from stable_audio_3.pipeline import StableAudioPipeline
+from stable_audio_3 import StableAudioModel
 from stable_audio_3.verbose import set_verbose
 import sys
 
@@ -20,11 +20,11 @@ def main(args):
     set_verbose(getattr(args, "verbose", False))
     torch.manual_seed(42)
     model_half = args.model_half
-    pipe = StableAudioPipeline.from_pretrained(args.model, model_half=model_half)
+    model = StableAudioModel.from_pretrained(args.model, model_half=model_half)
     if args.lora_ckpt_path:
-        pipe.load_lora(args.lora_ckpt_path)
+        model.load_lora(args.lora_ckpt_path)
     interface = create_diffusion_cond_ui(
-        pipe,
+        model,
         gradio_title=args.title if args.title is not None else "Stable Audio 3",
         default_prompt=args.default_prompt,
     )
@@ -41,7 +41,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Run gradio interface")
     parser.add_argument(
-        "--model", type=str, help="Name of pretrained model", required=False
+        "--model", type=str, help="Name of pretrained model", required=True
     )
     parser.add_argument(
         "--model-config", type=str, help="Path to model config", required=False

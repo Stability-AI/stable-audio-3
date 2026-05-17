@@ -18,12 +18,12 @@ Two dataset modes (exactly one required):
       000000000001.npy
       000000000001.json
 
-Saves .safetensors LoRA checkpoints compatible with the inference pipeline and run_gradio.py.
+Saves .safetensors LoRA checkpoints compatible with the inference model and run_gradio.py.
 
 Usage:
-  uv run python scripts/train_lora.py --model medium-rf --data_dir ./my_data --save_dir ./lora_out
-  uv run python scripts/train_lora.py --model medium-rf --encoded_dir ./latents_out --save_dir ./lora_out
-  uv run python scripts/train_lora.py --model medium-rf --data_dir ./my_data --steps 500 --rank 8
+  uv run python scripts/train_lora.py --model medium-base --data_dir ./my_data --save_dir ./lora_out
+  uv run python scripts/train_lora.py --model medium-base --encoded_dir ./latents_out --save_dir ./lora_out
+  uv run python scripts/train_lora.py --model medium-base --data_dir ./my_data --steps 500 --rank 8
 """
 
 # Disable HuggingFace progress bars BEFORE any imports
@@ -46,9 +46,11 @@ from stable_audio_3.data.dataset import (
     SampleDataset,
     collation_fn,
 )
-from stable_audio_3.loading_utils import copy_state_dict, load_ckpt_state_dict
-from stable_audio_3.model_configs import rf_models
-from stable_audio_3.model import create_diffusion_cond_from_config
+from safetensors.torch import load_file
+from stable_audio_3.loading_utils import copy_state_dict
+from stable_audio_3.model_configs import base_models
+from stable_audio_3.factory import create_diffusion_cond_from_config
+from stable_audio_3.models.lora.utils import load_lora_checkpoint
 from stable_audio_3.training.diffusion import (
     DiffusionCondTrainingWrapper,
     DiffusionCondInpaintDemoCallback,
@@ -56,16 +58,16 @@ from stable_audio_3.training.diffusion import (
 
 
 def load_model(model_name: str, device: torch.device):
-    if model_name not in rf_models:
+    if model_name not in base_models:
         raise ValueError(
-            f"LoRA training only supports RF models. Got '{model_name}', valid: {list(rf_models)}"
+            f"LoRA training requires a base model. Got '{model_name}', valid: {list(base_models)}"
         )
-    model_cfg = rf_models[model_name]
+    model_cfg = base_models[model_name]
     local_config, local_ckpt = model_cfg.resolve()
     with open(local_config) as f:
         model_config = json.load(f)
     model = create_diffusion_cond_from_config(model_config)
-    copy_state_dict(model, load_ckpt_state_dict(local_ckpt))
+    copy_state_dict(model, load_file(local_ckpt))
     model.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
     if model.pretransform is not None:
         model.pretransform.enable_grad = False
@@ -140,7 +142,7 @@ def train(args):
 
     lora_state_dict = None
     if args.lora_checkpoint:
-        lora_state_dict = load_ckpt_state_dict(args.lora_checkpoint)
+        lora_state_dict, _ = load_lora_checkpoint(args.lora_checkpoint)
 
     lora_config = {
         "rank": args.rank,
@@ -295,7 +297,7 @@ def main():
     p = argparse.ArgumentParser(
         description="Simple LoRA fine-tuning for Stable Audio 3"
     )
-    p.add_argument("--model", choices=list(rf_models), default="medium-rf")
+    p.add_argument("--model", choices=list(base_models), default="medium-base")
     p.add_argument(
         "--data_dir",
         default=None,

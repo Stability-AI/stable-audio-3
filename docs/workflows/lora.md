@@ -112,25 +112,25 @@ When `--include` is specified, only layers whose fully-qualified name contains a
 
 Exclude the `seconds_total` conditioner (prevents conditioner hijacking on small datasets):
 ```bash
-uv run python scripts/train_lora.py --model medium-rf --data_dir ./my_data \
+uv run python scripts/train_lora.py --model medium-base --data_dir ./my_data \
     --rank 16 --adapter_type lora-xs --exclude seconds_total
 ```
 
 Only apply LoRA to transformer layers:
 ```bash
-uv run python scripts/train_lora.py --model medium-rf --data_dir ./my_data \
+uv run python scripts/train_lora.py --model medium-base --data_dir ./my_data \
     --include transformer.layers
 ```
 
 Only the first 12 transformer layers:
 ```bash
-uv run python scripts/train_lora.py --model medium-rf --data_dir ./my_data \
+uv run python scripts/train_lora.py --model medium-base --data_dir ./my_data \
     --include "layers[0-11]"
 ```
 
 Everything except local embedding and seconds_total conditioner:
 ```bash
-uv run python scripts/train_lora.py --model medium-rf --data_dir ./my_data \
+uv run python scripts/train_lora.py --model medium-base --data_dir ./my_data \
     --exclude to_local_embed seconds_total
 ```
 
@@ -143,14 +143,14 @@ The `include`/`exclude` config is persisted in the checkpoint and automatically 
 **`--base_precision bf16`** casts all frozen base model weights to bfloat16 after LoRA is applied, while keeping LoRA parameters in fp32 for the optimizer. This halves the VRAM used by the frozen weights with negligible quality impact on most tasks:
 
 ```bash
-uv run python scripts/train_lora.py --model medium-rf --data_dir ./my_data \
+uv run python scripts/train_lora.py --model medium-base --data_dir ./my_data \
     --adapter_type dora-rows --base_precision bf16
 ```
 
 **Pre-computed SVD bases** avoid the per-layer SVD computation at startup for `-XS` adapters. Compute once and reuse across training runs:
 
 ```bash
-uv run python scripts/train_lora.py --model medium-rf --data_dir ./my_data \
+uv run python scripts/train_lora.py --model medium-base --data_dir ./my_data \
     --adapter_type lora-xs --svd_bases_path ./svd_bases.pt
 ```
 
@@ -161,7 +161,7 @@ Without `--svd_bases_path`, SVD is computed on-the-fly per layer (slower startup
 Use `--lora_checkpoint` to continue training from an existing checkpoint. The LoRA weights are loaded with `strict=False`, so the checkpoint does not need to cover exactly the same set of layers:
 
 ```bash
-uv run python scripts/train_lora.py --model medium-rf --data_dir ./my_data \
+uv run python scripts/train_lora.py --model medium-base --data_dir ./my_data \
     --lora_checkpoint ./lora_out/lora_step500.safetensors \
     --steps 1000 --output_dir ./lora_out_continued
 ```
@@ -194,10 +194,10 @@ Use the `--lora-ckpt-path` argument when running the Gradio interface. You can l
 
 ```bash
 # Single LoRA
-uv run python run_gradio.py --model medium --lora-ckpt-path lora.safetensors
+uv run python run_gradio.py --model medium-base --lora-ckpt-path lora.safetensors
 
 # Multiple LoRAs
-uv run python run_gradio.py --model medium \
+uv run python run_gradio.py --model medium-base \
     --lora-ckpt-path style_a.safetensors style_b.safetensors
 ```
 

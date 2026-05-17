@@ -14,9 +14,10 @@ Stable Audio 3 is the next generation of Stable Audio: a focused, streamlined pl
 
 ## Models
 
-| RF Model | Autoencoder | Hardware | Params | Max length | Use case |
+| Model | Autoencoder | Hardware | Params | Max length | Use case |
 |---|---|---|---|---|---|
-| **Stable Audio 3 Small** | SAME-Small | CPU | 433M | 120s | Lightweight inference, no GPU required |
+| **Stable Audio 3 Small-Music** | SAME-Small | CPU | 433M | 120s | Lightweight music-only inference, no GPU required |
+| **Stable Audio 3 Small-SFX** | SAME-Small | CPU | 433M | 120s | Lightweight sound effects-only inference, no GPU required |
 | **Stable Audio 3 Medium** | SAME-Large | GPU (CUDA) | 1.4B | 380s | High Quality, Fast Inference |
 | **Stable Audio 3 Large** | SAME-Large | API only | 2.7B | 380s | Highest quality, API only. Not supported by this repo, see the [API docs](#) |
 ---
@@ -35,21 +36,57 @@ Stable Audio 3 is the next generation of Stable Audio: a focused, streamlined pl
 Stable Audio 3 uses [uv](https://github.com/astral-sh/uv) for fast, lightweight installs. Install only what you need.
 
 ```bash
-# Base install
+# Base install (Python API only)
 uv sync
-
-# With CUDA support
-uv sync --extra cuda
 
 # With Gradio UI
 uv sync --extra ui
 
-# Multiple extras
-uv sync --extra cuda --extra ui
+# With LoRA training support
+uv sync --extra lora
+
+# Everything
+uv sync --extra ui --extra lora
 ```
 
+### CUDA Version
+
+By default, `uv sync` installs PyTorch built against CUDA 12.6. If you need a different CUDA version, install torch and torchaudio manually first (pinning the same version as `pyproject.toml`), then sync without reinstalling them, for example:
+
+```bash
+uv pip install torch==2.7.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu118
+uv sync --no-install-package torch --no-install-package torchaudio
+```
+
+Replace `cu118` with your target version. For torch 2.7.1, available CUDA variants are `cu118`, `cu126`, and `cu128`. Not all versions are published for every CUDA channel — check the [PyTorch install page](https://pytorch.org/get-started/locally/) to confirm your target is available.
+
 ### Flash Attention
-Stable Audio 3 Medium requires [Flash Attention](https://github.com/Dao-AILab/flash-attention), follow the instructions from there to install.
+
+Stable Audio 3 Medium requires [Flash Attention 2](https://github.com/Dao-AILab/flash-attention).
+
+**Install from a pre-built wheel** (fast, no compilation). The easiest source is the [flash-attention-prebuild-wheels](https://github.com/mjun0812/flash-attention-prebuild-wheels) community repo — browse the releases for a wheel matching your CUDA, PyTorch, and Python versions, then install it directly:
+
+```bash
+uv pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.6.3+cu126torch2.7-cp310-cp310-linux_x86_64.whl
+```
+
+The filename encodes the requirements — `cu126` is CUDA 12.6, `torch2.7` is PyTorch 2.7, `cp310` is Python 3.10. Pick the URL that matches your environment.
+
+If no pre-built wheel matches your setup, build from source. Install `ninja` first to speed up the C++ compile, then set the environment variables for your machine:
+
+```bash
+uv pip install ninja
+.venv/bin/python -m ensurepip
+FLASH_ATTENTION_SKIP_CUDA_BUILD=FALSE \
+FLASH_ATTENTION_FORCE_BUILD=TRUE \
+TORCH_CUDA_ARCH_LIST="9.0" \
+MAX_JOBS=8 \
+.venv/bin/pip3 install flash-attn --no-build-isolation --no-binary flash-attn \
+    --force-reinstall --no-cache-dir --no-deps
+```
+
+- `TORCH_CUDA_ARCH_LIST` — set to your GPU's compute capability: `8.0` (A100), `8.6` (A10/RTX 3090), `8.9` (L4/RTX 4090), `9.0` (H100/H200)
+- `MAX_JOBS` — number of parallel compile jobs; 4–8 is typical, reduce if you run out of RAM during compilation
 
 ## Quick Start
 
@@ -72,10 +109,10 @@ Stable Audio 3 supports several inference modes. For full details, see [Inferenc
 **Text-to-Audio** — Generate audio from a text prompt:
 
 ```python
-from stable_audio_3 import StableAudioPipeline
+from stable_audio_3 import StableAudioModel
 
-pipe = StableAudioPipeline.from_pretrained("medium")
-audio = pipe.generate(
+model = StableAudioModel.from_pretrained("medium")
+audio = model.generate(
     prompt="Lo-fi boom bap meets orchestral strings 84 BPM",
     duration=180,
 )
@@ -85,11 +122,11 @@ audio = pipe.generate(
 
 ```python
 import torchaudio
-from stable_audio_3 import StableAudioPipeline
+from stable_audio_3 import StableAudioModel
 
-pipe = StableAudioPipeline.from_pretrained("medium")
+model = StableAudioModel.from_pretrained("medium")
 init_audio = torchaudio.load("/path/to/audio.wav")
-audio = pipe.generate(
+audio = model.generate(
     init_audio=init_audio,
     init_noise_level=0.9,
     prompt="bossa nova bassline",
@@ -101,12 +138,12 @@ audio = pipe.generate(
 
 ```python
 import torchaudio
-from stable_audio_3 import StableAudioPipeline
+from stable_audio_3 import StableAudioModel
 
-pipe = StableAudioPipeline.from_pretrained("medium")
+model = StableAudioModel.from_pretrained("medium")
 
 inpaint_audio = torchaudio.load("/path/to/audio.wav")
-audio = pipe.generate(
+audio = model.generate(
     inpaint_audio=inpaint_audio,
     inpaint_mask_start_seconds=4.0,
     inpaint_mask_end_seconds=8.0,
@@ -122,9 +159,9 @@ To extend an audio clip (continuation), set `inpaint_mask_start_seconds` to the 
 
 ```python
 import torchaudio
-from stable_audio_3 import AutoencoderPipeline
+from stable_audio_3 import AutoencoderModel
 
-ae = AutoencoderPipeline.from_pretrained("same-l")
+ae = AutoencoderModel.from_pretrained("same-l")
 waveform, sr = torchaudio.load("audio.wav")
 latents = ae.encode(waveform, sr)
 audio_out = ae.decode(latents)
@@ -139,7 +176,7 @@ See [Autoencoder Workflows](docs/workflows/autoencoder.md) for encoding batches,
 Stable Audio 3 scales from a laptop to a multi-GPU server. Specify your backend at load time:
 
 ```python
-model = StableAudioPipeline.from_pretrained(
+model = StableAudioModel.from_pretrained(
     "medium",
     backend="tensorrt"  # or "mlx", "coreml", "openvino"
 )
@@ -174,14 +211,13 @@ Join our [Discord](https://discord.gg/cKpvjey8b) for updates, help, and discussi
 
 #### Output audio is a static glitch sound (affects Stable Audio 3 Medium-only)
 
-Likely an issue with flash-attention. Please make sure flash attention is installed correctly.
-You can check with
+Likely an issue with flash-attention. Verify it is importable:
 
-```
+```bash
 uv run python -c "import flash_attn; from flash_attn import flash_attn_func; print('Version:', flash_attn.__version__, '| flash_attn_func:', flash_attn_func)"
 ```
 
-if there are errors in any of this, `flash_attn` is not installed correctly.
+If this errors, flash-attn is not installed correctly — see the [Flash Attention install instructions](#flash-attention) above.
 
 ---
 

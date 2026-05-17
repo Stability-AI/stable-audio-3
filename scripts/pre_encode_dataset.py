@@ -26,7 +26,7 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from stable_audio_3 import AutoencoderPipeline
+from stable_audio_3 import AutoencoderModel
 from stable_audio_3.model_configs import ae_models
 from stable_audio_3.data.dataset import (
     LocalDatasetConfig,
@@ -45,7 +45,7 @@ def caption_metadata_fn(info, _audio):
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    ae = AutoencoderPipeline.from_pretrained(args.model, device=str(device))
+    ae = AutoencoderModel.from_pretrained(args.model, device=str(device))
     if args.model_half:
         ae.autoencoder = ae.autoencoder.half()
 
@@ -110,7 +110,7 @@ def main(args):
                 .squeeze(0)
                 .int()
             )
-            if args.no_pad:
+            if not args.pad:
                 padding_np = padding_mask.cpu().numpy()
                 valid_indices = np.where(padding_np == 1)[0]
                 if len(valid_indices) > 0:
@@ -153,15 +153,13 @@ if __name__ == "__main__":
         "--model_half", action="store_true", help="Run autoencoder in fp16"
     )
     parser.add_argument(
-        "--no_pad",
-        action="store_true",
-        help="Trim latents to valid audio length (variable-length mode); requires --batch_size 1",
+        "--pad", action="store_true", help="Pad audio samples to --sample_size"
     )
     args = parser.parse_args()
 
-    if args.no_pad and args.batch_size > 1:
+    if not args.pad and args.batch_size > 1:
         parser.error(
-            "--no_pad requires --batch_size 1 (variable-length samples cannot be batched)"
+            "padding is required for batch_size > 1; pass --pad or use --batch_size 1"
         )
 
     main(args)

@@ -74,8 +74,6 @@ class ConditionedDiffusionModelWrapper(nn.Module):
         # Sampling dist_shift: separate config for inference-time schedule
         if sampling_distribution_shift_options is not None:
             self.sampling_dist_shift = self._create_dist_shift(sampling_distribution_shift_options)
-        elif self.dist_shift is not None:
-            self.sampling_dist_shift = self.dist_shift
         else:
             # Default: seq_len-invariant LogSNR shift matching legacy log_snr_sampling=True
             self.sampling_dist_shift = LogSNRShift(rate=0, anchor_logsnr=-6.2, logsnr_end=2.0)

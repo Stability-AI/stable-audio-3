@@ -7,32 +7,27 @@ requires-python = ">=3.10"
 dependencies = [
     "einops>=0.8.2",
     "einops-exts>=0.0.4",
-    "gradio==6.3.0",
-    "matplotlib>=3.10.8",
     "numpy>=2.2.6",
     "packaging>=26.0",
     "safetensors>=0.7.0",
     "torch==2.7.1",
     "torchaudio==2.7.1",
-    "dill>=0.4.1",
     "tqdm>=4.67.3",
-    "accelerate>=1.13.0",
     "huggingface-hub>=1.7.1",
     "transformers>=5.8.0",
 ]
+
 [project.optional-dependencies]
-flash-attn = [
-  "ninja",
-  "pip",
-  "flash-attn"
-  ]
+ui = [
+  "gradio==6.3.0",
+  "matplotlib>=3.10.8",
+  "accelerate>=1.13.0",
+]
 
 lora = [
   "pytorch_lightning==2.5.5",
+  "dill>=0.4.1",
 ]
-
-[tool.uv]
-no-build-isolation-package = ["flash-attn"]
 
 [[tool.uv.index]]
 name = "pytorch-cu126"

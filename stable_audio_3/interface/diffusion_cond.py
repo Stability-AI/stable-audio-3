@@ -345,7 +345,7 @@ def create_sampling_ui(stable_audio_3_model, default_prompt=None):
                     # Sampler params
                     if is_rf:
                         sampler_types = ["euler", "rk4", "dpmpp"]
-                        default_sampler_type = "dpmpp"
+                        default_sampler_type = "euler"
                         sigma_max_max = 1.0
                         sigma_max_default = 1.0
                     elif is_rf_denoiser:

@@ -383,6 +383,7 @@ def sample_diffusion(
     callback = None,
     disable_tqdm: bool = False,
     decode: bool = True,
+    chunked_decode: tp.Optional[bool] = None,
     **sampler_kwargs
 ) -> torch.Tensor:
     """
@@ -507,7 +508,7 @@ def sample_diffusion(
     # Decode if requested
     if decode and pretransform is not None:
         sampled = sampled.to(next(pretransform.parameters()).dtype)
-        sampled = pretransform.decode(sampled)
+        sampled = pretransform.decode(sampled, chunked=chunked_decode)
 
         # Zero out audio beyond valid region (padding positions decode to garbage)
         if padding_mask is not None:

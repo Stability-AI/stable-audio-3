@@ -1,11 +1,11 @@
 # Stable Audio 3 Model
-> For a more in-depth breakdown of Stable Audio 3, please see our tech report.
+> For a more in-depth breakdown of Stable Audio 3, please see our [tech report]().
 
 Stable Audio 3 is a family of text-conditioned audio generation models.
 
 ## Using the Model
 
-All configurations (Small-Music, Small-SFX, and Medium) share the same interface — see the [model table](#) for hardware requirements and generation speed.
+All configurations (Small-Music, Small-SFX, and Medium) share the same interface — see the [model table](../../README.md#models) for hardware requirements and generation speed.
 
 | Input | Description |
 |---|---|
@@ -48,7 +48,7 @@ It is trained using a combination of four losses:
 - **Diffusion alignment** — a small diffusion model trained alongside SAME to ensure its latents are well-suited for generation
 - **Semantic** — small regression models for pitch and stereo image, plus a text/audio contrastive critic that encourages the latents to encode rich, cross-modal meaning
 
-There are two variants:
+There are two autoencoder variants:
 
 | Model | Params | Attention | Latency (no optimizations) †
 |---|---|---|---|
@@ -73,15 +73,19 @@ It accepts three conditions:
 
 Training happens in two phases:
 
-**1. Rectified flow (RF) training**
+**1. Rectified Flow Pre-Training (RF/base)**
 
 We use rectified flow aka flow-matching as our main training objective. The math can get a little complicated here, but put simply, we train a model to learn a trajectory from noise (randomness) to data (latents). One particularly cool feature is that we train with **variable-length diffusion**. Previously, if you just wanted to generate a short output, you will still have to generate a long sequence that would then be trimmed after generation, which sometimes could result in bad outputs. Now, if generating short sequences, it will understand that much better and also generate faster!
 
-**2. ARC post-training**
+**2. Adversarial Post-Training**
 
-After RF training, the model undergoes a final refinement stage to improve quality and reduce latency, producing the final checkpoint used for inference. 
+After RF training, the model undergoes a final refinement stage to improve quality and reduce latency, producing the final checkpoint used for inference. There is also a middle stage here called "distillation warmup" which helps bridge the gap between the two stages. During this stage, a discriminator model with the same architecture as the pre-trained model is fine-tuned with three complementary losses:
 
-There are three DiT variants:
+- **Adversarial relativistic loss** — Uses a discriminator like a GAN. Helps with perceptual quality.
+- **Contrastive loss** - Regularizes latent space so that paired prompts and audios are close together. This helps the discriminator be semantically aligned.
+- **[CLAP](https://github.com/LAION-AI/CLAP) loss**
+
+There are four DiT variants:
 
 | Model | Quality | Max Duration | Params | Autoencoder | Available |
 |---|---|---|---|---|---|
@@ -108,7 +112,7 @@ Post-trained checkpoints have no suffix because they are the default choice for 
 At inference time, Stable Audio 3 turns your inputs (text prompt and duration) into audio through a two-stage process: latent generation with the DiT, followed by waveform reconstruction with SAME.
 
 **1. Conditioning setup**
- 
+
 Your prompt is encoded into a dense embedding using T5Gemma, while the duration is converted into a sinusoidal embedding that represents the desired output length. If inpainting is used, the provided audio is first encoded into SAME latents and combined with a temporal mask indicating where generation should occur.
 
 **2. Latent initialization**
@@ -117,7 +121,7 @@ A sequence of Gaussian noise is initialized in the SAME latent space. The length
 
 **3. Iterative denoising (DiT sampling)**
 
-The DiT progressively transforms this noise into structured latents over a series of steps. At each step, the model predicts how to move the current latent state closer to a valid audio representation while staying consistent with the conditioning (text, duration, and optional inpainting signal). Because the model is trained with rectified flow and ARC, we can reduce the number of steps needed down to 8 while maintaining high quality. 
+The DiT progressively transforms this noise into structured latents over a series of steps. At each step, the model predicts how to move the current latent state closer to a valid audio representation while staying consistent with the conditioning (text, duration, and optional inpainting signal). Because the model is trained with rectified flow and ARC, we can reduce the number of steps needed down to 8 while maintaining high quality.
 
 **4. Latent → audio decoding (SAME)**
 

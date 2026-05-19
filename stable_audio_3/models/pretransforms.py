@@ -4,6 +4,26 @@ from einops import rearrange
 from torchaudio.transforms import Resample
 from .blocks import ResidualUnit, WNConv1d
 
+
+class AutoencoderPretransform(nn.Module):
+    def __init__(self, model, scale=1.0, iterate_batch=False, chunked=False):
+        super().__init__()
+        self.model = model
+        self.model.requires_grad_(False).eval()
+        self.scale = scale
+        self.downsampling_ratio = model.downsampling_ratio
+        self.io_channels = model.io_channels
+        self.enable_grad = False
+        self.iterate_batch = iterate_batch
+        self.chunked = chunked
+
+    def encode(self, x, **kwargs):
+        return self.model.encode_audio(x, chunked=self.chunked, iterate_batch=self.iterate_batch, **kwargs) / self.scale
+
+    def decode(self, z, chunked=None, **kwargs):
+        chunked = self.chunked if chunked is None else chunked
+        return self.model.decode_audio(z * self.scale, chunked=chunked, iterate_batch=self.iterate_batch, **kwargs)
+
 def fold_channels_into_batch(x):
     x = rearrange(x, 'b c ... -> (b c) ...')
     return x

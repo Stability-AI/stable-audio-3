@@ -31,7 +31,7 @@ from stable_audio_3 import StableAudioModel
 
 model = StableAudioModel.from_pretrained("medium")
 audio = model.generate(
-    prompt="120 BPM house loop", 
+    prompt="An anthemic Pop Rock instrumental that fills your head with nostalgic thoughtfulness",
     negative_prompt="poor quality",
     duration=30,
     steps=8, # default
@@ -44,11 +44,13 @@ audio = model.generate(
 ## Controls
 Overview of the main controls
 
-- **`prompt`** — Text description of the audio to generate (e.g. `"120 BPM house loop"`). For help crafting good prompts, see [Prompt Guide](../guides/prompting.md)
+- **`prompt`** — Text description of the audio to generate. For help crafting good prompts, see [Prompt Guide](../guides/prompting.md)
 - **`duration`** — Duration of the generated audio in seconds (default: `120`).
-- **`steps`** — Number of sampling steps (default: `8`). For faster inference, reduce this number at some cost to quality. Higher values (e.g. `50`) can improve quality at the cost of speed.
+- **`steps`** — Number of sampling steps (default: `8`). For even faster inference, reduce this number at some cost to quality. However, going higher than 8 doesn't necessarily increase quality (unless using a '-base' model, where you should use something like 50)
 - **`seed`** - Random seed for reproducible outputs if needed. Use -1 to select a random seed (default) or select your favorite number for deterministic results.
 - **`batch_size`** - Generate multiple at once, useful is you have a GPU and want to get a lot of variations. The max is limited by your GPU's VRAM.
+
+> **Base models only** (`small-music-base`, `small-sfx-base`, `medium-base`) — these parameters have no effect on post-trained checkpoints.
 - **`cfg_scale`** — Classifier-free guidance scale (default: `1.0`; try `7.0` for stronger prompt adherence). Higher values make the output adhere more closely to the prompt; lower values give the model more creative freedom.
 - **`negative_prompt`** — Text description of qualities to avoid in the output. Steers generation away from unwanted characteristics.
 
@@ -74,7 +76,7 @@ audio = model.generate(
 - **`init_audio`** - The source audio as a `(sample_rate, tensor)` tuple (e.g. from `torchaudio.load()`). The audio will be noised and then denoised.
 - **`init_noise_level`** — Controls how much the init audio influences the output (range: `0.0`–`1.0`, default: `1.0`). At `1.0` the init audio is fully replaced by noise and has no effect (pure generation). Lower values preserve more of the original — for example `0.1` produces a close variation, while `0.5` is a halfway blend between the original and pure generation.
 
-The other controls for text to audio are the same, however the `prompt` is now used to control how the audio will be edited. The [Prompt Guide](../guides/prompting.md) has some examples for this
+The other controls for text to audio are the same, however the `prompt` is now used to control how the audio will be edited. The [Prompt Guide](../guides/prompting.md) has some examples for this.
 
 ## Inpainting/Continuation
 Inpainting lets you regenerate a specific region of an existing audio file while keeping the rest intact, useful for fixing a section, swapping out a sound, or extending a loop.
@@ -106,7 +108,7 @@ audio = model.generate(
     inpaint_audio=inpaint_audio,
     inpaint_mask_start_seconds=10.0,
     inpaint_mask_end_seconds=18.0,
-    prompt="punchy kick drum fill",
+    prompt="A dream-like Synthpop instrumental that would accompany a dream-sequence in a surrealist movie",
 )
 ```
 
@@ -116,7 +118,7 @@ audio = model.generate(
 - **`inpaint_mask_start_seconds`** — Start of the region to regenerate, in seconds.
 - **`inpaint_mask_end_seconds`** — End of the region to regenerate, in seconds.
 
-The other controls for text to audio are the same, however the `prompt` is now used to control how the audio will be inpainted. The [Prompt Guide](../guides/prompting.md) has some examples for this
+The other controls for text to audio are the same, however the `prompt` is now used to control how the audio will be inpainted. The [Prompt Guide](../guides/prompting.md) has some examples for this.
 
 
 # Per-batch customization
@@ -147,6 +149,25 @@ This currently works for the following parameters:
 - `prompt`
 - `negative prompt`
 - `duration`
+
+# Chunked Decoding
+
+After diffusion sampling, the latents are decoded to audio by the autoencoder. For longer generations this decode step can be run in overlapping chunks to reduce peak VRAM — at the cost of slightly more compute and minor stitching artefacts at chunk boundaries if the overlap is too small.
+
+All models have chunked decoding **on by default**. You can override this per-generation:
+
+```python
+# Force chunked decoding off (faster on large-VRAM GPUs)
+audio = model.generate(prompt="...", duration=30, chunked_decode=False)
+
+# Force chunked decoding on
+audio = model.generate(prompt="...", duration=30, chunked_decode=True)
+
+# Use the model's default (omit the parameter)
+audio = model.generate(prompt="...", duration=30)
+```
+
+> **Note:** Chunked decoding only affects the final autoencoder decode step, not the diffusion process. On GPUs with enough VRAM to decode the full sequence at once, `chunked_decode=False` may be slightly faster.
 
 # LoRA
 ## Inference with LoRA

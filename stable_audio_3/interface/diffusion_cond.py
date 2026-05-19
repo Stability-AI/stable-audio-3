@@ -225,10 +225,9 @@ def generate_cond(
     audio_spectrogram = audio_spectrogram_image(audio, sample_rate=sample_rate)
 
     # Asynchronously delete the files after returning the output file, so as to prevent clutter in the directory
-    if file_naming in ["verbose", "prompt"]:
-        delete_files_async([output_wav, output_filename], 30)
+    delete_files_async([output_wav, output_filename], 30)
 
-    return ((sample_rate, audio.numpy().T), [audio_spectrogram, *preview_images])
+    return (output_filename, [audio_spectrogram, *preview_images])
 
 #  Asynchronously delete the given list of filenames after delay seconds. Sets up thread that sleeps for delay then deletes.
 def delete_files_async(filenames, delay):

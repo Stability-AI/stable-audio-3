@@ -104,6 +104,7 @@ class StableAudioModel:
         apg_scale: float = 1.0,
         dist_shift=None,
         return_latents: bool = False,
+        chunked_decode: tp.Optional[bool] = None,
         **sampler_kwargs,
     ) -> torch.Tensor:
         """
@@ -140,6 +141,8 @@ class StableAudioModel:
             apg_scale: APG (Adaptive Projected Guidance) scale. 1.0 = full APG, 0.0 = vanilla CFG.
             dist_shift: Optional distribution shift override for sampling. If None, uses model.sampling_dist_shift.
             return_latents: Whether to return the latents used for generation instead of the decoded audio.
+            chunked_decode: Whether to decode latents in overlapping chunks to reduce peak VRAM. True forces
+                chunked decoding on, False forces it off, None (default) uses the value set in the model config.
             **sampler_kwargs: Additional keyword arguments to pass to the sampler.
         """
 
@@ -309,6 +312,7 @@ class StableAudioModel:
             init_data=init_audio,
             init_noise_level=init_noise_level,
             decode=not return_latents,
+            chunked_decode=chunked_decode,
             **sampler_kwargs,
         )
 

@@ -12,7 +12,10 @@ from stable_audio_3.models.conditioners import (
     T5GemmaConditioner,
 )
 from stable_audio_3.models.bottleneck import SoftNormBottleneck
-from stable_audio_3.models.pretransforms import PatchedPretransform
+from stable_audio_3.models.pretransforms import (
+    PatchedPretransform,
+    AutoencoderPretransform,
+)
 
 
 def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
@@ -48,7 +51,7 @@ def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
         "use_effective_length_for_schedule", False
     )
 
-    pretransform = create_autoencoder_from_config(model_config, sample_rate)
+    pretransform = create_pretransform_from_config(model_config, sample_rate)
     min_input_length = pretransform.downsampling_ratio
 
     conditioning_config = model_config.get("conditioning", None)
@@ -109,6 +112,16 @@ def create_autoencoder_from_config(config, sample_rate):
         in_channels=in_channels,
         out_channels=out_channels,
         soft_clip=soft_clip,
+    )
+
+
+def create_pretransform_from_config(config, sample_rate):
+    pretransform_block = config["pretransform"]
+    autoencoder = create_autoencoder_from_config(config, sample_rate)
+    chunked = pretransform_block.get("chunked", False)
+    iterate_batch = pretransform_block.get("iterate_batch", False)
+    return AutoencoderPretransform(
+        autoencoder, chunked=chunked, iterate_batch=iterate_batch
     )
 
 

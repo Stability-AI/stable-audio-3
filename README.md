@@ -1,10 +1,17 @@
 # Stable Audio 3
 
-**A state-of-the-art open platform for fast, high-quality generated audio and music.** 
+**A state-of-the-art open platform for fast, high-quality generated audio and music.**
 
-TBD Paper/blog links
+[![arXiv](https://img.shields.io/badge/Technical%20Report-XXXX.XXXXX-b31b1b.svg)](https://arxiv.org/abs/XXXX.XXXXX)
+[[TODO:Blog]] <a href="https://discord.gg/cKpvjey8b"><img alt="Join us on Discord" src="https://img.shields.io/discord/823813159592001537?color=5865F2&logo=discord&logoColor=white"></a>
 
-<a href="https://discord.gg/cKpvjey8b"><img alt="Join us on Discord" src="https://img.shields.io/discord/823813159592001537?color=5865F2&logo=discord&logoColor=white"></a>
+![Stable Audio 3 Architecture](stable-audio-3.png)
+
+## Abstract
+
+
+TODO:TBD
+
 
 
 Stable Audio 3 is the next generation of Stable Audio: a focused, streamlined platform for inference and fine-tuning, built on lessons from [stable-audio-tools](https://github.com/Stability-AI/stable-audio-tools). If you're doing foundational research or working with previous Stable Audio models, that repo is still the place to go.
@@ -20,14 +27,30 @@ Stable Audio 3 is the next generation of Stable Audio: a focused, streamlined pl
 | **Stable Audio 3 Small-SFX** | SAME-Small | CPU | 433M | 120s | Lightweight sound effects-only inference, no GPU required |
 | **Stable Audio 3 Medium** | SAME-Large | GPU (CUDA) | 1.4B | 380s | High Quality, Fast Inference |
 | **Stable Audio 3 Large** | SAME-Large | API only | 2.7B | 380s | Highest quality, API only. Not supported by this repo, see the [API docs](#) |
+
+### Performance (TODO: finish this)
+
+| Model | Duration | H200 | H200 + TensorRT | Mac CPU* | Mac CoreML* | Peak VRAM† |
+|---|---|---|---|---|---|---|
+| `small` | 5s | 0.41s | 0.017s | 0.70s | 0.23s | 1.69 GB |
+| `small` | 30s | 0.46s | 0.022s | 1.72s | 0.63s | 1.89 GB |
+| `small` | 120s | 0.45s | 0.044s | 5.92s | 3.09s | 2.40 GB |
+| `medium` | 5s | 0.60s | 0.02s | – | – | 5.07 GB |
+| `medium` | 30s | 0.65s | 0.05s | – | – | 5.49 GB |
+| `medium` | 120s | 0.78s | 0.13s | – | – | 6.49 GB |
+| `medium` | 380s | 1.31s | 0.43s | – | – | 6.52 GB |
+
+\* CPU-only via CoreML (DiT) + TFLite (SAME-S decoder)
+† Peak allocated VRAM on H200, unchunked decode. Chunked decoding reduces this — e.g. `medium` at 120s drops from 6.49 GB to ~5.14 GB.
+
 ---
 
 ## Features
 - ⚡ **Fast, state-of-the-art generation** - Generate minutes of audio in milliseconds
 - 🎛️ **Three inference modes** — text-to-audio, audio-to-audio editing, and inpainting/continuation
-- ↔️ **Variable-length generation** — handles generation of a variety of sequences without wasting inference on unused latents
+- ↔️ **Variable-length generation** — handles generation of a variety of sequences without wasting inference time and VRAM on unused latents
 - 🎯 **Personalization through LoRA fine-tuning** — adapt any model to a target style; stackable, adjustable at runtime
-- 💻 **Broad hardware support** — CPU (Small), CUDA/TensorRT (Medium), Apple Silicon via MLX/CoreML, Intel via OpenVINO
+- 💻 **Broad hardware support** — CPU (Small), CUDA/TensorRT (Medium), Apple Silicon via CoreML, Others coming soon
 - 🎵 **SAME autoencoder** — new Semantic-Acoustic Music Encoder; stereo, 44.1 kHz, 256-dimensional latents optimized for both generative tractability and high-quality reconstruction
 
 
@@ -113,7 +136,7 @@ from stable_audio_3 import StableAudioModel
 
 model = StableAudioModel.from_pretrained("medium")
 audio = model.generate(
-    prompt="Lo-fi boom bap meets orchestral strings 84 BPM",
+    prompt="House music that encapsulates the feeling of being at a festival in the sunny weather with all your friends 124 BPM",
     duration=180,
 )
 ```
@@ -170,24 +193,21 @@ audio_out = ae.decode(latents)
 See [Autoencoder Workflows](docs/workflows/autoencoder.md) for encoding batches, chunked processing, and pre-encoding datasets for LoRA training.
 
 ## Hardware Support
+Stable Audio 3 scales from a laptop to a GPU server. Right now, we have scripts for generating audio with various backends.
 
-*COMING SOON*
+TODO: FINISH THIS
 
-Stable Audio 3 scales from a laptop to a multi-GPU server. Specify your backend at load time:
+As an example,
+```
+bash optimized/run_trt.sh
 
-```python
-model = StableAudioModel.from_pretrained(
-    "medium",
-    backend="tensorrt"  # or "mlx", "coreml", "openvino"
-)
 ```
 
 
-### Inference Times
+Check out the `optimized/` directory for other options
 
-TBD
+*More Hardware Support COMING SOON*
 
----
 
 ## Docs
 
@@ -203,7 +223,9 @@ TBD
 
 ## Community
 
-Join our [Discord](https://discord.gg/cKpvjey8b) for updates, help, and discussions. We host weekly office hours talking all things AI audio.
+- [Harmonai Discord](https://discord.gg/cKpvjey8b): Check out our Harmonai Discord server run by the research team. Besides good discussions, we host weekly office hours talking all things AI audio and music and want to hear what you come up with!
+
+- [Underfit](https://github.com/dada-bots/underfit): A LoRA training poweruser dream from Dadabots. If LoRA training in this repo is not enough, check out some experimental tools there.
 
 ---
 
@@ -223,8 +245,7 @@ If this errors, flash-attn is not installed correctly — see the [Flash Attenti
 
 ## License
 
-To use these models commercially, please refer to the 
-[Stability AI Community License](https://stability.ai/license)
+Please refer to the [Stability AI Community License](https://stability.ai/license)
 
 
 ## Testing
@@ -245,4 +266,33 @@ Save generated audio outputs to `test_audio_outputs/` for manual inspection:
 
 ```bash
 uv run pytest --save-audio
+```
+
+
+## Citation
+
+For Stable Audio 3, please cite
+```BibTeX
+@misc{evans2026stableaudio3,
+  title={Stable Audio 3},
+  author={Zach Evans and Julian D. Parker and Matthew Rice and CJ Carr and Zack Zukowski and Josiah Taylor and Jordi Pons},
+  year={2026},
+  eprint={2605.12345},
+  archivePrefix={arXiv},
+  primaryClass={cs.SD},
+  url={https://arxiv.org/abs/2505.12345}
+}
+```
+
+For SAME, please cite
+```BibTeX
+@misc{parker2026SAME,
+  title={SAME: A Semantically-Aligned Music Autoencoder},
+  author={Julian D. Parker and Zach Evans and CJ Carr and Zack Zukowski and Josiah Taylor and Matthew Rice and Jordi Pons},
+  year={2026},
+  eprint={2605.12345},
+  archivePrefix={arXiv},
+  primaryClass={cs.SD},
+  url={https://arxiv.org/abs/2505.12345}
+}
 ```

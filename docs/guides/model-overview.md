@@ -73,7 +73,7 @@ It accepts three conditions:
 
 Training happens in two phases:
 
-**1. Rectified Flow Pre-Training RF**
+**1. Rectified Flow Pre-Training (RF/base)**
 
 We use rectified flow aka flow-matching as our main training objective. The math can get a little complicated here, but put simply, we train a model to learn a trajectory from noise (randomness) to data (latents). One particularly cool feature is that we train with **variable-length diffusion**. Previously, if you just wanted to generate a short output, you will still have to generate a long sequence that would then be trimmed after generation, which sometimes could result in bad outputs. Now, if generating short sequences, it will understand that much better and also generate faster!
 

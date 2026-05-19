@@ -365,50 +365,29 @@ class StableAudioModel:
     @staticmethod
     def _build_conditioning_dicts(prompt, negative_prompt, duration, batch_size):
         """Returns (conditioning, negative_conditioning) lists of dicts."""
-        if isinstance(prompt, str):
-            conditioning = [{"prompt": prompt, "seconds_total": duration}] * batch_size
-        else:
-            assert len(prompt) == batch_size, (
-                "When passing a list of prompts, the length must match the batch size"
-            )
-            if isinstance(duration, (int, float)):
-                conditioning = [
-                    {"prompt": p, "seconds_total": duration} for p in prompt
-                ]
-            else:
-                assert len(prompt) == len(duration), (
-                    "When passing a list of prompts and durations, the length of durations must match the length of prompts"
+
+        def _to_list(value, name):
+            """Broadcast a scalar or validate a list to length batch_size."""
+            if isinstance(value, list):
+                assert len(value) == batch_size, (
+                    f"Length of {name} ({len(value)}) must match batch_size ({batch_size})"
                 )
-                conditioning = [
-                    {"prompt": p, "seconds_total": d} for p, d in zip(prompt, duration)
-                ]
+                return value
+            return [value] * batch_size
+
+        prompts = _to_list(prompt, "prompt")
+        durations = _to_list(duration, "duration")
+        conditioning = [
+            {"prompt": p, "seconds_total": d} for p, d in zip(prompts, durations)
+        ]
 
         negative_conditioning = None
         if negative_prompt:
-            if isinstance(negative_prompt, str):
-                if isinstance(duration, (int, float)):
-                    negative_conditioning = [
-                        {"prompt": negative_prompt, "seconds_total": duration}
-                    ] * batch_size
-                else:
-                    negative_conditioning = [
-                        {"prompt": negative_prompt, "seconds_total": d}
-                        for d in duration
-                    ]
-            else:
-                assert len(negative_prompt) == batch_size, (
-                    "When passing a list of negative prompts, the length must match the batch size"
-                )
-                if isinstance(duration, (int, float)):
-                    negative_conditioning = [
-                        {"prompt": p, "seconds_total": duration}
-                        for p in negative_prompt
-                    ]
-                else:
-                    negative_conditioning = [
-                        {"prompt": p, "seconds_total": d}
-                        for p, d in zip(negative_prompt, duration)
-                    ]
+            neg_prompts = _to_list(negative_prompt, "negative_prompt")
+            negative_conditioning = [
+                {"prompt": p, "seconds_total": d}
+                for p, d in zip(neg_prompts, durations)
+            ]
 
         return conditioning, negative_conditioning
 

@@ -26,7 +26,7 @@ REPO_NAME="stable-audio-3"
 BRANCH="main"
 SUBDIR_IN_REPO="optimized/mlx"
 LOCAL_DIR="sa3_mlx"
-DEFAULT_ARGS=(--prompt "Epic orchestral buildup" --dit sm-music --decoder same-s --seconds 10 --play)
+DEFAULT_ARGS=(--prompt "Epic orchestral buildup" --dit sm-music --decoder same-s --seconds 120 --play)
 
 TAR_URL="https://github.com/$REPO_OWNER/$REPO_NAME/archive/refs/heads/$BRANCH.tar.gz"
 TAR_INNER="$REPO_NAME-$BRANCH/$SUBDIR_IN_REPO"

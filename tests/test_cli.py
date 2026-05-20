@@ -20,7 +20,8 @@ import torch
 SAMPLE_RATE = 44100
 CHANNELS = 2
 FAKE_AUDIO_PATH = "some/audio.wav"
-_FAKE_LOAD_RESULT = (SAMPLE_RATE, torch.zeros(CHANNELS, SAMPLE_RATE * 5))
+_FAKE_WAVEFORM = torch.zeros(CHANNELS, SAMPLE_RATE * 5)
+_FAKE_LOAD_RESULT = (_FAKE_WAVEFORM, SAMPLE_RATE)
 
 
 def _fake_audio(batch: int = 1, duration: float = 5.0) -> torch.Tensor:
@@ -239,7 +240,9 @@ def test_audio_to_audio(mock_model):
         ]
     )
     kwargs = mock_model.generate.call_args.kwargs
-    assert kwargs["init_audio"] == _FAKE_LOAD_RESULT
+    sr, waveform = kwargs["init_audio"]
+    assert sr == SAMPLE_RATE
+    assert torch.equal(waveform, _FAKE_WAVEFORM)
     assert kwargs["init_noise_level"] == 0.7
     assert kwargs["inpaint_audio"] is None
 
@@ -268,7 +271,9 @@ def test_inpaint_single_region(mock_model):
         ]
     )
     kwargs = mock_model.generate.call_args.kwargs
-    assert kwargs["inpaint_audio"] == _FAKE_LOAD_RESULT
+    sr, waveform = kwargs["inpaint_audio"]
+    assert sr == SAMPLE_RATE
+    assert torch.equal(waveform, _FAKE_WAVEFORM)
     assert kwargs["init_audio"] is None
     assert kwargs["inpaint_mask_start_seconds"] == 2.0
     assert kwargs["inpaint_mask_end_seconds"] == 5.0
@@ -316,6 +321,16 @@ def test_inpaint_continuation(mock_model):
     assert kwargs["inpaint_mask_start_seconds"] == 5.0
     assert kwargs["inpaint_mask_end_seconds"] == 15.0
     assert kwargs["duration"] == 15.0
+
+
+def test_inpaint_region_without_audio_fails():
+    with pytest.raises(SystemExit):
+        _run(["-p", "test", "--inpaint-start", "2.0", "--inpaint-end", "5.0"])
+
+
+def test_inpaint_audio_without_region_fails():
+    with pytest.raises(SystemExit):
+        _run(["-p", "test", "--inpaint-audio", FAKE_AUDIO_PATH])
 
 
 def test_inpaint_start_without_end_fails():

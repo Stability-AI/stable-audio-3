@@ -182,6 +182,10 @@ def main():
         parser.error(
             "--inpaint-start and --inpaint-end must be specified the same number of times"
         )
+    if args.inpaint_starts and not args.inpaint_audio:
+        parser.error("--inpaint-start/--inpaint-end require --inpaint-audio")
+    if args.inpaint_audio and not args.inpaint_starts:
+        parser.error("--inpaint-audio requires --inpaint-start and --inpaint-end")
 
     # --- Build scalar / list args ---
     prompt = args.prompt[0] if len(args.prompt) == 1 else args.prompt
@@ -215,13 +219,16 @@ def main():
         model.set_lora_strength(args.lora_strength, lora_index=args.lora_index)
 
     # --- Load audio inputs ---
+    # torchaudio.load returns (waveform, sample_rate); model.generate expects (sample_rate, waveform)
     init_audio = None
     if args.init_audio:
-        init_audio = torchaudio.load(args.init_audio)
+        waveform, sr = torchaudio.load(args.init_audio)
+        init_audio = (sr, waveform)
 
     inpaint_audio = None
     if args.inpaint_audio:
-        inpaint_audio = torchaudio.load(args.inpaint_audio)
+        waveform, sr = torchaudio.load(args.inpaint_audio)
+        inpaint_audio = (sr, waveform)
 
     inpaint_start = None
     inpaint_end = None

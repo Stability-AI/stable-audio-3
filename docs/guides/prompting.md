@@ -1,6 +1,6 @@
 # Prompt Guide
 
-This guide provides tips and tricks for getting the most out of your prompts, and helps you break out of prompt "writer's block." Prompting is more of an art than a science, but there are some best practices we've discovered. This is just a starting point, be creative and go crazy (perhaps share in the [Discord](https://discord.gg/cKpvjey8b))!
+This guide provides tips and tricks for getting the most out of your prompts, and helps you break out of prompt "writer's block." Prompting is more of an art than a science, but there are some best practices we've discovered. This is just a starting point, be creative and go crazy (perhaps share in our [Harmonai Discord](https://discord.gg/cKpvjey8b))!
 
 ---
 

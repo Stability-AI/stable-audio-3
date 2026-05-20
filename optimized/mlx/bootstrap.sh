@@ -2,12 +2,12 @@
 #
 # sa3_mlx bootstrap — Stable Audio 3 inference on Apple Silicon in one command.
 #
-# Hosted at (once pushed):
+# Hosted at:
 #   https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/mlx/bootstrap.sh
 #
 # Usage:
-#   curl -LsSf <URL>/bootstrap.sh | bash
-#   curl -LsSf <URL>/bootstrap.sh | bash -s -- --prompt "ambient drone" --dit medium --decoder same-l
+#   curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/mlx/bootstrap.sh | bash
+#   curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/mlx/bootstrap.sh | bash -s -- --prompt "ambient drone" --dit medium --decoder same-l
 #
 # Default demo prompt is "Epic orchestral buildup".
 #
@@ -94,6 +94,6 @@ if [[ $# -gt 0 ]]; then
     exec ./sa3 "$@"
 else
     step "Running demo: ./sa3 ${DEFAULT_ARGS[*]}"
-    printf '  %s(pass your own args via:  curl <URL> | bash -s -- --prompt "..." ...)%s\n' "$DIM" "$RESET"
+    printf '  %s(pass your own args via:  curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/mlx/bootstrap.sh | bash -s -- --prompt "..." ...)%s\n' "$DIM" "$RESET"
     exec ./sa3 "${DEFAULT_ARGS[@]}"
 fi

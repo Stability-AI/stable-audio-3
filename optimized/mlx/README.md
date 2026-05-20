@@ -212,3 +212,7 @@ only one set of small-codec npz files is shipped.
 
 Model weights derived from Stability AI's Stable Audio 3 checkpoints.
 T5Gemma text encoder from Google.
+
+Use of the Stable Audio 3 weights is governed by the **Stability AI
+Community License**. Please refer to the full terms at
+<https://stability.ai/license>.

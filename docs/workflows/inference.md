@@ -218,10 +218,6 @@ model.set_lora_strength(0.0)              # Disable without unloading
 # With multiple LoRAs, target by index:
 model.set_lora_strength(1.0, lora_index=0)
 model.set_lora_strength(0.3, lora_index=1)
-
-# Target only the Diffusion Transformer backbone or conditioner independently:
-model.set_lora_strength(1.0, target="dit")
-model.set_lora_strength(0.0, target="conditioner")
 ```
 
 For full details on LoRA training see [LoRA Training](lora.md).

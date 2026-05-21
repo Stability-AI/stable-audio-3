@@ -319,11 +319,11 @@ class DiffusionTransformer(nn.Module):
                           If provided, only valid positions contribute to the projection.
         """
         dtype = v0.dtype
-        v0, v1 = v0.double(), v1.double()
+        v0, v1 = v0.float(), v1.float()
 
         if padding_mask is not None:
             # Expand mask to match tensor shape: (B, T) -> (B, 1, T)
-            mask = padding_mask.unsqueeze(1).double()
+            mask = padding_mask.unsqueeze(1).float()
             # Zero out padding positions for projection computation
             v0_masked = v0 * mask
             v1_masked = v1 * mask

@@ -66,4 +66,5 @@ exclude = [
     "stable_audio_3/interface",
     "stable_audio_3/data",
     "stable_audio_3/training",
+    "optimized",
 ]

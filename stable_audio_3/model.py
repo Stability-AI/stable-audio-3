@@ -28,7 +28,7 @@ class StableAudioModel:
         torch.backends.cudnn.benchmark = False
 
     @staticmethod
-    def from_pretrained(model_name_or_path, device=None, model_half=True):
+    def from_pretrained(model_name, device=None, model_half=True):
         # Load the model and any necessary components here
         if device is None and torch.cuda.is_available():
             device = "cuda"
@@ -38,18 +38,18 @@ class StableAudioModel:
             device = "cpu"
 
         if not torch.cuda.is_available():
-            if model_name_or_path in ("medium", "medium-base"):
+            if model_name in ("medium", "medium-base"):
                 print(
-                    f"Warning: You are loading the {model_name_or_path} model without a GPU. This model is not designed to run on cpu"
+                    f"Warning: You are loading the {model_name} model without a GPU. This model is not designed to run on cpu"
                 )
             model_half = False
 
-        if model_name_or_path not in all_models:
+        if model_name not in all_models:
             raise ValueError(
-                f"Unknown model '{model_name_or_path}'. Valid models: {list(all_models)}"
+                f"Unknown model '{model_name}'. Valid models: {list(all_models)}"
             )
 
-        model_cfg = all_models[model_name_or_path]
+        model_cfg = all_models[model_name]
         local_config, local_ckpt = model_cfg.resolve()
         with open(local_config) as f:
             model_config = json.load(f)

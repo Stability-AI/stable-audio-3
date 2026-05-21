@@ -126,6 +126,12 @@ This starts a local web interface with a shareable link. To load a LoRA checkpoi
 uv run python run_gradio.py --model medium --lora-ckpt-path path/to/lora.ckpt
 ```
 
+For a minimal WebUI that maps closely to the `stable-audio` CLI flags, run:
+
+```bash
+uv run python run_basic_webui.py --model medium
+```
+
 ## Usage
 
 Stable Audio 3 supports several inference modes. For full details, see [Inference Methods](docs/workflows/inference.md).

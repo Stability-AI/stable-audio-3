@@ -434,11 +434,11 @@ def main():
                          "script doesn't). Default: on.")
 
     # ── Output ────────────────────────────────────────────────────────────────
-    ap.add_argument("--out", default="out.wav",
+    ap.add_argument("--out", default=None,
                     help="Output WAV path. Relative paths land in the project's output/ "
                          "directory (auto-created); absolute paths are used as-is. "
                          "Always written as 16-bit PCM stereo at 44.1 kHz, trimmed to "
-                         "exactly --seconds.")
+                         "exactly --seconds. If omitted, auto-named from the prompt and seed.")
     ap.add_argument("--play", action="store_true",
                     help="After writing the WAV, play it through the default output device "
                          "via the macOS `afplay` binary. Blocking — the script exits when "
@@ -448,17 +448,20 @@ def main():
     if args.steps < 1:
         ap.error(f"--steps must be ≥ 1 (got {args.steps})")
 
-    # Relative --out paths land in the project's output/ folder; absolute paths
-    # are honoured as-is so users can still write anywhere on disk.
+    args = prompt_user_if_missing(args)
+    if args.prompt is None:
+        args.prompt = input("Prompt: ").strip()
+
+    # Resolve output path — auto-name from prompt+seed when --out is not given.
+    if args.out is None:
+        import re as _re
+        slug = _re.sub(r'[^a-z0-9]+', '_', args.prompt.lower()).strip('_')[:48]
+        args.out = f"{slug}_{args.seed}.wav" if slug else f"out_{args.seed}.wav"
     out_path = Path(args.out)
     if not out_path.is_absolute():
         out_path = REPO / "output" / out_path
     out_path.parent.mkdir(parents=True, exist_ok=True)
     args.out = str(out_path)
-
-    args = prompt_user_if_missing(args)
-    if args.prompt is None:
-        args.prompt = input("Prompt: ").strip()
     # Empty prompt is allowed — T5Gemma will produce padding-only embeddings,
     # which (with the learned padding_embedding) is the unconditional case.
     dtype = mx.float32 if args.dit_dtype == "fp32" else mx.float16

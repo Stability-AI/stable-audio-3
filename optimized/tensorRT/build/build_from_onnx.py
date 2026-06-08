@@ -173,6 +173,25 @@ TARGETS = {
         "profile":      _DIT_PROFILE,
         "plugin":       False,
     },
+    # ── FP8 variant (DiT-only) ───────────────────────────────────────────
+    # Pre-processed FP8-trunk ONNX (ModelOpt PTQ + FP32 islands + per-channel
+    # weights; producer: build_dit_fp8.py). STRONGLY_TYPED compile: the Q/DQ
+    # nodes and per-tensor dtypes carry the precision. ~1.8x faster steps than
+    # FP16-mixed; a different but comparable sample under the pingpong sampler.
+    "sa3-m-fp8": {
+        # External-data sidecar travels alongside (smaller than fp16mixed's
+        # 2.9 GB — the quantised GEMM weights are 1-byte e4m3).
+        "onnx_hf":      ["sa3-m/dit_fp8.onnx", "sa3-m/dit_fp8.onnx.data"],
+        "trt_local":    "sa3-m/dit_fp8.trt",
+        "flags":        set(),
+        "network":      "STRONGLY_TYPED",
+        "workspace_gb": 16,
+        "profile":      _DIT_PROFILE,
+        "plugin":       False,
+        # Opt-in: built only by explicit name, never via 'all' / 'all-both'.
+        # The published dit_fp8.onnx is the gate — see README ("Not yet on HF").
+        "opt_in":       True,
+    },
     # SAME-L FP32 decoder: the canonical ONNX is FP16-mixed; we upcast every
     # FP16 initializer/Constant/Cast to FP32 in-process before building. The
     # Triton SWA plugin already runs FP32 internally, so its contract is
@@ -336,7 +355,9 @@ def build_one(name: str) -> str:
 
 
 def main():
-    canonical = [k for k in TARGETS if not k.endswith("-fp32")]
+    opt_in    = [k for k in TARGETS if TARGETS[k].get("opt_in")]
+    canonical = [k for k in TARGETS
+                 if not k.endswith("-fp32") and not TARGETS[k].get("opt_in")]
     fp32      = [k for k in TARGETS if k.endswith("-fp32")]
 
     if len(sys.argv) < 2:
@@ -347,6 +368,10 @@ def main():
         print("\nFP32 variants (~2x slower, ~2x engine size, opt-in):")
         for k in fp32:
             print(f"  {k}")
+        if opt_in:
+            print("\nOpt-in variants (built only by explicit name, not in any group):")
+            for k in opt_in:
+                print(f"  {k}")
         print("\nGroups:")
         print("  all       — every canonical target (default for shipping)")
         print("  all-fp32  — every FP32 target")

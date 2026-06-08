@@ -146,27 +146,43 @@ ENCODER_PATHS = {
 #
 # The canonical engines are FP16-mixed (FP16 trunk + FP32 islands around
 # RMSNorm / Softmax / RoPE). Pure-FP32 variants are also published — same
-# numerical behavior as PyTorch eager FP32. Use `--precision fp32` on the
-# CLI to pick them; default is `fp16mixed`.
+# numerical behavior as PyTorch eager FP32. `fp8` is a DiT-only ModelOpt-PTQ
+# variant (~1.8x faster steps than fp16mixed; built by build/build_dit_fp8.py);
+# under the stochastic pingpong sampler it gives a different but comparable
+# sample. There is no fp8 decoder, so `--precision fp8` pairs the fp8 DiT with
+# the fp16mixed decoder. Default is `fp16mixed`.
 #
 # The lookup tables below resolve the engine filename per (dit/decoder,
 # precision). Encoders are FP16-mixed only.
 DIT_ENGINE_FILENAME = {
     "fp16mixed": "dit_fp16mixed.trt",
     "fp32":      "dit_fp32.trt",
+    "fp8":       "dit_fp8.trt",
 }
 _DIT_SUBDIR = {"sm-music": "sa3-sm-music", "sm-sfx": "sa3-sm-sfx", "medium": "sa3-m"}
 DECODER_ENGINE_FILENAME = {
     "same-l": {
         "fp16mixed": "dec_dynamic_triton_swa.trt",
         "fp32":      "dec_dynamic_fp32.trt",
+        "fp8":       "dec_dynamic_triton_swa.trt",  # no fp8 decoder: use fp16mixed
     },
     "same-s": {
         "fp16mixed": "dec_dynamic_bf16.trt",
         "fp32":      "dec_dynamic_fp32.trt",
+        "fp8":       "dec_dynamic_bf16.trt",         # no fp8 decoder: use fp16mixed
     },
 }
-PRECISIONS = ("fp16mixed", "fp32")
+PRECISIONS = ("fp16mixed", "fp32", "fp8")
+# fp8 is only built/published for the medium DiT (sa3-m); the small models
+# have no dit_fp8.trt, so guard before a request 404s on a nonexistent file.
+_FP8_DITS = ("medium",)
+
+
+def _check_precision(dit_name: str, precision: str) -> None:
+    if precision == "fp8" and dit_name not in _FP8_DITS:
+        raise ValueError(
+            f"precision 'fp8' is only available for dit in {list(_FP8_DITS)} "
+            f"(sa3-m); got dit={dit_name!r}. Use 'fp16mixed' or 'fp32'.")
 
 
 def get_dit_engine_path(dit_name: str, precision: str = "fp16mixed") -> Path:
@@ -174,6 +190,7 @@ def get_dit_engine_path(dit_name: str, precision: str = "fp16mixed") -> Path:
         raise ValueError(f"unknown dit={dit_name!r}; valid: {list(_DIT_SUBDIR)}")
     if precision not in DIT_ENGINE_FILENAME:
         raise ValueError(f"unknown precision={precision!r}; valid: {PRECISIONS}")
+    _check_precision(dit_name, precision)
     return ARCH_DIR / _DIT_SUBDIR[dit_name] / DIT_ENGINE_FILENAME[precision]
 
 
@@ -189,6 +206,7 @@ def get_engine_files(dit_name: str, decoder_name: str, precision: str = "fp16mix
                        with_encoder: bool = False) -> list[str]:
     """Relative paths (under ARCH_DIR) needed for the chosen pipeline. Pass this
     list to _ensure_files() to auto-download anything missing from HF."""
+    _check_precision(dit_name, precision)
     files = list(SHARED_FILES)
     files.append(f"{_DIT_SUBDIR[dit_name]}/{DIT_ENGINE_FILENAME[precision]}")
     files.append(f"{decoder_name}/{DECODER_ENGINE_FILENAME[decoder_name][precision]}")

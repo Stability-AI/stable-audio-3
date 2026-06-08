@@ -93,6 +93,13 @@ TARGETS = [
     {"label": "[opt-in] DiT sm-sfx FP32",
      "command": _from_onnx("sa3-sm-sfx-fp32"),
      "outputs": ["sa3-sm-sfx/dit_fp32.trt"]},
+    # FP8 variant, opt-in, DiT-only. ~1.8x faster steps than FP16-mixed
+    # (ModelOpt PTQ; producer build_dit_fp8.py). A different but comparable
+    # sample under the stochastic pingpong sampler.
+    {"label": "[opt-in] DiT medium FP8 (~1.8x)",
+     "command": _from_onnx("sa3-m-fp8"),
+     "outputs": ["sa3-m/dit_fp8.trt"],
+     "opt_in": True},  # built only by number, never via "Build all missing"
 ]
 
 
@@ -134,12 +141,19 @@ def render_menu(arch: str, arch_dir: Path) -> list[bool]:
             size_s = fmt_size(sz) if sz >= 0 else f"{DIM}(missing){RESET}"
             print(f"        {tick}  {DIM}{rel}{RESET}  {size_s}")
 
-    n_missing = built_flags.count(False)
+    # "Build all missing" covers default targets only; opt-in variants (FP8)
+    # are built by number, so they are counted and reported separately.
+    n_missing = sum(1 for t, ok in zip(TARGETS, built_flags)
+                    if not ok and not t.get("opt_in"))
+    n_optin_missing = sum(1 for t, ok in zip(TARGETS, built_flags)
+                          if not ok and t.get("opt_in"))
     print()
     if n_missing == 0:
-        print(f"  {BOLD}{GREEN}[A]{RESET} Build all missing  {DIM}(nothing missing — all engines built){RESET}")
+        print(f"  {BOLD}{GREEN}[A]{RESET} Build all missing  {DIM}(nothing missing — all default engines built){RESET}")
     else:
         print(f"  {BOLD}{YELLOW}[A]{RESET} Build all missing  {DIM}({n_missing} target(s)){RESET}")
+    if n_optin_missing:
+        print(f"      {DIM}(+{n_optin_missing} opt-in target(s) not in [A] — build by number){RESET}")
     print(f"  {BOLD}{DIM}[Q]{RESET} Quit")
     return built_flags
 
@@ -180,7 +194,9 @@ def main() -> int:
             return 0
 
         if choice in ("a", "all"):
-            missing = [t for t, ok in zip(TARGETS, built_flags) if not ok]
+            # Opt-in variants (FP8) are excluded; build them by number.
+            missing = [t for t, ok in zip(TARGETS, built_flags)
+                       if not ok and not t.get("opt_in")]
             if not missing:
                 print(f"  {DIM}Nothing to build.{RESET}")
                 continue

@@ -404,9 +404,11 @@ class SA3Inference:
         Args:
             dit:            one of DIT_CHOICES — "sm-music" / "sm-sfx" / "medium"
             decoder:        one of DECODER_PATHS — "same-s" / "same-l"
-            precision:      "fp16mixed" (default, fastest) or "fp32" (bit-equiv
-                            PyTorch eager, ~2× slower). Engines auto-download
-                            from HF if the requested precision file is missing.
+            precision:      "fp16mixed" (default, fastest), "fp32" (bit-equiv
+                            PyTorch eager, ~2× slower), or "fp8" (medium DiT
+                            only, ModelOpt PTQ, ~1.8× faster steps; pairs with
+                            the fp16mixed decoder). Engines auto-download from
+                            HF if the requested precision file is missing.
             default_T_lat:  latent length to build the initial graph at
             default_steps:  pingpong steps for the initial graph
             default_seconds: duration condition for the initial graph (used for
@@ -634,8 +636,9 @@ def main():
     ap.add_argument("--dit", choices=list(DIT_CHOICES.keys()), default=None)
     ap.add_argument("--decoder", choices=list(DECODER_PATHS.keys()), default=None)
     ap.add_argument("--precision", choices=list(canon.PRECISIONS), default="fp16mixed",
-                    help="Engine precision: 'fp16mixed' (default, fast) or 'fp32' "
-                         "(bit-equiv PyTorch eager, slower). Auto-downloads from HF.")
+                    help="Engine precision: 'fp16mixed' (default, fast), 'fp32' "
+                         "(bit-equiv PyTorch eager, slower), or 'fp8' (DiT-only "
+                         "ModelOpt PTQ, ~1.8x faster steps). Auto-downloads from HF.")
     ap.add_argument("--models-dir", default=str(canon.MODELS_DIR))
     ap.add_argument("--seconds", type=float, default=30.0)
     ap.add_argument("--steps", type=int, default=8)

@@ -12,6 +12,11 @@ onnx/
 *.onnx
 *.onnx.data
 
+# FP8 calibration data — captured by build/make_calib.py from the model
+# checkpoint, a reproducible producer artifact (~hundreds of MB). Regenerated
+# on demand, never committed.
+*.calib.npz
+
 # T5 tokenizer — generally ignored (downloaded under models/<arch>/t5gemma/
 # alongside the engine for legacy fallback), but the canonical copy ships
 # bundled at scripts/tokenizer.json (arch-agnostic, 34 MB) so the build path
@@ -36,3 +41,7 @@ __pycache__/
 # But keep __pycache__/ ignored even under build/ (the un-ignore above would
 # accidentally re-include build/__pycache__/ otherwise).
 build/**/__pycache__/
+# Same for make_calib.py's captured calibration npz (the *.calib.npz rule
+# above is otherwise shadowed by the build/ un-ignore — make_calib writes it
+# next to the build scripts by default).
+build/**/*.calib.npz

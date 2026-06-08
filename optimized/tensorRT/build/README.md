@@ -69,6 +69,10 @@ python build_from_onnx.py same-s-decoder-fp32   # canonical ONNX is already FP32
 python build_from_onnx.py sa3-m-fp32            # reads HF dit.onnx (already FP32)
 python build_from_onnx.py all-fp32              # every FP32 target
 python build_from_onnx.py all-both              # canonical + FP32
+
+# FP8 variant — opt-in, DiT-only. ~1.8x faster steps than FP16-mixed.
+# Pair with `sa3_trt --precision fp8` at inference (fp8 DiT + fp16mixed decoder).
+python build_from_onnx.py sa3-m-fp8             # reads HF dit_fp8.onnx (ModelOpt PTQ)
 ```
 
 ### Consumer deps
@@ -148,6 +152,33 @@ This wraps every RMSNorm chain, attention `Softmax`, and the RoPE region in `Cas
 
 Naive `BuilderFlag.FP16` (without the surgery) catastrophically overflows in RMSNorm variance + attention softmax — the islands are mandatory. BF16 was tried earlier and compounds quantisation error over 8 sampling steps (cos-sim drifts from 0.99 single-step to 0.81 final-latent vs PT FP32) — audibly degraded.
 
+### FP8 DiT (opt-in, ~1.8x)
+
+`build_dit_fp8.py` extends the FP16-mixed recipe with a ModelOpt FP8 GEMM trunk: it takes the `dit_fp16mixed.onnx` plus a calibration `.npz` (real DiT inputs across the pingpong schedule) and produces `dit_fp8.onnx`: fp8 weight/activation Q/DQ on the MatMuls, the same FP32 islands re-applied (plus the conditioning front-end, which must stay FP32 or the t>=0.984 timestep features flush), and per-channel weight scales. Validated on sa3-m vs the FP16-mixed engine: worst single-step velocity cosine 0.978 (latent cosine 0.998), 8-step compounded final-latent cosine ~0.96 to 0.976 (prompt-dependent), ~11.2 ms/step (vs ~19.9), ~1.8x. Under the stochastic pingpong sampler it yields a different but comparable sample.
+
+First capture the calibration data from the model checkpoint with `make_calib.py` (drives the model's own pingpong `generate()` to record real DiT inputs across the sampling schedule; prompts come from the repo's own `interface/reprompt.py` Music examples, the deployment-matched reprompt format):
+
+```bash
+python make_calib.py \
+  --model-config <MODELS_ROOT>/SA3-M-hf/model_config.json \
+  --checkpoint   <MODELS_ROOT>/SA3-M-hf/model.safetensors \
+  --out          sa3-m.calib.npz
+```
+
+Then build the engine:
+
+```bash
+python build_dit_fp8.py \
+  --input  $HF/onnx/sa3-m/dit_fp16mixed.onnx \
+  --calib  sa3-m.calib.npz \
+  --onnx   $HF/onnx/sa3-m/dit_fp8.onnx \
+  --engine ../models/$ARCH/sa3-m/dit_fp8.trt
+```
+
+`make_calib.py` needs only the repo + checkpoint (`torch`, `numpy`, `stable_audio_3`). `build_dit_fp8.py` additionally requires `nvidia-modelopt` + `onnxruntime-gpu` (the calibration-repair pass); consumers compile the published `dit_fp8.onnx` with plain `build_from_onnx.py sa3-m-fp8` (STRONGLY_TYPED, no ModelOpt, no calibration).
+
+> **Not yet on HF.** `dit_fp8.onnx` + `dit_fp8.onnx.data` are not in the model repo yet, so `build_from_onnx.py sa3-m-fp8` and `sa3_trt --precision fp8` 404 until a producer run uploads them (under exactly those filenames). The consumer recipe and `--precision fp8` plumbing land here so the wiring is reviewed; the artifact upload is the follow-up step.
+
 Each script also writes the ONNX to `<HF_REPO>/onnx/<engine>/<file>.onnx`. After all 8 are done:
 
 ```bash
@@ -166,6 +197,8 @@ git push
 | `build_from_onnx.py` | One target → download ONNX from HF + compile to TRT. **For the SA3 DiTs, pulls `dit_fp16mixed.onnx` (the pre-processed island-wrapped graph)** so the consumer just needs to invoke `STRONGLY_TYPED` compilation — no `onnx-graphsurgeon` required | consumer |
 | `build_dit_profile.py` | Build a DiT with custom `(min, opt, max)` profile shapes (experimental — short-form / fixed-shape variants). Operates on either ONNX flavor. | consumer |
 | `build_dit_fp16mixed.py` | **Producer-side** ONNX surgery: takes the canonical FP32 `dit.onnx`, finds RMSNorm chains + attention `Softmax` + RoPE region, wraps each in `Cast(FP32) ↔ Cast(FP16)` islands, converts non-island weights to FP16, and writes both the modified `dit_fp16mixed.onnx` AND the TRT engine. Only re-run when the model retrains or the island recipe changes. Requires `onnx` + `onnx-graphsurgeon`. | producer |
+| `make_calib.py` | **Producer-side** FP8 calibration capture: drives the model's own pingpong `generate()` and records the six DiT engine inputs across the schedule into a `*.calib.npz` for `build_dit_fp8.py`. Needs only the checkpoint (`torch` + `stable_audio_3`). | producer |
+| `build_dit_fp8.py` | **Producer-side** FP8 trunk on top of `dit_fp16mixed.onnx`: ModelOpt FP8 PTQ (MatMul/Gemm, max calibration from a `.npz`), restores ModelOpt-corrupted initializers + recalibrates activation scales, re-applies the FP32 islands (incl. the conditioning front-end), and per-channel weight scales. Writes `dit_fp8.onnx` + the TRT engine. ~1.8x faster steps than FP16-mixed. Requires `nvidia-modelopt` + `onnxruntime-gpu`. | producer |
 | `build_t5gemma.py` | Trace + export T5Gemma encoder ONNX + build TRT | producer |
 | `build_same_s_decoder.py` | Trace + export SAME-S decoder ONNX + build TRT | producer |
 | `build_same_s_encoder.py` | Trace + export SAME-S encoder ONNX + build TRT | producer |

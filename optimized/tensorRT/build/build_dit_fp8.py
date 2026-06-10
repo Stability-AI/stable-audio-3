@@ -11,10 +11,11 @@ with ``build_from_onnx.py`` (plain STRONGLY_TYPED, no graphsurgeon / ModelOpt).
 Background — why this is more than ``mtq.quantize(...)``:
 - The DiT's per-step velocity error compounds over the 8 pingpong steps. BF16
   fails (final-latent cos ~0.81); naive FP8 PTQ lands ~0.91. The decisive
-  fixes, in order, take it to ~0.96 to 0.976 compounded (final-latent, prompt-
-  dependent) and 0.978 worst single-step velocity cosine vs the FP16-mixed
-  engine; under the stochastic pingpong sampler the result is a different but
-  comparable sample, judged by ear:
+  fixes, in order, take it to 0.9982 worst single-step latent cosine (n=376)
+  and a compounded euler final-latent cosine of mean 0.953 / worst 0.873 over
+  the 47 reprompt prompts vs the FP16-mixed engine; under the stochastic
+  pingpong sampler the result is a different but comparable sample, judged by
+  ear:
     1. ModelOpt rejects the canonical ONNX because upstream's island surgery
        leaves it un-toposorted, and its opset bump leaves ReduceMean's pre-18
        attribute-form axes. We Kahn-sort + version_convert to opset 19 first.
@@ -47,15 +48,20 @@ leading-axis batch of samples.
 
 Inputs/outputs stay FP32 so the runtime can swap engines transparently.
 
-Validated (sa3-m, vs the FP16-mixed engine; measured at L=646, but the recipe is
-shape-independent: activation scales are per-tensor and the default profile below
-is dynamic, so the numbers carry over):
-  - Worst single-step velocity cosine: 0.978
-  - Worst single-step latent cosine (x + dt*v): 0.998
-  - 8-step compounded euler final-latent cosine: ~0.96 to 0.976 (single-prompt
-    and prompt-dependent; the FP16-mixed engine itself scores only ~0.998 vs PT
-    eager, so this is a guide, not a gate, and final judgement is by ear)
-  - Step time (B=1, L=646): ~11.2 ms (FP16-mixed: ~19.9 ms) -> ~1.8x
+Validated (sa3-m, vs the FP16-mixed engine, over the 47 reprompt Music prompts
+x 8 sigmas at L=646; the recipe is shape-independent: activation scales are
+per-tensor and the default profile below is dynamic, so the numbers carry over):
+  - Worst single-step latent cosine (x + dt*v, n=376): 0.9982 (mean 0.9997)
+  - 8-step compounded euler final-latent cosine, distribution over the 47
+    prompts: mean 0.953, median 0.957, p5 0.915, worst 0.873. The compounded
+    rollout is chaotic at the early sigmas (an eps=1e-3 input perturbation
+    alone compounds to ~0.967) and the FP16-mixed engine itself scores only
+    ~0.998 vs PT eager, so this is a guide, not a gate; the shipped gate is
+    decoded audio under the production pingpong sampler, judged by ear
+    (RMS-curve correlation ~0.90 vs the FP16-mixed engine's generation).
+  - Step time (B=1, L=646): ~10.6-11.0 ms (FP16-mixed: ~18.7-19.4 ms) -> ~1.8x.
+    TRT tactic selection is nondeterministic per build; if a fresh engine
+    benches noticeably slower, rebuild it.
   - A true batched forward amortizes (~1.4x at B=4) once compute drops, unlike
     FP16-mixed (<=1.09x): fp8 frees the SM throughput the FP16 engine saturated.
 

@@ -161,6 +161,58 @@ Sample run on **M4 Pro / 48 GB**:
 └───────────┴─────────┴─────────┴───────────┴───────────┴────────────┘
 ```
 
+## LoRA training primitives
+
+The optimized runtime includes MLX counterparts to the adapter family already
+supported by the official PyTorch implementation: standard LoRA, DoRA, BoRA,
+and LoRA-XS variants.
+
+```python
+from models.defs.lora import (
+    apply_lora_checkpoint,
+    inject_trainable_lora,
+    save_lora_checkpoint,
+)
+from models.defs.training import (
+    rectified_flow_loss,
+    sample_training_timesteps,
+    shift_training_timesteps,
+)
+from models.defs.audio_encoding import encode_audio
+```
+
+`inject_trainable_lora()` freezes the base model and leaves only adapter
+parameters trainable through `mlx.nn.value_and_grad`. `save_lora_checkpoint()`
+writes the same safetensors keys and `lora_config` metadata used by the
+PyTorch trainer. `apply_lora_checkpoint()` loads that format through MLX
+without adding PyTorch or safetensors as runtime dependencies. Application
+materializes a fixed strength into the loaded model's in-memory weights; it
+does not modify the base checkpoint on disk. Reload the base model before
+applying a different strength rather than applying repeatedly to the same
+instance.
+
+`encode_audio()` provides the waveform-to-latent bridge used by training. It
+accepts a batch of already-decoded 44.1 kHz stereo waveforms, applies SAME's
+patched pretransform, pads to the encoder's required alignment, optionally
+encodes long clips in overlapping chunks, and returns both latents and a
+ceiling-scaled padding mask:
+
+```python
+encoded = encode_audio(
+    same_l_encoder,
+    audio,  # [batch, 2, samples]
+    valid_sample_lengths=[samples_a, samples_b],
+    pad_modulo=16,  # 32 for SAME-S
+    chunked=True,
+)
+latents = encoded.latents
+loss_mask = encoded.padding_mask
+```
+
+These are model-level primitives rather than a dataset or training CLI.
+Callers remain responsible for file decoding and resampling, dataset
+discovery and persistence, conditioning, optimization, and checkpoint cadence.
+
 ## Flag reference
 
 | Flag                  | Default  | Notes                                                                 |

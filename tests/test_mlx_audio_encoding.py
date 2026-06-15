@@ -74,33 +74,34 @@ def test_encode_audio_pads_to_codec_alignment_and_builds_mask():
     )
 
 
-def test_chunked_encoding_matches_unchunked_encoding():
+def test_chunked_encoding_matches_unchunked_for_even_and_odd_overlaps():
     rng = np.random.default_rng(21)
     audio = mx.array(
-        rng.standard_normal((2, 2, SAMPLES_PER_LATENT * 10)).astype(np.float32)
+        rng.standard_normal((2, 2, SAMPLES_PER_LATENT * 11)).astype(np.float32)
     )
     encoder = GroupingEncoder()
 
     unchunked = encode_audio(encoder, audio, pad_modulo=16)
-    chunked = encode_audio(
-        encoder,
-        audio,
-        pad_modulo=16,
-        chunked=True,
-        chunk_size=4,
-        overlap=2,
-        chunk_batch_size=2,
-    )
+    for overlap in (2, 1):
+        chunked = encode_audio(
+            encoder,
+            audio,
+            pad_modulo=16,
+            chunked=True,
+            chunk_size=4,
+            overlap=overlap,
+            chunk_batch_size=2,
+        )
 
-    np.testing.assert_allclose(
-        np.asarray(chunked.latents),
-        np.asarray(unchunked.latents),
-        atol=1e-6,
-    )
-    np.testing.assert_array_equal(
-        np.asarray(chunked.padding_mask),
-        np.asarray(unchunked.padding_mask),
-    )
+        np.testing.assert_allclose(
+            np.asarray(chunked.latents),
+            np.asarray(unchunked.latents),
+            atol=1e-6,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(chunked.padding_mask),
+            np.asarray(unchunked.padding_mask),
+        )
 
 
 @pytest.mark.parametrize(

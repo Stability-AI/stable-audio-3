@@ -238,6 +238,8 @@ def _stitch_encoded_chunks(
     chunk_size: int,
     overlap: int,
 ):
+    # Floor division intentionally gives the later chunk the extra latent when
+    # an overlap is odd. The interval clipping below prevents gaps or duplicates.
     half_overlap = overlap // 2
     intervals = []
     last_index = len(chunk_starts) - 1

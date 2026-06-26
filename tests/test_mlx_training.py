@@ -67,3 +67,24 @@ def test_rectified_flow_loss_uses_velocity_target_and_mask():
             loss_mask=mask,
         )
     ) == pytest.approx(9.0)
+
+
+def test_rectified_flow_loss_averages_masked_loss_per_sample():
+    clean = mx.zeros((2, 1, 3), dtype=mx.float32)
+    noise = mx.array([[[1.0, 1.0, 1.0]], [[3.0, 3.0, 3.0]]], dtype=mx.float32)
+    timesteps = mx.array([0.25, 0.25], dtype=mx.float32)
+    mask = mx.array([[True, False, False], [True, True, True]])
+
+    def zero_model(noised, timestep):
+        del noised, timestep
+        return mx.zeros_like(clean)
+
+    loss = rectified_flow_loss(
+        zero_model,
+        clean,
+        timesteps,
+        noise=noise,
+        loss_mask=mask,
+    )
+
+    assert float(loss) == pytest.approx(5.0)

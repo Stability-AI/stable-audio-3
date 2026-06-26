@@ -124,8 +124,12 @@ def rectified_flow_loss(
     if loss_mask is None:
         return mx.mean(mse)
     mask = loss_mask[:, None, :].astype(mx.float32)
-    denominator = mx.maximum(mx.sum(mask) * mse.shape[1], 1.0)
-    return mx.sum(mse * mask) / denominator
+    per_sample_denominator = mx.maximum(
+        mx.sum(mask, axis=(1, 2)) * mse.shape[1],
+        1.0,
+    )
+    per_sample_loss = mx.sum(mse * mask, axis=(1, 2)) / per_sample_denominator
+    return mx.mean(per_sample_loss)
 
 
 def _shift_timestep(

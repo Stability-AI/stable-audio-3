@@ -12,6 +12,7 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten
 
+from optimized.mlx.models.defs import dit_mlx, dit_mlx_medium
 from optimized.mlx.models.defs.lora import (
     apply_lora_checkpoint,
     apply_lora_checkpoints,
@@ -79,6 +80,44 @@ def test_trainable_dora_supports_bias_free_mlx_layers(model, inputs):
     mx.eval(output)
 
     assert bool(mx.all(mx.isfinite(output)))
+
+
+@pytest.mark.parametrize(
+    ("model_factory", "minimum_layer_count"),
+    [
+        (dit_mlx.DiT, 190),
+        (dit_mlx_medium.DiT, 220),
+    ],
+)
+def test_trainable_lora_targets_optimized_small_and_medium_dits(
+    model_factory,
+    minimum_layer_count: int,
+):
+    model = model_factory(T_lat=8)
+    target_names = [
+        name
+        for name, layer in model.named_modules()
+        if isinstance(layer, (nn.Linear, nn.Conv1d))
+    ]
+    include = [
+        "transformer.project_in",
+        "preprocess_conv",
+        "transformer.layers.0.to_local_embed.seq.0",
+    ]
+
+    assert len(target_names) >= minimum_layer_count
+    assert all(name in target_names for name in include)
+
+    report = inject_trainable_lora(
+        model,
+        rank=1,
+        alpha=1,
+        adapter_type="lora",
+        include=include,
+    )
+
+    assert set(report.layer_names) == set(include)
+    assert report.adapter_type == "lora"
 
 
 class TinyTorchLinear(torch.nn.Module):

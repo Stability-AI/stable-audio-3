@@ -405,11 +405,16 @@ def convert_weights(safetensors_path, out_path=None):
     return out
 
 
-def load_dit(weights_path, T_lat=320, dtype=mx.float16, compile_=False):
+def load_dit(weights_path, T_lat=320, dtype=mx.float16, compile_=False,
+             lora_paths=None, lora_strength=1.0, lora_log=print):
     """Build MLX DiT and load weights.
 
     weights_path: either the .safetensors (we'll convert in-memory) or a
                   pre-converted .safetensors-mlx file.
+
+    lora_paths: optional list of LoRA adapters (.safetensors / PEFT dir) to merge
+      into the weights at load time. lora_strength scales every adapter's delta.
+      See models/defs/lora_merge.py.
     """
     weights_path = str(weights_path)
     if weights_path.endswith(".safetensors") and ("medium-ARC" in weights_path):
@@ -417,6 +422,11 @@ def load_dit(weights_path, T_lat=320, dtype=mx.float16, compile_=False):
         wd = convert_weights(weights_path, out_path=None)
     else:
         wd = dict(mx.load(weights_path))
+
+    if lora_paths:
+        from .lora_merge import merge_loras_into_weights
+        stats = merge_loras_into_weights(wd, lora_paths, strength=lora_strength, log=lora_log)
+        lora_log(f"lora: merged {stats['merged']} layer(s) from {stats['adapters']} adapter(s)")
 
     model = DiT(T_lat=T_lat)
 

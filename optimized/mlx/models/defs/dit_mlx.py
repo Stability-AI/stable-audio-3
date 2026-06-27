@@ -304,18 +304,28 @@ def convert_weights_from_torch_ckpt(ckpt_path):
     return out
 
 
-def load_dit(weights_path, T_lat=320, dtype=mx.float16, compile_=False):
+def load_dit(weights_path, T_lat=320, dtype=mx.float16, compile_=False,
+             lora_paths=None, lora_strength=1.0, lora_log=print):
     """Build MLX DiT and load weights.
 
     weights_path can be either:
       - the sa3-sm-music torch ckpt (slow; converts at load time), OR
       - a pre-converted MLX file (.npz or .safetensors — fast path).
+
+    lora_paths: optional list of LoRA adapters (.safetensors / PEFT dir) to merge
+      into the weights at load time. lora_strength scales every adapter's delta.
+      See models/defs/lora_merge.py.
     """
     p = str(weights_path)
     if p.endswith(".npz") or p.endswith(".safetensors"):
         wd = dict(mx.load(p))
     else:
         wd = convert_weights_from_torch_ckpt(p)
+
+    if lora_paths:
+        from .lora_merge import merge_loras_into_weights
+        stats = merge_loras_into_weights(wd, lora_paths, strength=lora_strength, log=lora_log)
+        lora_log(f"lora: merged {stats['merged']} layer(s) from {stats['adapters']} adapter(s)")
 
     model = DiT(T_lat=T_lat)
     wd_list = [(k, v.astype(dtype)) for k, v in wd.items()]

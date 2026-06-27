@@ -170,13 +170,18 @@ def prompt_user_if_missing(args):
     return args
 
 
-def load_dit(dit_name: str, T_lat: int, dtype):
+def load_dit(dit_name: str, T_lat: int, dtype, lora_paths=None, lora_strength=1.0):
     cfg = DIT_CHOICES[dit_name]
     ckpt = ensure_local(cfg["ckpt"])
     import importlib, io, contextlib
     mod = importlib.import_module(cfg["loader"])
+    # The loader's own chatter is swallowed, but the LoRA merge summary is routed
+    # to stderr (not redirected) so it stays visible to callers that capture it.
+    lora_log = lambda m: print(m, file=sys.stderr)
     with contextlib.redirect_stdout(io.StringIO()):
-        model = mod.load_dit(str(ckpt), T_lat=T_lat, dtype=dtype, compile_=False)
+        model = mod.load_dit(str(ckpt), T_lat=T_lat, dtype=dtype, compile_=False,
+                             lora_paths=lora_paths, lora_strength=lora_strength,
+                             lora_log=lora_log)
     return model, str(ckpt)
 
 
@@ -387,6 +392,16 @@ def main():
                     help="Path to the bundled T5Gemma FP16 .npz (weights + tokenizer). "
                          "Default points at models/mlx/t5gemma_f16.npz next to this script; "
                          "auto-downloaded from HuggingFace if not present.")
+    ap.add_argument("--lora", nargs="+", default=None, metavar="ADAPTER",
+                    help="One or more LoRA adapters to merge into the DiT at load time. "
+                         "Each is a .safetensors file (SA3-native train_lora.py output) or a "
+                         "PEFT adapter directory/.safetensors (with its adapter_config.json). "
+                         "ONLY .safetensors is accepted — a pickle .ckpt/.pt is refused (it "
+                         "would execute code on load). The adapter's base must match --dit "
+                         "(e.g. a medium adapter with --dit medium).")
+    ap.add_argument("--lora-strength", type=float, default=1.0,
+                    help="Application weight for every --lora delta (default 1.0). 0 disables "
+                         "the adapter (bit-identical to no LoRA); >1 amplifies it.")
 
     # ── Sampling ──────────────────────────────────────────────────────────────
     ap.add_argument("--seconds", type=float, default=30.0,
@@ -625,7 +640,11 @@ def main():
 
     # ── 3b. DiT pingpong sampling ──
     stage("[3/5]", f"DiT — load + sample ({args.steps} steps, σmax={sigma_max:.2f})")
-    t0 = time.time(); dit_model, _ = load_dit(args.dit, T_lat=T_lat, dtype=dtype)
+    if args.lora:
+        sub(f"lora  {', '.join(os.path.basename(p.rstrip('/')) for p in args.lora)}  "
+            f"(strength {args.lora_strength:g})")
+    t0 = time.time(); dit_model, _ = load_dit(args.dit, T_lat=T_lat, dtype=dtype,
+                                              lora_paths=args.lora, lora_strength=args.lora_strength)
     _stage_peak_b('DiT load')
     sub(f"load {time.time()-t0:.1f}s")
 

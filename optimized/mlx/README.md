@@ -94,6 +94,10 @@ Apple Silicon only (MLX is Metal-backed). Python 3.10+. `./install.sh
 ./sa3 --prompt "ambient drone" --cfg 3.0 --negative-prompt "drums, vocals" \
       --dit sm-music --decoder same-s --out drone.wav
 
+# Apply a LoRA finetune (merged into the DiT at load; base must match --dit)
+./sa3 --prompt "arabic maqam oud taqsim" --dit medium --decoder same-l \
+      --lora ./my_lora.safetensors --lora-strength 1.0 --out maqam.wav
+
 # Generate + play immediately (afplay; Ctrl-C stops both)
 ./sa3 --prompt "rainforest" --dit sm-sfx --decoder same-s --play
 
@@ -178,6 +182,8 @@ Sample run on **M4 Pro / 48 GB**:
 | `--init-noise-level`  | 1.0      | σmax; 0.4–0.8 typical for variation, 1.0 = full regen, >1 = overshoot |
 | `--inpaint-range`     | —        | `START,END` seconds; regenerate that span, keep the rest              |
 | `--dit-dtype`         | fp16     | DiT compute dtype (decoder always FP32; T5Gemma always fp16)          |
+| `--lora`              | —        | One or more `.safetensors` LoRA adapters merged into the DiT at load (SA3-native or PEFT). Pickle `.ckpt/.pt` is refused. Base must match `--dit` |
+| `--lora-strength`     | 1.0      | Application weight per `--lora` delta; 0 = bit-exact bypass, >1 amplifies |
 | `--free-models`       | on       | Progressive model freeing; `--no-free-models` keeps them resident     |
 | `--out`               | out.wav  | Relative → `output/<file>`; absolute → as-is. 16-bit PCM stereo @ 44.1 kHz, trimmed to exactly `--seconds` |
 | `--play`              | off      | After writing, play via `afplay`; Ctrl-C stops both processes         |

@@ -148,10 +148,35 @@ def _merged_weight(W0: np.ndarray, p: dict, adapter_type: str, scaling: float) -
     raise LoraError(f"unknown adapter_type {adapter_type!r}")
 
 
+def _check_shapes(layer: str, W0: np.ndarray, p: dict, adapter_type: str) -> None:
+    """Fail with a clear message when the adapter doesn't fit the base weight —
+    almost always because the adapter was trained for a different base than
+    ``--dit`` (e.g. a medium adapter on sm-music). Without this the mismatch
+    surfaces as a raw numpy broadcasting error deep in the merge."""
+    fan_out, fan_in = W0.shape
+    if adapter_type.endswith("-xs"):
+        rank = p["M_xs"].shape[0]
+        if rank > min(fan_out, fan_in):
+            raise LoraError(
+                f"{layer}: LoRA-XS rank {rank} exceeds base min-dim "
+                f"{min(fan_out, fan_in)} for weight {W0.shape} — wrong base for --dit?"
+            )
+        return
+    b_out, b_rank = p["lora_B"].shape
+    a_rank, a_in = p["lora_A"].shape
+    if b_out != fan_out or a_in != fan_in or a_rank != b_rank:
+        raise LoraError(
+            f"{layer}: adapter lora_B{p['lora_B'].shape}·lora_A{p['lora_A'].shape} "
+            f"does not fit base weight {W0.shape} — wrong base for --dit?"
+        )
+
+
 def _mag_2d(mag: np.ndarray, norm_dim: int) -> np.ndarray:
     """Reshape a (possibly 2D) magnitude vector to broadcast against the weight on
-    ``norm_dim`` (mirrors `magnitude.unsqueeze(norm_dim)` after a squeeze)."""
-    mag = np.squeeze(mag)
+    ``norm_dim`` (mirrors `magnitude.unsqueeze(norm_dim)` after a squeeze).
+    ``atleast_1d`` guards the degenerate (1, 1) case where squeeze yields a
+    0-d array (no real DiT layer has a single output, but keep it total)."""
+    mag = np.atleast_1d(np.squeeze(mag))
     return mag.reshape(-1, 1) if norm_dim == 1 else mag.reshape(1, -1)
 
 
@@ -295,8 +320,9 @@ def merge_loras_into_weights(weights: dict, lora_paths, strength: float = 1.0,
         log(f"lora: {os.path.basename(path)} — {adapter_type}, "
             f"scaling={scaling:.3f}, {len(layers)} target layers")
 
-    # Accumulate deltas per npz key against the *original* weight.
-    deltas: dict[str, np.ndarray] = {}
+    # Accumulate deltas per npz key against the *original* weight. Each entry is
+    # [summed_delta, restore] — the layout restorer is the same across repeats.
+    accum: dict[str, list] = {}
     skipped: list[str] = []
     for path, adapter_type, scaling, layers in parsed:
         need = _PARAMS_FOR.get(adapter_type, ())
@@ -309,25 +335,25 @@ def merge_loras_into_weights(weights: dict, lora_paths, strength: float = 1.0,
             if missing:
                 raise LoraError(f"{layer}: adapter is {adapter_type} but missing {missing}")
             W0, restore = _weight_as_2d(weights[key])
+            _check_shapes(layer, W0, params, adapter_type)
             merged = _merged_weight(W0, params, adapter_type, scaling)
             delta = strength * (merged - W0)
-            deltas[key] = deltas.get(key, 0.0) + delta
-            # stash the layout restorer with the key (same for repeats)
-            deltas.setdefault(key + "\0restore", restore)
+            if key in accum:
+                accum[key][0] += delta
+            else:
+                accum[key] = [delta, restore]
 
-    merged_count = 0
-    for key, delta in list(deltas.items()):
-        if key.endswith("\0restore"):
-            continue
-        restore = deltas[key + "\0restore"]
+    for key, (delta, restore) in accum.items():
         W0, _ = _weight_as_2d(weights[key])
         weights[key] = mx.array(restore(W0 + delta))
-        merged_count += 1
 
     if skipped:
         log(f"lora: skipped {len(skipped)} layer(s) not in this DiT "
             f"(e.g. {skipped[0]})")
-    return {"merged": merged_count, "skipped": skipped, "adapters": len(parsed)}
+    if not accum:
+        log("lora: WARNING — merged 0 layers; the adapter targets nothing in this "
+            "DiT (wrong base for --dit, or unsupported target modules)")
+    return {"merged": len(accum), "skipped": skipped, "adapters": len(parsed)}
 
 
 def _weight_as_2d(arr):

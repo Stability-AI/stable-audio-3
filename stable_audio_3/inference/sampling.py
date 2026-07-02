@@ -35,10 +35,14 @@ def build_schedule(
     """
     n_points = steps + 1 if include_endpoint else steps
 
+    # Build a NORMALIZED [1 -> 0] grid, warp it (optional dist_shift), then scale by sigma_max.
+    # Warping the normalized grid and scaling keeps the schedule monotonically decreasing
+    # sigma_max -> 0 across all steps. sigma_max = 1.0 is plain text-to-audio; sigma_max < 1.0 is
+    # the audio-to-audio / variation start (denoising begins from a partially noised init).
     if include_endpoint:
-        t = torch.linspace(sigma_max, 0, n_points, device=device)
+        t = torch.linspace(1.0, 0, n_points, device=device)
     else:
-        t = torch.linspace(sigma_max, 0, n_points + 1, device=device)[:-1]
+        t = torch.linspace(1.0, 0, n_points + 1, device=device)[:-1]
 
     if dist_shift is not None:
         seq_len = effective_seq_len if effective_seq_len is not None else fallback_seq_len
@@ -50,16 +54,18 @@ def build_schedule(
             seq_len = max(int(seq_len), 1)
         t = dist_shift.shift(t, seq_len)
 
-        # Ensure the first timestep remains aligned with sigma_max after shifting.
-        # This keeps the schedule consistent with the initialization in sample_diffusion(),
-        # which mixes init_data using sigma_max.
-        if isinstance(t, torch.Tensor):
-            sigma_max_tensor = t.new_tensor(sigma_max)
-            if t.ndim == 1:
-                t[0] = sigma_max_tensor
-            else:
-                # For batched/per-element schedules, enforce sigma_max at the first time index.
-                t[..., 0] = sigma_max_tensor
+    # Scale the (warped) normalized schedule into [0, sigma_max], then pin the first step exactly
+    # to sigma_max so it matches sample_diffusion()'s init_data mix (which uses sigma_max). The
+    # shift preserves endpoints, so t[0] is already sigma_max — this just guards against float
+    # error. (With dist_shift=None this is the plain linear grid scaled to [0, sigma_max].)
+    t = t * sigma_max
+    if isinstance(t, torch.Tensor):
+        sigma_max_tensor = t.new_tensor(sigma_max)
+        if t.ndim == 1:
+            t[0] = sigma_max_tensor
+        else:
+            # For batched/per-element schedules, enforce sigma_max at the first time index.
+            t[..., 0] = sigma_max_tensor
 
     return t
 

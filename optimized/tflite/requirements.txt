@@ -1,0 +1,5 @@
+ai_edge_litert>=1.0
+numpy>=1.24
+sentencepiece>=0.2
+soundfile>=0.12
+huggingface_hub>=0.20

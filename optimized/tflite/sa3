@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+#
+# Wrapper around scripts/sa3_tflite.py — runs it via the project's .venv so no
+# activation is needed.
+#
+# If setup is incomplete (no uv, no .venv) you'll be prompted to run
+# install.sh; saying yes runs the installer and then resumes the command.
+#
+# Usage: ./sa3 --prompt "lofi house" --dit sm-music --decoder same-s --out a.wav
+#
+set -euo pipefail
+
+# Pre-emptively add the uv installer's default bin dir to PATH. The user's
+# shell profile only updates new shells; this lets us find uv in the current
+# process tree (matters right after a fresh `curl|sh` install).
+export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$HOME/.local/bin:$PATH"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ -t 1 ]]; then
+    RED=$'\033[1;31m'; YELLOW=$'\033[1;33m'; CYAN=$'\033[1;36m'
+    BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+else
+    RED=""; YELLOW=""; CYAN=""; BOLD=""; DIM=""; RESET=""
+fi
+
+fail() { printf '\n%serror%s: %s\n' "$RED" "$RESET" "$1" >&2; exit 1; }
+
+# Prompts the user to run install.sh. Honors `-y` / non-interactive stdin.
+# Resumes (returns 0) on success so the caller can re-attempt the run;
+# exits 1 if the user declines or install fails.
+prompt_install() {
+    local reason="$1"
+    printf '\n%s%s%s\n' "$YELLOW" "$reason" "$RESET" >&2
+
+    if [[ ! -t 0 ]]; then
+        printf '%serror%s: stdin is not a TTY — re-run %s./install.sh%s manually.\n' \
+            "$RED" "$RESET" "$BOLD" "$RESET" >&2
+        exit 1
+    fi
+
+    printf '  %sRun ./install.sh now to set up?%s %s[Y/n]%s ' \
+        "$BOLD" "$RESET" "$DIM" "$RESET"
+    read -r REPLY < /dev/tty
+    case "$REPLY" in
+        ""|y|Y|yes|YES) ;;
+        *) fail "install declined — re-run ./install.sh manually when ready." ;;
+    esac
+
+    printf '\n%s→ running ./install.sh%s\n' "$CYAN" "$RESET" >&2
+    if ! "$SCRIPT_DIR/install.sh"; then
+        fail "installer failed — see output above."
+    fi
+}
+
+# ── infrastructure checks ───────────────────────────────────────────────────
+if [[ ! -f "$SCRIPT_DIR/scripts/sa3_tflite.py" ]]; then
+    fail "scripts/sa3_tflite.py not found — repo files are missing or moved."
+fi
+
+needs_install=0
+missing=()
+if ! command -v uv >/dev/null 2>&1; then
+    needs_install=1; missing+=("uv")
+fi
+if [[ ! -d "$SCRIPT_DIR/.venv" ]]; then
+    needs_install=1; missing+=(".venv/")
+fi
+
+if [[ $needs_install -eq 1 ]]; then
+    prompt_install "Setup incomplete — missing: ${missing[*]}"
+fi
+
+# ── hand off to scripts/sa3_tflite.py ───────────────────────────────────────
+# Invoke .venv/bin/python directly rather than via `uv run`. `uv run` walks up
+# looking for a pyproject.toml and (in newer uv versions) with --no-project
+# creates an ephemeral env with no deps, ignoring our .venv. Direct invocation
+# is shorter, faster, and side-steps both bugs.
+cd "$SCRIPT_DIR"
+exec "$SCRIPT_DIR/.venv/bin/python" scripts/sa3_tflite.py "$@"

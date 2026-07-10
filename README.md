@@ -2,7 +2,7 @@
 
 **A state-of-the-art open platform for fast, high-quality generated audio and music.**
 
-[Technical Report](https://arxiv.org/abs/2605.17991) · [🤗 Models](https://huggingface.co/collections/stabilityai/stable-audio-3) · [🤗 Extra Models](https://huggingface.co/collections/stabilityai/stable-audio-3-extra) · [Discord](https://discord.gg/cKpvjey8b) · [Demo](https://huggingface.co/spaces/stabilityai/stable-audio-3) · [Blog Post](https://stability.ai/news-updates/meet-stable-audio-3-the-model-family-built-for-artistic-experimentation-with-open-weight-models)
+[Technical Report](https://arxiv.org/abs/2605.17991) · [🤗 Models](https://huggingface.co/collections/stabilityai/stable-audio-3) · [🤗 Extra Models](https://huggingface.co/collections/stabilityai/stable-audio-3-extra) · [Discord](https://discord.gg/7QM7mtY9uH) · [Demo](https://huggingface.co/spaces/stabilityai/stable-audio-3) · [Blog Post](https://stability.ai/news-updates/meet-stable-audio-3-the-model-family-built-for-artistic-experimentation-with-open-weight-models)
 
 ![Stable Audio 3 Architecture](stable-audio-3.png)
 
@@ -258,7 +258,7 @@ MLX and TensorRT available (experimental), check out the scripts and docs in [op
 
 ## Community
 
-- [Harmonai Discord](https://discord.gg/cKpvjey8b): Check out our Harmonai Discord server run by the research team. Besides good discussions, we host weekly office hours talking all things AI audio and music and want to hear what you come up with!
+- [Harmonai Discord](https://discord.gg/7QM7mtY9uH): Check out our Harmonai Discord server run by the research team. Besides good discussions, we host weekly office hours talking all things AI audio and music and want to hear what you come up with!
 
 - [Underfit](https://github.com/dada-bots/underfit): A LoRA training poweruser dream from Dadabots. If LoRA training in this repo is not enough, check out some experimental tools there like agentic LoRA orchestrations and monitoring.
 

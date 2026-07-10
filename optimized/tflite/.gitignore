@@ -1,0 +1,14 @@
+# Model weights — pulled from HuggingFace, never committed here.
+# (The SentencePiece tokenizer at models/tokenizer.model IS committed — it's
+#  small and the .tflite T5Gemma is encoder-only.)
+*.tflite
+
+# Generated audio — anywhere on the tree, including output/.
+*.wav
+
+# Python virtualenv created by install.sh
+.venv/
+
+# Python bytecode caches
+__pycache__/
+*.pyc

@@ -364,7 +364,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         return gr.update(value=DEFAULT_DECODERS.get(dit_name, "same-s"))
 
     def generate(dit_name, decoder_name, prompt, negative_prompt,
-                 seconds, steps, seed_text, cfg, apg, sigma_max,
+                 seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
                  a2a_audio, inpaint_audio, inp_start, inp_end):
         err = lambda m: ("", "", "", f"<span style='color:#f88'>{m}</span>")
         prompt = (prompt or "").strip()
@@ -376,12 +376,13 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         except ValueError:
             seed = _random.randint(0, 2**31 - 1)
             notes.append(f"seed wasn't an integer — used random seed {seed}")
-        # init_noise_level only means something with guide audio — pure prompt
-        # generations always run the full schedule (σmax = 1.0).
-        sigma_max = float(sigma_max) if a2a_audio else 1.0
+        # sigma_max governs every generation's schedule start; when guide audio is
+        # present (a2a), init_noise_level overrides it (parent-repo gradio semantics).
+        sigma_max = float(init_noise) if a2a_audio else float(sigma_max)
         if sigma_max < MIN_SIGMA:
-            notes.append(f"init_noise_level 0 runs at {MIN_SIGMA} (model is undefined at t≈0) — "
-                         "output ≈ the re-encoded input")
+            which = "init_noise_level" if a2a_audio else "sigma_max"
+            notes.append(f"{which} 0 runs at {MIN_SIGMA} (model is undefined at t≈0)"
+                         + (" — output ≈ the re-encoded input" if a2a_audio else ""))
             sigma_max = MIN_SIGMA
 
         inpaint_range = None
@@ -481,8 +482,11 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 generate_btn = gr.Button("Generate", variant="primary", size="lg")
 
                 with gr.Accordion("Advanced", open=False):
-                    apg = gr.Slider(label="APG (only applies when CFG > 1)",
-                                    minimum=0.0, maximum=1.0, value=1.0, step=0.05)
+                    with gr.Row():
+                        apg = gr.Slider(label="APG (only applies when CFG > 1)",
+                                        minimum=0.0, maximum=1.0, value=1.0, step=0.05)
+                        sigma_global = gr.Slider(label="sigma_max",
+                                                 minimum=0.0, maximum=1.0, value=1.0, step=0.01)
                     negative_prompt = gr.Textbox(label="Negative prompt", lines=1)
 
                 with gr.Accordion("Audio-to-audio (guide the whole clip)", open=False):
@@ -521,8 +525,9 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
 
         generate_btn.click(generate,
                            inputs=[dit_dd, decoder_dd, prompt, negative_prompt,
-                                   seconds, steps, seed, cfg, apg, sigma_slider,
-                                   a2a_audio, inpaint_audio, inp_start, inp_end],
+                                   seconds, steps, seed, cfg, apg, sigma_global,
+                                   sigma_slider, a2a_audio, inpaint_audio,
+                                   inp_start, inp_end],
                            outputs=[output_audio, output_spec, timing, error_box])
 
         gr.Markdown(

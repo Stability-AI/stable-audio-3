@@ -107,7 +107,8 @@ def verbose_basename(prompt, negative_prompt, cfg, sigma_max, seed) -> str:
     base = condense_prompt(prompt)
     if negative_prompt and negative_prompt.strip():
         base += ".neg-" + condense_prompt(negative_prompt.strip())
-    base += f".cfg{cfg:g}"
+    if cfg != 1.0:
+        base += f".cfg{cfg:g}"
     if sigma_max != 1.0:
         base += f".smx{sigma_max:g}"
     return f"{base}.{seed}"
@@ -384,11 +385,14 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         # Permissive by design: a generation should succeed with whatever IS set.
         # Half-configured features are ignored with a visible note, never an error.
         notes = []
+        # blank or -1 → random seed, kept small (1-9999) for readability
         try:
-            seed = int(seed_text.strip()) if seed_text and seed_text.strip() else _random.randint(0, 2**31 - 1)
+            seed = int(seed_text.strip()) if seed_text and seed_text.strip() else -1
         except ValueError:
-            seed = _random.randint(0, 2**31 - 1)
-            notes.append(f"seed wasn't an integer — used random seed {seed}")
+            seed = -1
+            notes.append("seed wasn't an integer — used a random one")
+        if seed == -1:
+            seed = _random.randint(1, 9999)
         # backstop for API callers bypassing the slider maxima
         max_s = MAX_SECONDS.get(dit_name, 120)
         if seconds > max_s:
@@ -463,7 +467,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
             f"decode={t['decode_ms']:.0f})</span> ·&nbsp; "
             f"<b>{t['realtime']:.1f}× realtime</b> ·&nbsp; "
             f"<b>seed</b>: <code>{seed}</code> ·&nbsp; "
-            f"<b>T_lat</b>: {t['T_lat']} ·&nbsp; <b>samples</b>: {t['samples']}"
+            f"<b>seq_len</b>: {t['T_lat']} ·&nbsp; <b>samples</b>: {t['samples']}"
         )
         if notes:
             timing_html = ("".join(f"<div style='color:#fa3; font-size:0.85em'>note: {n}</div>"
@@ -522,10 +526,6 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                                               value=0, step=0.5)
                         inp_end = gr.Slider(label="End (s)", minimum=0, maximum=120,
                                             value=0, step=0.5)
-                    gr.Markdown(
-                        "<span style='color:#888; font-size:0.85em'>Reads best with CFG ≥ 5 and a "
-                        "contrasting prompt. Combinable with audio-to-audio: the regenerated span "
-                        "then starts from the guide audio instead of noise.</span>")
 
             with gr.Column(scale=2):
                 gr.Markdown("**Audio**")
@@ -551,8 +551,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
 
         gr.Markdown(
             "<p style='color:#888; font-size:0.85em'>"
-            "WAVs saved under <code>output/gradio/</code> as "
-            "<code>prompt[.neg-…].cfg…[.smx…].seed.wav</code> (kept forever). "
+            "WAVs saved under <code>output/gradio/</code>. "
             "DiT runs fp16 (MLX canonical), codecs fp32.</p>"
         )
 

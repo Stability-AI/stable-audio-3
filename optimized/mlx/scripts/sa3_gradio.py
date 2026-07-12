@@ -23,7 +23,6 @@ import argparse
 import base64
 import math
 import sys
-import threading
 import time
 import uuid
 import wave
@@ -57,11 +56,18 @@ KEEP_RECENT_N = 20
 MIN_SIGMA = 0.01
 DEFAULT_DECODERS = {name: cfg["default_decoder"] for name, cfg in DIT_CHOICES.items()}
 
-# gradio runs handlers on anyio worker threads; MLX keeps its default stream
-# per-thread, so a handler can land on a thread with no GPU stream registered
-# ("There is no Stream(gpu, 0) in current thread"). One generation at a time,
-# and every generation re-pins the default device on its thread.
-_GEN_LOCK = threading.Lock()
+# MLX ≥0.31 registers GPU streams PER THREAD (ThreadLocalStream) while gradio
+# runs each handler on a rotating anyio worker thread — cross-thread MLX use
+# then dies with "There is no Stream(gpu, 0) in current thread". The categorical
+# fix: ALL MLX work (pre-warm + every generation) runs on one dedicated owner
+# thread; handlers submit to it and wait. This also serializes generations.
+import concurrent.futures as _cf
+_MLX_EXECUTOR = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
+
+
+def mlx_call(fn, *args, **kwargs):
+    """Run fn on the MLX owner thread and return its result (re-raises errors)."""
+    return _MLX_EXECUTOR.submit(fn, *args, **kwargs).result()
 
 
 def read_audio_any(path: str) -> np.ndarray:
@@ -180,7 +186,7 @@ def run_generation(dit_name: str, decoder_name: str, prompt: str,
       - both: the inpainted span regenerates FROM the a2a guide instead of pure noise
     """
     t = {}
-    mx.set_default_device(mx.gpu)   # thread-local in MLX — see _GEN_LOCK note
+    mx.set_default_device(mx.gpu)   # belt-and-braces; normally on the MLX owner thread
     dtype = mx.float16   # MLX canonical DiT dtype
     T_lat = max(1, math.ceil(seconds * SAMPLE_RATE / SAMPLES_PER_LATENT))
 
@@ -344,11 +350,15 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
     import gradio as gr
     import random as _random
 
-    # Pre-warm the initial pipeline so the first click is fast.
+    # Pre-warm the initial pipeline so the first click is fast — ON the MLX
+    # owner thread, so all stream/model state lives where generations run.
     warm_T = max(1, math.ceil(default_seconds * SAMPLE_RATE / SAMPLES_PER_LATENT))
     print(f"  pre-warming {initial_dit}+{initial_decoder} (T_lat={warm_T})...")
-    get_t5(); get_conditioner(initial_dit)
-    get_dit(initial_dit, warm_T, mx.float16); get_decoder(initial_decoder)
+
+    def _warm():
+        get_t5(); get_conditioner(initial_dit)
+        get_dit(initial_dit, warm_T, mx.float16); get_decoder(initial_decoder)
+    mlx_call(_warm)
 
     def on_dit_change(dit_name):
         return gr.update(value=DEFAULT_DECODERS.get(dit_name, "same-s"))
@@ -385,12 +395,12 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 "inpaint" if inpaint_range else
                 "audio-to-audio" if a2a_audio else "text-to-audio")
         try:
-            with _GEN_LOCK:
-                audio_np, t = run_generation(
-                    dit_name, decoder_name, prompt, negative_prompt or "",
-                    float(seconds), int(steps), seed, float(cfg), float(apg),
-                    float(sigma_max), a2a_audio or None, inpaint_audio or None,
-                    inpaint_range)
+            audio_np, t = mlx_call(
+                run_generation,
+                dit_name, decoder_name, prompt, negative_prompt or "",
+                float(seconds), int(steps), seed, float(cfg), float(apg),
+                float(sigma_max), a2a_audio or None, inpaint_audio or None,
+                inpaint_range)
         except Exception as e:
             return err(f"error: {type(e).__name__}: {e}")
         if not np.isfinite(audio_np).all():

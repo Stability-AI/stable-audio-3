@@ -22,9 +22,9 @@ from __future__ import annotations
 import argparse
 import base64
 import math
+import re
 import sys
 import time
-import uuid
 import wave
 from pathlib import Path
 
@@ -52,7 +52,6 @@ from spec import render_spectrogram_png  # noqa: E402
 
 OUTPUT_DIR = REPO / "output" / "gradio"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-KEEP_RECENT_N = 20
 MIN_SIGMA = 0.01
 DEFAULT_DECODERS = {name: cfg["default_decoder"] for name, cfg in DIT_CHOICES.items()}
 # Trained max clip length per model (repo README model table).
@@ -95,13 +94,23 @@ def read_audio_any(path: str) -> np.ndarray:
         return np.ascontiguousarray(y, dtype=np.float32)
 
 
-def _prune_old_outputs():
-    wavs = sorted(OUTPUT_DIR.glob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for old in wavs[KEEP_RECENT_N:]:
-        try:
-            old.unlink()
-        except OSError:
-            pass
+def condense_prompt(prompt: str) -> str:
+    """Prompt → filename fragment (the main repo's verbose-naming rule):
+    filesystem-special characters become hyphens, capped at 150 chars."""
+    prompt = re.sub(r'[\\/:*?"<>|]', '-', prompt)[:150]
+    return prompt or "_"
+
+
+def verbose_basename(prompt, negative_prompt, cfg, sigma_max, seed) -> str:
+    """prompt[.neg-…].cfg{scale}[.smx{σ}].{seed} — matches the main repo's
+    gradio 'verbose' file naming."""
+    base = condense_prompt(prompt)
+    if negative_prompt and negative_prompt.strip():
+        base += ".neg-" + condense_prompt(negative_prompt.strip())
+    base += f".cfg{cfg:g}"
+    if sigma_max != 1.0:
+        base += f".smx{sigma_max:g}"
+    return f"{base}.{seed}"
 
 
 def _save_wav(pcm_int16, out_path):
@@ -420,15 +429,14 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
             return err("error: model produced non-finite audio (try a higher σmax or different seed)")
 
         pcm = (np.clip(audio_np, -1, 1) * 32767.0).astype(np.int16).T   # (T, 2)
-        out_path = OUTPUT_DIR / f"sa3-{uuid.uuid4().hex[:10]}.wav"
+        out_path = OUTPUT_DIR / f"{verbose_basename(prompt, negative_prompt, cfg, sigma_max, seed)}.wav"
         _save_wav(pcm, out_path)
-        _prune_old_outputs()
         b64 = base64.b64encode(out_path.read_bytes()).decode("ascii")
         audio_html = (
             f'<audio controls autoplay style="width:100%" '
             f'src="data:audio/wav;base64,{b64}"></audio>'
             f'<div style="font-size:0.85em; margin-top:4px; color:#888">'
-            f'{out_path.stat().st_size/1e6:.1f} MB · {mode} · right-click to download</div>'
+            f'{out_path.stat().st_size/1e6:.1f} MB · {mode} · saved as <code>{out_path.name}</code></div>'
         )
         try:
             spec_png = render_spectrogram_png(pcm, sample_rate=SAMPLE_RATE,
@@ -543,7 +551,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
 
         gr.Markdown(
             "<p style='color:#888; font-size:0.85em'>"
-            f"WAVs saved under <code>output/gradio/</code> (rotates after {KEEP_RECENT_N} files). "
+            "WAVs saved under <code>output/gradio/</code> as "
+            "<code>prompt[.neg-…].cfg…[.smx…].seed.wav</code> (kept forever). "
             "DiT runs fp16 (MLX canonical), codecs fp32.</p>"
         )
 

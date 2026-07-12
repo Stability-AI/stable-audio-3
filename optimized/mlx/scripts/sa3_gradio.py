@@ -380,7 +380,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
     def generate(dit_name, decoder_name, prompt, negative_prompt,
                  seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
                  a2a_audio, inpaint_audio, inp_start, inp_end):
-        err = lambda m: ("", "", "", f"<span style='color:#f88'>{m}</span>")
+        err = lambda m: ("", "", f"<span style='color:#f88'>{m}</span>")
         prompt = (prompt or "").strip()
         # Permissive by design: a generation should succeed with whatever IS set.
         # Half-configured features are ignored with a visible note, never an error.
@@ -436,25 +436,39 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         out_path = OUTPUT_DIR / f"{verbose_basename(prompt, negative_prompt, cfg, sigma_max, seed)}.wav"
         _save_wav(pcm, out_path)
         b64 = base64.b64encode(out_path.read_bytes()).decode("ascii")
-        audio_html = (
+        # Audio + spectrogram in ONE block so inline handlers can couple them:
+        # the audio's timeupdate drives the white playhead; clicking the
+        # spectrogram seeks (gradio HTML runs attributes, not <script> tags).
+        audio_el = (
             f'<audio controls autoplay style="width:100%" '
+            f'ontimeupdate="var p=this.parentNode.querySelector(\'.ph\');'
+            f'if(p&&this.duration)p.style.left=(this.currentTime/this.duration*100)+\'%\';" '
             f'src="data:audio/wav;base64,{b64}"></audio>'
-            f'<div style="font-size:0.85em; margin-top:4px; color:#888">'
+            f'<div style="font-size:0.85em; margin:4px 0; color:#888">'
             f'{out_path.stat().st_size/1e6:.1f} MB · {mode} · saved as <code>{out_path.name}</code></div>'
         )
         try:
             spec_png = render_spectrogram_png(pcm, sample_rate=SAMPLE_RATE,
                                               width=1200, height=240)
             spec_b64 = base64.b64encode(spec_png).decode("ascii")
-            spec_html = (
+            spec_el = (
+                f'<div style="position:relative; cursor:pointer" '
+                f'onclick="var a=this.parentNode.querySelector(\'audio\');'
+                f'var r=this.getBoundingClientRect();'
+                f'if(a&&a.duration){{a.currentTime=(event.clientX-r.left)/r.width*a.duration;a.play();}}">'
                 f'<img src="data:image/png;base64,{spec_b64}" '
-                f'style="width:100%; image-rendering:pixelated; border:1px solid #333" '
+                f'style="width:100%; display:block; image-rendering:pixelated; border:1px solid #333" '
                 f'alt="spectrogram"/>'
+                f'<div class="ph" style="position:absolute; top:0; bottom:0; left:0%; width:2px; '
+                f'background:#fff; pointer-events:none; box-shadow:0 0 4px rgba(0,0,0,.8)"></div>'
+                f'</div>'
                 f'<div style="font-size:0.75em; color:#666; margin-top:2px">'
-                f'3-band tinted stereo mel · red=bass / green=mid / blue=high · L top, R bottom</div>'
+                f'3-band tinted stereo mel · red=bass / green=mid / blue=high · L top, R bottom · '
+                f'click to seek</div>'
             )
         except Exception as e:
-            spec_html = f"<span style='color:#fa3'>spectrogram failed: {type(e).__name__}: {e}</span>"
+            spec_el = f"<span style='color:#fa3'>spectrogram failed: {type(e).__name__}: {e}</span>"
+        player_html = f"<div>{audio_el}{spec_el}</div>"
 
         load_note = (f"DiT-load {t['dit_load_ms']:.0f} ms ·&nbsp; "
                      if t.get("dit_load_ms", 0) > 100 else "")
@@ -472,7 +486,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         if notes:
             timing_html = ("".join(f"<div style='color:#fa3; font-size:0.85em'>note: {n}</div>"
                                    for n in notes) + timing_html)
-        return audio_html, spec_html, timing_html, ""
+        return player_html, timing_html, ""
 
     with gr.Blocks(title="SA3 MLX") as demo:
         gr.Markdown(
@@ -528,10 +542,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                                             value=0, step=0.5)
 
             with gr.Column(scale=2):
-                gr.Markdown("**Audio**")
-                output_audio = gr.HTML()
-                gr.Markdown("**Spectrogram**")
-                output_spec = gr.HTML()
+                gr.Markdown("**Output**")
+                output_player = gr.HTML()
                 timing = gr.HTML()
                 error_box = gr.HTML()
 
@@ -547,7 +559,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                                    seconds, steps, seed, cfg, apg, sigma_global,
                                    sigma_slider, a2a_audio, inpaint_audio,
                                    inp_start, inp_end],
-                           outputs=[output_audio, output_spec, timing, error_box])
+                           outputs=[output_player, timing, error_box])
 
         gr.Markdown(
             "<p style='color:#888; font-size:0.85em'>"

@@ -4,10 +4,12 @@ The MLX sibling of optimized/tensorRT/scripts/sa3_gradio.py, with every
 generation mode wired (the TRT one only exposes text-to-audio):
   - Model picker: sm-music / sm-sfx / medium (hot-swap; models cache in unified
     memory, LRU-evicted — first switch loads weights, subsequent instant)
-  - CFG + negative prompt (batched CFG with APG, same math as sa3_mlx.py)
-  - Audio-to-audio: upload init audio + σmax slider
-  - Inpainting: init audio + "START,END" seconds range (paste-back guaranteed
-    bit-exact outside the range)
+  - CFG 0-10 next to seconds/steps (0 = negative prompt takes over, 0.5 = halfway
+    between prompts, 1 = off, >1 = extrapolate) + negative prompt/APG under Advanced
+  - Audio-to-audio: guide audio + σmax slider (whole clip starts from its latents)
+  - Inpainting: separate reference audio + start/end range sliders (kept bit-exact
+    outside the range). Combinable with a2a: the regenerated span then starts
+    from the guide audio instead of noise.
   - Spectrogram display: 3-band tinted stereo mel spectrogram (numpy port —
     no torch), rendered inline alongside the audio
 
@@ -21,6 +23,7 @@ import argparse
 import base64
 import math
 import sys
+import threading
 import time
 import uuid
 import wave
@@ -53,6 +56,12 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 KEEP_RECENT_N = 20
 MIN_SIGMA = 0.01
 DEFAULT_DECODERS = {name: cfg["default_decoder"] for name, cfg in DIT_CHOICES.items()}
+
+# gradio runs handlers on anyio worker threads; MLX keeps its default stream
+# per-thread, so a handler can land on a thread with no GPU stream registered
+# ("There is no Stream(gpu, 0) in current thread"). One generation at a time,
+# and every generation re-pins the default device on its thread.
+_GEN_LOCK = threading.Lock()
 
 
 def _prune_old_outputs():
@@ -135,9 +144,20 @@ def get_encoder(decoder_name: str):
 def run_generation(dit_name: str, decoder_name: str, prompt: str,
                    negative_prompt: str, seconds: float, steps: int,
                    seed: int, cfg: float, apg: float, sigma_max: float,
-                   init_audio_path: str | None, inpaint_range_sec):
-    """Returns (audio_np (2,T) float32, timings dict)."""
+                   a2a_audio_path: str | None = None,
+                   inpaint_audio_path: str | None = None,
+                   inpaint_range_sec=None):
+    """Returns (audio_np (2,T) float32, timings dict).
+
+    a2a and inpainting are independent and combinable:
+      - a2a_audio_path: the whole generation STARTS from this audio's latents
+        (noise = lat*(1-σmax) + noise*σmax)
+      - inpaint_audio_path + inpaint_range_sec: kept bit-exact outside the range
+        (local_add_cond context + per-step paste-back)
+      - both: the inpainted span regenerates FROM the a2a guide instead of pure noise
+    """
     t = {}
+    mx.set_default_device(mx.gpu)   # thread-local in MLX — see _GEN_LOCK note
     dtype = mx.float16   # MLX canonical DiT dtype
     T_lat = max(1, math.ceil(seconds * SAMPLE_RATE / SAMPLES_PER_LATENT))
 
@@ -170,25 +190,34 @@ def run_generation(dit_name: str, decoder_name: str, prompt: str,
     mx.eval(cross_attn, global_cond)
     t["cond_ms"] = (time.time() - t0) * 1000
 
-    # 3a. (a2a / inpaint) encode init audio → latents
-    init_latents = None
-    if init_audio_path:
-        t0 = time.time()
+    # 3a. encode the provided audio inputs → latents (each is optional)
+    def encode_audio(path):
         enc_model, pad_mod = get_encoder(decoder_name)
         enc_T_lat = T_lat
         if (T_lat * 16) % pad_mod != 0:
             enc_T_lat = math.ceil((T_lat * 16) / pad_mod) * pad_mod // 16
         target_samples = enc_T_lat * SAMPLES_PER_LATENT
-        audio_np = read_wav(init_audio_path)
+        audio_np = read_wav(path)
         if audio_np.shape[-1] >= target_samples:
             audio_np = audio_np[:, :target_samples]
         else:
             audio_np = np.pad(audio_np, ((0, 0), (0, target_samples - audio_np.shape[-1])))
         patches_np = patch_audio(audio_np[None, ...], patch_size=256)
-        init_latents = enc_model(mx.array(patches_np))[..., :T_lat]
-        mx.eval(init_latents)
-        init_latents = init_latents.astype(dtype)
-        t["enc_ms"] = (time.time() - t0) * 1000
+        lat = enc_model(mx.array(patches_np))[..., :T_lat]
+        mx.eval(lat)
+        return lat.astype(dtype)
+
+    a2a_latents = None      # start-point guide (whole clip)
+    ctx_latents = None      # inpaint context (kept outside the range)
+    t["enc_ms"] = 0.0
+    if a2a_audio_path:
+        t0 = time.time()
+        a2a_latents = encode_audio(a2a_audio_path)
+        t["enc_ms"] += (time.time() - t0) * 1000
+    if inpaint_audio_path and inpaint_range_sec is not None:
+        t0 = time.time()
+        ctx_latents = encode_audio(inpaint_audio_path)
+        t["enc_ms"] += (time.time() - t0) * 1000
 
     # 3b. DiT + pingpong sample
     dit_model, t["dit_load_ms"] = get_dit(dit_name, T_lat, dtype)
@@ -196,27 +225,26 @@ def run_generation(dit_name: str, decoder_name: str, prompt: str,
 
     key = mx.random.key(seed)
     pure_noise = mx.random.normal((1, 256, T_lat), dtype=dtype, key=key)
-    inpaint_lat = None
-    if inpaint_range_sec is not None:
-        s0 = max(0, int(round(inpaint_range_sec[0] * SAMPLE_RATE / SAMPLES_PER_LATENT)))
-        s1 = min(T_lat, int(round(inpaint_range_sec[1] * SAMPLE_RATE / SAMPLES_PER_LATENT)))
-        inpaint_lat = (s0, s1)
-    if init_latents is not None and inpaint_lat is None:
-        noise = init_latents * (1.0 - sigma_max) + pure_noise * sigma_max
+    # a2a start-point mix is independent of inpainting: when both are set, the
+    # inpainted span regenerates FROM the guide audio instead of pure noise
+    # (the kept span is pasted back from ctx_latents every step regardless).
+    if a2a_latents is not None:
+        noise = a2a_latents * (1.0 - sigma_max) + pure_noise * sigma_max
     else:
         noise = pure_noise
     mx.eval(noise)
 
     local_add_cond = None
     paste_back = None
-    if inpaint_lat is not None:
-        s0, s1 = inpaint_lat
+    if ctx_latents is not None:
+        s0 = max(0, int(round(inpaint_range_sec[0] * SAMPLE_RATE / SAMPLES_PER_LATENT)))
+        s1 = min(T_lat, int(round(inpaint_range_sec[1] * SAMPLE_RATE / SAMPLES_PER_LATENT)))
         mask_np = np.ones((1, 1, T_lat), dtype=np.float32)
         mask_np[:, :, s0:s1] = 0.0
         keep = mx.array(mask_np)
-        masked_input = init_latents.astype(mx.float32) * keep
+        masked_input = ctx_latents.astype(mx.float32) * keep
         local_add_cond = mx.concatenate([keep, masked_input], axis=1).transpose(0, 2, 1).astype(dtype)
-        paste_back = (init_latents, keep)
+        paste_back = (ctx_latents, keep)
 
     def model_fn(x, tt):
         if cfg == 1.0:
@@ -304,7 +332,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
 
     def generate(dit_name, decoder_name, prompt, negative_prompt,
                  seconds, steps, seed_text, cfg, apg, sigma_max,
-                 init_audio, inpaint_text):
+                 a2a_audio, inpaint_audio, inp_start, inp_end):
         err = lambda m: ("", "", "", f"<span style='color:#f88'>{m}</span>")
         prompt = (prompt or "").strip()
         try:
@@ -314,24 +342,25 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         if sigma_max < MIN_SIGMA:
             return err(f"error: σmax must be ≥ {MIN_SIGMA} (rf_denoiser is undefined at t≈0)")
         inpaint_range = None
-        if inpaint_text and inpaint_text.strip():
-            if not init_audio:
-                return err("error: inpaint range requires init audio")
-            try:
-                s_str, e_str = inpaint_text.split(",")
-                inpaint_range = (float(s_str), float(e_str))
-            except ValueError:
-                return err(f"error: inpaint range must be 'START,END' seconds, got {inpaint_text!r}")
-            if not (0 <= inpaint_range[0] < inpaint_range[1] <= seconds):
-                return err(f"error: need 0 ≤ start < end ≤ {seconds}s")
+        if inpaint_audio:
+            if inp_end <= inp_start:
+                return err("error: set the inpaint range sliders (end must be > start)")
+            if inp_end > seconds:
+                return err(f"error: inpaint end {inp_end}s exceeds clip length {seconds}s")
+            inpaint_range = (float(inp_start), float(inp_end))
+        elif inp_end > inp_start:
+            return err("error: inpaint range set but no reference audio uploaded")
 
-        mode = ("inpaint" if inpaint_range else
-                "audio-to-audio" if init_audio else "text-to-audio")
+        mode = ("a2a+inpaint" if (a2a_audio and inpaint_range) else
+                "inpaint" if inpaint_range else
+                "audio-to-audio" if a2a_audio else "text-to-audio")
         try:
-            audio_np, t = run_generation(
-                dit_name, decoder_name, prompt, negative_prompt or "",
-                float(seconds), int(steps), seed, float(cfg), float(apg),
-                float(sigma_max), init_audio or None, inpaint_range)
+            with _GEN_LOCK:
+                audio_np, t = run_generation(
+                    dit_name, decoder_name, prompt, negative_prompt or "",
+                    float(seconds), int(steps), seed, float(cfg), float(apg),
+                    float(sigma_max), a2a_audio or None, inpaint_audio or None,
+                    inpaint_range)
         except Exception as e:
             return err(f"error: {type(e).__name__}: {e}")
         if not np.isfinite(audio_np).all():
@@ -399,33 +428,36 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                                         value=default_seconds, step=1)
                     steps = gr.Slider(label="Steps", minimum=1, maximum=16,
                                       value=default_steps, step=1)
+                    cfg = gr.Slider(label="CFG", minimum=0.0, maximum=10.0,
+                                    value=1.0, step=0.1)
                 seed = gr.Textbox(label="Seed (optional, blank = random)",
                                   max_lines=1, value="")
                 generate_btn = gr.Button("Generate", variant="primary", size="lg")
 
-                with gr.Accordion("CFG / negative prompt", open=False):
-                    cfg = gr.Slider(label="CFG scale — 1 = prompt only (off) · 0 = negative prompt "
-                                          "only · 0.5 = halfway between both · >1 = push beyond prompt",
-                                    minimum=0.0, maximum=10.0, value=1.0, step=0.1)
-                    apg = gr.Slider(label="APG (1 = full orthogonal projection, 0 = vanilla CFG; "
-                                          "applies only when CFG > 1)",
+                with gr.Accordion("Advanced", open=False):
+                    apg = gr.Slider(label="APG (only applies when CFG > 1)",
                                     minimum=0.0, maximum=1.0, value=1.0, step=0.05)
-                    negative_prompt = gr.Textbox(
-                        label="Negative prompt (active when CFG ≠ 1; at CFG 0 it fully takes over — "
-                              "blank = unconditional)", lines=1)
+                    negative_prompt = gr.Textbox(label="Negative prompt", lines=1)
 
-                with gr.Accordion("Audio-to-audio / inpainting", open=False):
-                    init_audio = gr.Audio(label="Init audio (enables a2a; add a range below for inpainting)",
-                                          type="filepath")
-                    sigma_slider = gr.Slider(label="Init noise level σmax (a2a: 0.4–0.8 typical; 1.0 = ignore init)",
-                                             minimum=0.05, maximum=1.2, value=1.0, step=0.05)
-                    inpaint_text = gr.Textbox(
-                        label="Inpaint range 'START,END' seconds (regenerates just that span; blank = a2a)",
-                        max_lines=1, value="")
+                with gr.Accordion("Audio-to-audio (guide the whole clip)", open=False):
+                    a2a_audio = gr.Audio(label="Guide audio — generation starts from its latents",
+                                         type="filepath")
+                    sigma_slider = gr.Slider(
+                        label="σmax — how strongly to re-noise the guide (0.4–0.8 typical; 1.0 = ignore)",
+                        minimum=0.05, maximum=1.2, value=1.0, step=0.05)
+
+                with gr.Accordion("Inpainting (regenerate a span of reference audio)", open=False):
+                    inpaint_audio = gr.Audio(label="Reference audio — kept bit-exact outside the range",
+                                             type="filepath")
+                    with gr.Row():
+                        inp_start = gr.Slider(label="Start (s)", minimum=0, maximum=120,
+                                              value=0, step=0.5)
+                        inp_end = gr.Slider(label="End (s)", minimum=0, maximum=120,
+                                            value=0, step=0.5)
                     gr.Markdown(
-                        "<span style='color:#888; font-size:0.85em'>a2a wants clips ≥ ~20 s "
-                        "(shorter inputs give repetitive latents). Inpainting reads best with "
-                        "CFG ≥ 5 and a contrasting prompt.</span>")
+                        "<span style='color:#888; font-size:0.85em'>Reads best with CFG ≥ 5 and a "
+                        "contrasting prompt. Combinable with audio-to-audio: the regenerated span "
+                        "then starts from the guide audio instead of noise.</span>")
 
             with gr.Column(scale=2):
                 gr.Markdown("**Audio**")
@@ -436,10 +468,15 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 error_box = gr.HTML()
 
         dit_dd.change(on_dit_change, inputs=[dit_dd], outputs=[decoder_dd])
+
+        def on_seconds_change(sec):
+            return gr.update(maximum=sec), gr.update(maximum=sec)
+        seconds.change(on_seconds_change, inputs=[seconds], outputs=[inp_start, inp_end])
+
         generate_btn.click(generate,
                            inputs=[dit_dd, decoder_dd, prompt, negative_prompt,
                                    seconds, steps, seed, cfg, apg, sigma_slider,
-                                   init_audio, inpaint_text],
+                                   a2a_audio, inpaint_audio, inp_start, inp_end],
                            outputs=[output_audio, output_spec, timing, error_box])
 
         gr.Markdown(

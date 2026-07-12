@@ -122,9 +122,11 @@ python scripts/sa3_mlx.py --prompt "..." --dit medium --decoder same-l
 ./sa3-gradio --dit medium     # initial model (switchable in the UI)
 ```
 
-Every generation mode is wired: text-to-audio, CFG + negative prompt (with APG),
-audio-to-audio (upload init audio + σmax slider), and inpainting (upload +
-`START,END` seconds range). Each clip renders with a 3-band tinted stereo mel
+Every generation mode is wired: text-to-audio, CFG 0–10 (0 = the negative prompt
+takes over, 0.5 = halfway between both prompts, >1 = extrapolate), audio-to-audio
+(guide audio + σmax slider), and inpainting (separate reference audio + start/end
+range sliders) — a2a and inpainting combine, so an inpainted span can regenerate
+from the guide audio instead of noise. Each clip renders with a 3-band tinted stereo mel
 spectrogram (bass=red / mid=green / high=blue). Models hot-swap from the
 dropdowns and cache in unified memory, so switching back is instant; WAVs land
 in `output/gradio/`. The UI needs two extra packages (`gradio`, `pillow`) —

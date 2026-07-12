@@ -232,7 +232,11 @@ def run_generation(dit_name: str, decoder_name: str, prompt: str,
         cond_d = x.astype(mx.float32) - cond_v.astype(mx.float32) * sigma
         uncond_d = x.astype(mx.float32) - uncond_v.astype(mx.float32) * sigma
         diff = cond_d - uncond_d
-        if apg <= 0.0:
+        # cfg < 1 is the INTERPOLATION regime: cfg_d = lerp(uncond_d, cond_d, cfg),
+        # so 0 = pure negative/uncond branch, 0.5 = halfway between both prompts.
+        # APG's orthogonal projection would bend that line — it only applies to the
+        # extrapolation regime (cfg > 1) it was designed for.
+        if apg <= 0.0 or cfg < 1.0:
             cfg_diff = diff
         else:
             norm = mx.sqrt((cond_d * cond_d).sum(axis=(-2, -1), keepdims=True))
@@ -400,11 +404,15 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 generate_btn = gr.Button("Generate", variant="primary", size="lg")
 
                 with gr.Accordion("CFG / negative prompt", open=False):
-                    cfg = gr.Slider(label="CFG scale (1.0 = off)", minimum=1.0,
-                                    maximum=10.0, value=1.0, step=0.1)
-                    apg = gr.Slider(label="APG (1 = full orthogonal projection, 0 = vanilla CFG)",
+                    cfg = gr.Slider(label="CFG scale — 1 = prompt only (off) · 0 = negative prompt "
+                                          "only · 0.5 = halfway between both · >1 = push beyond prompt",
+                                    minimum=0.0, maximum=10.0, value=1.0, step=0.1)
+                    apg = gr.Slider(label="APG (1 = full orthogonal projection, 0 = vanilla CFG; "
+                                          "applies only when CFG > 1)",
                                     minimum=0.0, maximum=1.0, value=1.0, step=0.05)
-                    negative_prompt = gr.Textbox(label="Negative prompt (needs CFG > 1)", lines=1)
+                    negative_prompt = gr.Textbox(
+                        label="Negative prompt (active when CFG ≠ 1; at CFG 0 it fully takes over — "
+                              "blank = unconditional)", lines=1)
 
                 with gr.Accordion("Audio-to-audio / inpainting", open=False):
                     init_audio = gr.Audio(label="Init audio (enables a2a; add a range below for inpainting)",

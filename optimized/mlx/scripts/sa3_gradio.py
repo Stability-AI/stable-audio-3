@@ -55,6 +55,8 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 KEEP_RECENT_N = 20
 MIN_SIGMA = 0.01
 DEFAULT_DECODERS = {name: cfg["default_decoder"] for name, cfg in DIT_CHOICES.items()}
+# Trained max clip length per model (repo README model table).
+MAX_SECONDS = {"sm-music": 120, "sm-sfx": 120, "medium": 380}
 
 # MLX ≥0.31 registers GPU streams PER THREAD (ThreadLocalStream) while gradio
 # runs each handler on a rotating anyio worker thread — cross-thread MLX use
@@ -360,8 +362,10 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         get_dit(initial_dit, warm_T, mx.float16); get_decoder(initial_decoder)
     mlx_call(_warm)
 
-    def on_dit_change(dit_name):
-        return gr.update(value=DEFAULT_DECODERS.get(dit_name, "same-s"))
+    def on_dit_change(dit_name, cur_seconds):
+        max_s = MAX_SECONDS.get(dit_name, 120)
+        return (gr.update(value=DEFAULT_DECODERS.get(dit_name, "same-s")),
+                gr.update(maximum=max_s, value=min(cur_seconds, max_s)))
 
     def generate(dit_name, decoder_name, prompt, negative_prompt,
                  seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
@@ -376,6 +380,11 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         except ValueError:
             seed = _random.randint(0, 2**31 - 1)
             notes.append(f"seed wasn't an integer — used random seed {seed}")
+        # backstop for API callers bypassing the slider maxima
+        max_s = MAX_SECONDS.get(dit_name, 120)
+        if seconds > max_s:
+            notes.append(f"seconds clamped to {dit_name}'s trained max ({max_s:g}s)")
+            seconds = float(max_s)
         # sigma_max governs every generation's schedule start; when guide audio is
         # present (a2a), init_noise_level overrides it (parent-repo gradio semantics).
         sigma_max = float(init_noise) if a2a_audio else float(sigma_max)
@@ -471,7 +480,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 prompt = gr.Textbox(label="Prompt", lines=2,
                                     placeholder="e.g. 'Impending tribal, epic orchestral buildup'")
                 with gr.Row():
-                    seconds = gr.Slider(label="Seconds", minimum=1, maximum=120,
+                    seconds = gr.Slider(label="Seconds", minimum=1,
+                                        maximum=MAX_SECONDS.get(initial_dit, 120),
                                         value=default_seconds, step=1)
                     steps = gr.Slider(label="Steps", minimum=1, maximum=16,
                                       value=default_steps, step=1)
@@ -517,7 +527,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 timing = gr.HTML()
                 error_box = gr.HTML()
 
-        dit_dd.change(on_dit_change, inputs=[dit_dd], outputs=[decoder_dd])
+        dit_dd.change(on_dit_change, inputs=[dit_dd, seconds],
+                      outputs=[decoder_dd, seconds])
 
         def on_seconds_change(sec):
             return gr.update(maximum=sec), gr.update(maximum=sec)

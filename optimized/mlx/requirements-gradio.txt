@@ -1,0 +1,3 @@
+# Extras for the gradio web UI (./sa3-gradio) — not needed by the CLI.
+gradio>=4.0
+pillow>=10.0

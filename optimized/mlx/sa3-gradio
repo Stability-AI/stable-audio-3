@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Shortcut for running scripts/sa3_gradio.py with the project .venv.
+# All args pass through unchanged.
+#
+# Examples:
+#   ./sa3-gradio                            # sm-music + same-s, public share link
+#   ./sa3-gradio --dit medium
+#   ./sa3-gradio --no-share                 # local-only
+#   ./sa3-gradio --help
+set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY="${SCRIPT_DIR}/.venv/bin/python"
+
+if [ ! -x "$PY" ]; then
+  echo "No .venv found — run ./install.sh first."
+  exit 1
+fi
+
+# gradio + pillow are UI-only extras, not part of the base requirements.
+if ! "$PY" -c "import gradio, PIL" >/dev/null 2>&1; then
+  echo "The gradio UI needs two extra packages (gradio, pillow)."
+  read -r -p "Install them into .venv now? [Y/n] " ans
+  case "${ans:-Y}" in
+    [Yy]*)
+      if command -v uv >/dev/null 2>&1; then
+        uv pip install -p "$PY" -r "${SCRIPT_DIR}/requirements-gradio.txt"
+      else
+        "$PY" -m pip install -r "${SCRIPT_DIR}/requirements-gradio.txt"
+      fi
+      ;;
+    *) echo "Aborted — install manually: uv pip install -p .venv/bin/python -r requirements-gradio.txt"; exit 1 ;;
+  esac
+fi
+
+exec "$PY" "${SCRIPT_DIR}/scripts/sa3_gradio.py" "$@"

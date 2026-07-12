@@ -114,6 +114,22 @@ uv run python scripts/sa3_mlx.py --prompt "..." --dit medium --decoder same-l
 python scripts/sa3_mlx.py --prompt "..." --dit medium --decoder same-l
 ```
 
+## Web UI (gradio)
+
+```bash
+./sa3-gradio                  # public gradio.live share link by default
+./sa3-gradio --no-share       # local-only (http://127.0.0.1:7860)
+./sa3-gradio --dit medium     # initial model (switchable in the UI)
+```
+
+Every generation mode is wired: text-to-audio, CFG + negative prompt (with APG),
+audio-to-audio (upload init audio + σmax slider), and inpainting (upload +
+`START,END` seconds range). Each clip renders with a 3-band tinted stereo mel
+spectrogram (bass=red / mid=green / high=blue). Models hot-swap from the
+dropdowns and cache in unified memory, so switching back is instant; WAVs land
+in `output/gradio/`. The UI needs two extra packages (`gradio`, `pillow`) —
+`./sa3-gradio` offers to install them into `.venv` on first run.
+
 ## Speed & memory
 
 Measured on **M1 8 GB** (the slowest M-chip). Newer chips are faster —

@@ -376,9 +376,12 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         except ValueError:
             seed = _random.randint(0, 2**31 - 1)
             notes.append(f"seed wasn't an integer — used random seed {seed}")
-        sigma_max = float(sigma_max)
+        # init_noise_level only means something with guide audio — pure prompt
+        # generations always run the full schedule (σmax = 1.0).
+        sigma_max = float(sigma_max) if a2a_audio else 1.0
         if sigma_max < MIN_SIGMA:
-            notes.append(f"σmax clamped to {MIN_SIGMA} (model is undefined at t≈0)")
+            notes.append(f"init_noise_level 0 runs at {MIN_SIGMA} (model is undefined at t≈0) — "
+                         "output ≈ the re-encoded input")
             sigma_max = MIN_SIGMA
 
         inpaint_range = None
@@ -486,8 +489,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                     a2a_audio = gr.Audio(label="Guide audio — generation starts from its latents",
                                          type="filepath")
                     sigma_slider = gr.Slider(
-                        label="σmax — how strongly to re-noise the guide (0.4–0.8 typical; 1.0 = ignore)",
-                        minimum=0.05, maximum=1.2, value=1.0, step=0.05)
+                        label="init_noise_level (1.0 = prompt, ~0.92 = fusion, 0 = input)",
+                        minimum=0.0, maximum=1.0, value=0.92, step=0.01)
 
                 with gr.Accordion("Inpainting (regenerate a span of reference audio)", open=False):
                     inpaint_audio = gr.Audio(label="Reference audio — kept bit-exact outside the range",

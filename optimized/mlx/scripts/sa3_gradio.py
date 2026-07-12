@@ -64,6 +64,29 @@ DEFAULT_DECODERS = {name: cfg["default_decoder"] for name, cfg in DIT_CHOICES.it
 _GEN_LOCK = threading.Lock()
 
 
+def read_audio_any(path: str) -> np.ndarray:
+    """(2, T) float32 @ 44.1 kHz from any common upload format.
+
+    Layered: read_wav handles 16-bit/44.1k natively and shells out to ffmpeg
+    for the rest when installed; if that fails (no ffmpeg), soundfile's bundled
+    libsndfile decodes mp3/flac/ogg/24-bit/48 kHz directly, followed by a
+    linear resample to 44.1 kHz."""
+    try:
+        return read_wav(path)
+    except Exception:
+        import soundfile as sf
+        data, sr = sf.read(path, dtype="float32", always_2d=True)   # (T, ch)
+        y = data.T
+        y = np.stack([y[0], y[0]]) if y.shape[0] == 1 else y[:2]
+        if sr != SAMPLE_RATE:
+            in_len = y.shape[-1]
+            new_len = int(round(in_len * SAMPLE_RATE / sr))
+            scale = in_len / new_len
+            pos = np.clip((np.arange(new_len) + 0.5) * scale - 0.5, 0, in_len - 1)
+            y = np.stack([np.interp(pos, np.arange(in_len), ch) for ch in y])
+        return np.ascontiguousarray(y, dtype=np.float32)
+
+
 def _prune_old_outputs():
     wavs = sorted(OUTPUT_DIR.glob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
     for old in wavs[KEEP_RECENT_N:]:
@@ -197,7 +220,7 @@ def run_generation(dit_name: str, decoder_name: str, prompt: str,
         if (T_lat * 16) % pad_mod != 0:
             enc_T_lat = math.ceil((T_lat * 16) / pad_mod) * pad_mod // 16
         target_samples = enc_T_lat * SAMPLES_PER_LATENT
-        audio_np = read_wav(path)
+        audio_np = read_audio_any(path)
         if audio_np.shape[-1] >= target_samples:
             audio_np = audio_np[:, :target_samples]
         else:

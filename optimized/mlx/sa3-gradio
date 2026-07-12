@@ -16,9 +16,9 @@ if [ ! -x "$PY" ]; then
   exit 1
 fi
 
-# gradio + pillow are UI-only extras, not part of the base requirements.
-if ! "$PY" -c "import gradio, PIL" >/dev/null 2>&1; then
-  echo "The gradio UI needs two extra packages (gradio, pillow)."
+# gradio + pillow + soundfile are UI-only extras, not part of the base requirements.
+if ! "$PY" -c "import gradio, PIL, soundfile" >/dev/null 2>&1; then
+  echo "The gradio UI needs a few extra packages (gradio, pillow, soundfile)."
   read -r -p "Install them into .venv now? [Y/n] " ans
   case "${ans:-Y}" in
     [Yy]*)

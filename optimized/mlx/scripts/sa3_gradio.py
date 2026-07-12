@@ -358,21 +358,28 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                  a2a_audio, inpaint_audio, inp_start, inp_end):
         err = lambda m: ("", "", "", f"<span style='color:#f88'>{m}</span>")
         prompt = (prompt or "").strip()
+        # Permissive by design: a generation should succeed with whatever IS set.
+        # Half-configured features are ignored with a visible note, never an error.
+        notes = []
         try:
             seed = int(seed_text.strip()) if seed_text and seed_text.strip() else _random.randint(0, 2**31 - 1)
         except ValueError:
-            return err("error: seed must be an integer")
+            seed = _random.randint(0, 2**31 - 1)
+            notes.append(f"seed wasn't an integer — used random seed {seed}")
+        sigma_max = float(sigma_max)
         if sigma_max < MIN_SIGMA:
-            return err(f"error: σmax must be ≥ {MIN_SIGMA} (rf_denoiser is undefined at t≈0)")
+            notes.append(f"σmax clamped to {MIN_SIGMA} (model is undefined at t≈0)")
+            sigma_max = MIN_SIGMA
+
         inpaint_range = None
-        if inpaint_audio:
-            if inp_end <= inp_start:
-                return err("error: set the inpaint range sliders (end must be > start)")
+        if inpaint_audio and inp_end > inp_start and inp_start < seconds:
             if inp_end > seconds:
-                return err(f"error: inpaint end {inp_end}s exceeds clip length {seconds}s")
-            inpaint_range = (float(inp_start), float(inp_end))
+                notes.append(f"inpaint end clamped to the clip length ({seconds:g}s)")
+            inpaint_range = (float(inp_start), float(min(inp_end, seconds)))
+        elif inpaint_audio:
+            notes.append("inpainting ignored — set the start/end range sliders")
         elif inp_end > inp_start:
-            return err("error: inpaint range set but no reference audio uploaded")
+            notes.append("inpaint range ignored — no reference audio uploaded")
 
         mode = ("a2a+inpaint" if (a2a_audio and inpaint_range) else
                 "inpaint" if inpaint_range else
@@ -427,6 +434,9 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
             f"<b>seed</b>: <code>{seed}</code> ·&nbsp; "
             f"<b>T_lat</b>: {t['T_lat']} ·&nbsp; <b>samples</b>: {t['samples']}"
         )
+        if notes:
+            timing_html = ("".join(f"<div style='color:#fa3; font-size:0.85em'>note: {n}</div>"
+                                   for n in notes) + timing_html)
         return audio_html, spec_html, timing_html, ""
 
     with gr.Blocks(title="SA3 MLX") as demo:

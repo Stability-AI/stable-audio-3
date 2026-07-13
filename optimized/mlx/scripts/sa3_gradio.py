@@ -395,9 +395,26 @@ _JS_SCROLL_RESTORE = (
     "this.remove();")
 
 
-def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=False):
+def _ago(ts) -> str:
+    if not ts:
+        return ""
+    d = max(0.0, time.time() - ts)
+    if d < 10:
+        return "just now"
+    if d < 60:
+        return f"{int(d)}s ago"
+    if d < 3600:
+        return f"{int(d // 60)}m ago"
+    if d < 86400:
+        return f"{int(d // 3600)}h ago"
+    return f"{int(d // 86400)}d ago"
+
+
+def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=False,
+                  bg=None):
     """One self-contained player block: audio + caption + seekable spectrogram
-    with playhead. Global one-at-a-time playback via onplay pause-others."""
+    with playhead. Global one-at-a-time playback via onplay pause-others.
+    small: audio + spectrogram side by side (half width each), 'Xm ago' caption."""
     attrs = f'onplay="{_JS_PAUSE_OTHERS}" ontimeupdate="{_JS_PLAYHEAD}"'
     if autodl:
         js_name = entry["name"].replace("\\", "").replace("'", "\\'")
@@ -410,46 +427,54 @@ def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=Fal
     audio_el = (f'<audio controls {auto}style="width:100%" {attrs} '
                 f'src="data:{entry["mime"]};base64,{entry["b64"]}"></audio>')
     prompt_disp = html_lib.escape(entry["prompt"]) or "<i>(no prompt)</i>"
-    if small:
-        cap = (f'<div style="font-size:0.8em; margin:2px 0; color:#888">'
-               f'{prompt_disp} · seed {entry["seed"]} · <code>{html_lib.escape(entry["name"])}</code></div>')
-    else:
-        cap = (f'<div style="font-size:0.85em; margin:4px 0; color:#888">'
-               f'{entry["size_mb"]:.1f} MB · {entry["mode"]} · saved as '
-               f'<code>{html_lib.escape(entry["name"])}</code></div>')
-    spec = ""
+
+    spec_core = ""
     if entry.get("spec_b64"):
-        height = "height:64px;" if small else ""
-        spec = (f'<div style="position:relative; cursor:pointer" onclick="{_JS_SEEK}">'
-                f'<img src="data:image/png;base64,{entry["spec_b64"]}" '
-                f'style="width:100%; {height} display:block; image-rendering:pixelated; '
-                f'border:1px solid #333" alt="spectrogram"/>'
-                f'<div class="ph" style="position:absolute; top:0; bottom:0; left:0%; width:2px; '
-                f'background:#fff; pointer-events:none; box-shadow:0 0 4px rgba(0,0,0,.8)"></div>'
-                f'</div>')
-        if not small:
-            spec += ('<div style="font-size:0.75em; color:#666; margin-top:2px">'
-                     '3-band tinted stereo mel · red=bass / green=mid / blue=high · '
-                     'L top, R bottom · click to seek</div>')
-    style = "margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid #333;" if small else ""
-    return (f'<div class="blk" data-key="{entry["key"]}" style="{style}">'
+        height = "height:56px;" if small else ""
+        spec_core = (f'<div style="position:relative; cursor:pointer" onclick="{_JS_SEEK}">'
+                     f'<img src="data:image/png;base64,{entry["spec_b64"]}" '
+                     f'style="width:100%; {height} display:block; image-rendering:pixelated; '
+                     f'border:1px solid #333" alt="spectrogram"/>'
+                     f'<div class="ph" style="position:absolute; top:0; bottom:0; left:0%; '
+                     f'width:2px; background:#fff; pointer-events:none; '
+                     f'box-shadow:0 0 4px rgba(0,0,0,.8)"></div>'
+                     f'</div>')
+
+    if small:
+        row = (f'<div style="display:flex; gap:8px; align-items:center">'
+               f'<div style="flex:1; min-width:0">{audio_el}</div>'
+               f'<div style="flex:1; min-width:0">{spec_core}</div></div>')
+        cap = (f'<div style="font-size:0.8em; margin:2px 0; color:#888">'
+               f'{_ago(entry.get("ts"))} · {prompt_disp} · seed {entry["seed"]} · '
+               f'<code>{html_lib.escape(entry["name"])}</code></div>')
+        style = f"padding:6px 8px;{' background:' + bg + ';' if bg else ''}"
+        return (f'<div class="blk" data-key="{entry["key"]}" style="{style}">'
+                f'{row}{cap}</div>')
+
+    cap = (f'<div style="font-size:0.85em; margin:4px 0; color:#888">'
+           f'{entry["size_mb"]:.1f} MB · {entry["mode"]} · saved as '
+           f'<code>{html_lib.escape(entry["name"])}</code></div>')
+    spec = spec_core
+    if spec_core:
+        spec += ('<div style="font-size:0.75em; color:#666; margin-top:2px">'
+                 '3-band tinted stereo mel · red=bass / green=mid / blue=high · '
+                 'L top, R bottom · click to seek</div>')
+    return (f'<div class="blk" data-key="{entry["key"]}">'
             f'{audio_el}{cap}{spec}</div>')
 
 
 def render_history(hist):
     if not hist:
         return ""
-    items = "".join(render_player(e, small=True) for e in hist)
+    # zebra striping instead of separators: light grey on every other row
+    items = "".join(
+        render_player(e, small=True, bg="rgba(127,127,127,0.12)" if i % 2 else None)
+        for i, e in enumerate(hist))
     boot = f'<img src="data:," style="display:none" onerror="{_JS_SCROLL_RESTORE}"/>'
-    # darker grey box so the history reads as subdued background material
-    return (f'<div style="margin-top:14px; background:rgba(0,0,0,0.3); '
-            f'border:1px solid #2a2a2a; border-radius:8px; padding:10px 12px">'
-            f'<div style="font-weight:600; font-size:0.85em; color:#999">'
-            f'Previous generations ({len(hist)})</div>'
+    return (f'<div style="font-weight:600; margin-top:14px">Previous generations ({len(hist)})</div>'
             f'<div id="sa3-hist" onscroll="{_JS_SCROLL_RECORD}" '
-            f'style="max-height:480px; overflow-y:auto; position:relative; margin-top:8px; '
-            f'padding-right:6px; opacity:0.85">{boot}{items}</div>'
-            f'</div>')
+            f'style="max-height:480px; overflow-y:auto; position:relative; margin-top:6px; '
+            f'padding-right:6px">{boot}{items}</div>')
 
 
 def render_queue_status(entry=None, generating=False):
@@ -593,6 +618,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
 
         entry = {
             "key": f"k{time.time_ns()}",
+            "ts": time.time(),
             "b64": base64.b64encode(out_path.read_bytes()).decode("ascii"),
             "mime": mime,
             "name": out_path.name,

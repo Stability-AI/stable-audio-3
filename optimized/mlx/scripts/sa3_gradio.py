@@ -392,12 +392,15 @@ _JS_PLAYHEAD = ("var p=this.closest('.blk').querySelector('.ph');"
                 "if(p&&this.duration)p.style.left=(this.currentTime/this.duration*100)+'%';")
 # Main-player position ledger (for Hotswap): every timeupdate/play/pause stamps
 # the current position so a freshly swapped-in element can resume exactly there.
-# EVERY recorder is guarded on isConnected: when the old element is removed
-# during the swap, the browser fires a teardown pause AND a final timeupdate on
-# the detached element — either would overwrite the playing:true stamp and kill
-# the resume. Detached elements never get to write the ledger.
-_JS_POS_RECORD = ("if(this.isConnected){window._sa3Pos="
-                  "{t:this.currentTime,playing:!this.paused,ts:Date.now()};}")
+# Guards (all verified via CDP against the live page):
+#  - isConnected: teardown fires a pause AND a final timeupdate on the removed
+#    element — detached elements never write the ledger.
+#  - unresumed hotswap candidates (data-hs set, hsd not yet) don't write either:
+#    with autoplay, the NEW element's 'play' event fires BEFORE loadedmetadata
+#    and would stamp t≈0 over the old clip's position right before the resume
+#    handler reads it.
+_JS_POS_RECORD = ("if(this.isConnected&&!(this.dataset.hs==='1'&&!this.dataset.hsd))"
+                  "{window._sa3Pos={t:this.currentTime,playing:!this.paused,ts:Date.now()};}")
 # Hotswap resume: if the previous main audio was playing when this one arrived,
 # jump to its position (+ the split-second since the last stamp) and keep going;
 # beyond the new clip's duration -> start at zero. Guarded (hsd) so it applies
@@ -513,7 +516,10 @@ def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=Fal
     spec_core = ""
     if entry.get("spec_b64"):
         height = "height:56px;" if small else ""
-        spec_core = (f'<div style="position:relative; cursor:pointer" onclick="{_JS_SEEK}">'
+        tip = ("3-band tinted stereo mel · red=bass / green=mid / blue=high · "
+               "L top, R bottom · click to seek")
+        spec_core = (f'<div style="position:relative; cursor:pointer" title="{tip}" '
+                     f'onclick="{_JS_SEEK}">'
                      f'<img src="data:image/png;base64,{entry["spec_b64"]}" '
                      f'style="width:100%; {height} display:block; image-rendering:pixelated; '
                      f'border:1px solid #333" alt="spectrogram"/>'
@@ -533,13 +539,8 @@ def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=Fal
         return (f'<div class="blk" data-key="{entry["key"]}" style="{style}">'
                 f'{row}{cap}</div>')
 
-    spec = spec_core
-    if spec_core:
-        spec += ('<div style="font-size:0.75em; color:#666; margin-top:2px">'
-                 '3-band tinted stereo mel · red=bass / green=mid / blue=high · '
-                 'L top, R bottom · click to seek</div>')
     return (f'<div class="blk" data-key="{entry["key"]}">'
-            f'{audio_el}{spec}</div>')
+            f'{audio_el}{spec_core}</div>')
 
 
 def render_history(hist, advance=False, loop=False):
@@ -824,9 +825,6 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                                       value=default_steps, step=1)
                     cfg = gr.Slider(label="CFG", minimum=0.0, maximum=10.0,
                                     value=1.0, step=0.1)
-                generate_btn = gr.Button("Generate", variant="primary", size="lg",
-                                         elem_id="sa3-generate")
-                promote_btn = gr.Button("", elem_id="sa3-promote")   # CSS-hidden, DOM-present
 
                 with gr.Accordion("Advanced", open=False):
                     with gr.Row():
@@ -863,6 +861,9 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                         label="Format", visible=FFMPEG)
 
             with gr.Column(scale=2, elem_id="sa3-out"):
+                generate_btn = gr.Button("Generate", variant="primary", size="lg",
+                                         elem_id="sa3-generate")
+                promote_btn = gr.Button("", elem_id="sa3-promote")   # CSS-hidden, DOM-present
                 gr.Markdown("**Output**")
                 output_player = gr.HTML()
                 timing = gr.HTML()

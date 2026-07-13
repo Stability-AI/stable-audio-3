@@ -1,0 +1,4 @@
+# Extras for the gradio web UI (./sa3-gradio) — not needed by the CLI.
+gradio>=4.0
+pillow>=10.0
+soundfile>=0.12   # decode mp3/flac/24-bit/48kHz uploads without ffmpeg

@@ -392,12 +392,18 @@ _JS_PLAYHEAD = ("var p=this.closest('.blk').querySelector('.ph');"
 # Main-player position ledger (for Hotswap): every timeupdate/play/pause stamps
 # the current position so a freshly swapped-in element can resume exactly there.
 _JS_POS_RECORD = "window._sa3Pos={t:this.currentTime,playing:!this.paused,ts:Date.now()};"
+# Pause events also fire when the old element is REMOVED from the DOM during the
+# swap — that teardown-pause must not overwrite the playing:true stamp, or the
+# new element would think nothing was playing. Only record user pauses.
+_JS_POS_RECORD_PAUSE = f"if(this.isConnected){{{_JS_POS_RECORD}}}"
 # Hotswap resume: if the previous main audio was playing when this one arrived,
 # jump to its position (+ the split-second since the last stamp) and keep going;
-# beyond the new clip's duration -> start at zero.
-_JS_HOTSWAP = ("if(this.dataset.hs==='1'){var s=window._sa3Pos;"
+# beyond the new clip's duration -> start at zero. Guarded (hsd) so it applies
+# once, on whichever of loadedmetadata/canplay fires first.
+_JS_HOTSWAP = ("if(this.dataset.hs==='1'&&!this.dataset.hsd&&this.duration){"
+               "this.dataset.hsd=1;var s=window._sa3Pos;"
                "if(s&&s.playing){var tt=s.t+(Date.now()-s.ts)/1000;"
-               "this.currentTime=(this.duration&&tt<this.duration)?tt:0;this.play();}}")
+               "this.currentTime=(tt<this.duration)?tt:0;this.play();}}")
 _JS_SEEK = ("var a=this.closest('.blk').querySelector('audio');"
             "var r=this.getBoundingClientRect();"
             "if(a&&a.duration){a.currentTime=(event.clientX-r.left)/r.width*a.duration;a.play();}")
@@ -462,19 +468,25 @@ def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=Fal
     advance: on ended, hop to the next history item's audio (Auto-play).
     loop: native loop attribute — finished audio restarts (suppresses ended).
     hotswap: main slot only — resume at the previous clip's position on arrival."""
+    # assemble per-event handler bodies (a duplicated attribute name would
+    # silently drop one handler, so each event is emitted exactly once)
+    on_canplay = []
     if small:
         attrs = f'onplay="{_JS_PAUSE_OTHERS}" ontimeupdate="{_JS_PLAYHEAD}"'
     else:
         attrs = (f'onplay="{_JS_PAUSE_OTHERS}{_JS_POS_RECORD}" '
-                 f'onpause="{_JS_POS_RECORD}" '
+                 f'onpause="{_JS_POS_RECORD_PAUSE}" '
                  f'ontimeupdate="{_JS_PLAYHEAD}{_JS_POS_RECORD}"')
     if hotswap and not small:
         attrs += f' data-hs="1" onloadedmetadata="{_JS_HOTSWAP}"'
+        on_canplay.append(_JS_HOTSWAP)   # fallback if loadedmetadata already passed
     if autodl:
         js_name = entry["name"].replace("\\", "").replace("'", "\\'")
-        attrs += (' oncanplay="if(!this.dataset.dld){this.dataset.dld=1;'
-                  "var l=document.createElement('a');l.href=this.src;"
-                  f"l.download='{js_name}';l.click();}}\"")
+        on_canplay.append("if(!this.dataset.dld){this.dataset.dld=1;"
+                          "var l=document.createElement('a');l.href=this.src;"
+                          f"l.download='{js_name}';l.click();}}")
+    if on_canplay:
+        attrs += f' oncanplay="{"".join(on_canplay)}"'
     if loop:
         attrs += " loop"
     elif radio:

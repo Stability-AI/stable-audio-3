@@ -558,27 +558,27 @@ def _ago(ts) -> str:
     return f"{int(d // 86400)}d ago"
 
 
-def _lora_specs_from_ui(vals, notes):
+def _lora_specs_from_ui(vals, notes, num_steps):
     """Turn the 3 LoRA rows' flat values (file, strength, min, max)×3 into
-    lora_merge specs. Empty rows are skipped; half-sane inputs get a note and
-    the most permissive interpretation (never an error — matches the app's
-    permissive-by-design generation policy)."""
+    lora_merge specs. Empty rows are skipped; a min slider at 1 / max slider at
+    (or beyond) the schedule length mean 'from the start' / 'to the last step',
+    so a maxed-out range slider keeps meaning 'all steps' when Steps changes.
+    Half-sane inputs get a note and the most permissive interpretation (never
+    an error — matches the app's permissive-by-design generation policy)."""
     specs = []
     for i in range(3):
         path, strength, mn, mxx = vals[4 * i: 4 * i + 4]
         if not path:
             continue
-        mn = int(mn) if mn else None
-        mxx = int(mxx) if mxx else None
-        if mn is not None and mn < 1:
-            mn = 1
-        if mxx is not None and mxx < 1:
-            notes.append(f"LoRA {i + 1}: max step < 1 — treated as 'last step'")
-            mxx = None
+        mn = int(mn) if mn and int(mn) > 1 else None
+        mxx = int(mxx) if mxx and int(mxx) < num_steps else None
+        if mn is not None and mn > num_steps:
+            notes.append(f"LoRA {i + 1}: min step {mn} is beyond the "
+                         f"{num_steps}-step schedule — adapter inactive")
         if mn is not None and mxx is not None and mn > mxx:
             notes.append(f"LoRA {i + 1}: min step {mn} > max step {mxx} — adapter skipped")
             continue
-        steps = None if ((mn is None or mn == 1) and mxx is None) else (mn, mxx)
+        steps = None if (mn is None and mxx is None) else (mn, mxx)
         specs.append({"path": path, "strength": float(strength), "steps": steps})
     return specs or None
 
@@ -775,7 +775,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         # Permissive by design: a generation should succeed with whatever IS set.
         # Half-configured features are ignored with a visible note, never an error.
         notes = []
-        lora_specs = _lora_specs_from_ui(lora_vals, notes) if lora_vals else None
+        lora_specs = (_lora_specs_from_ui(lora_vals, notes, int(steps))
+                      if lora_vals else None)
         # blank or -1 → random seed, kept small (1-9999) for readability
         try:
             seed = int(seed_text.strip()) if seed_text and seed_text.strip() else -1
@@ -1031,29 +1032,37 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 with gr.Accordion("LoRA", open=False):
                     gr.Markdown(
                         "<span style='font-size:0.85em;color:#888'>"
-                        "Up to 3 adapters (.safetensors — SA3-native / underfit / "
-                        "PEFT), each with its own strength and 1-based inclusive "
-                        "sampling-step range (blank max = last step; skipping "
-                        "step 1 often helps). Adapters must be trained for the "
-                        "selected DiT model. Step-gated adapters are re-merged "
-                        "in place at step boundaries — no reload, no per-step "
-                        "cost.</span>")
-                    lora_inputs = []
+                        "Adapters (.safetensors — SA3-native / underfit / PEFT), "
+                        "each with its own strength and 1-based inclusive "
+                        "sampling-step range (max slider at the top = last "
+                        "step; skipping step 1 often helps). Adapters must be "
+                        "trained for the selected DiT model. Step-gated "
+                        "adapters are re-merged in place at step boundaries — "
+                        "no reload, no per-step cost.</span>")
+                    lora_inputs, lora_groups, lora_rm_btns = [], [], []
                     for _i in range(1, 4):
-                        with gr.Row():
-                            _lf = gr.File(label=f"LoRA {_i} (.safetensors)",
-                                          file_types=[".safetensors"],
-                                          type="filepath", scale=3, height=88)
-                            _ls = gr.Slider(label="Strength", minimum=0.0,
-                                            maximum=2.0, value=1.0, step=0.05,
-                                            scale=2)
-                            _ln = gr.Number(label="Min step", value=1,
-                                            precision=0, minimum=1, scale=1,
-                                            min_width=80)
-                            _lx = gr.Number(label="Max step (blank = last)",
-                                            value=None, precision=0, minimum=1,
-                                            scale=1, min_width=80)
+                        with gr.Group(visible=False) as _grp:
+                            with gr.Row():
+                                _lf = gr.File(label=f"LoRA {_i} (.safetensors)",
+                                              file_types=[".safetensors"],
+                                              type="filepath", scale=4, height=88)
+                                _ls = gr.Slider(label="strength", minimum=0.0,
+                                                maximum=10.0, value=1.0, step=0.1,
+                                                scale=3)
+                                _rm = gr.Button("✕ remove", size="sm", scale=0,
+                                                min_width=90)
+                            with gr.Row():
+                                _ln = gr.Slider(label="Min step", minimum=1,
+                                                maximum=default_steps, value=1,
+                                                step=1)
+                                _lx = gr.Slider(label="Max step", minimum=1,
+                                                maximum=default_steps,
+                                                value=default_steps, step=1)
+                        lora_groups.append(_grp)
+                        lora_rm_btns.append(_rm)
                         lora_inputs += [_lf, _ls, _ln, _lx]
+                    lora_add_btn = gr.Button("+ Add LoRA", size="sm")
+                    lora_vis = gr.State([False, False, False])
 
                 with gr.Accordion("Audio-to-audio (guide the whole clip)", open=False):
                     a2a_audio = gr.Audio(label="Guide audio — generation starts from its latents",
@@ -1111,6 +1120,39 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
             return gr.update(), opts
         output_opts.change(on_opts_change, inputs=[output_opts, opts_state],
                            outputs=[output_opts, opts_state])
+
+        def lora_add(vis):
+            """Reveal the first hidden LoRA row; hide the button at 3/3."""
+            vis = list(vis)
+            for i, v in enumerate(vis):
+                if not v:
+                    vis[i] = True
+                    break
+            return ([gr.update(visible=v) for v in vis]
+                    + [gr.update(visible=not all(vis)), vis])
+        lora_add_btn.click(lora_add, inputs=[lora_vis],
+                           outputs=lora_groups + [lora_add_btn, lora_vis])
+
+        def _lora_remove(idx):
+            def _rm(vis, cur_steps):
+                vis = list(vis)
+                vis[idx] = False
+                return ([gr.update(visible=v) for v in vis]
+                        + [gr.update(visible=True), vis,
+                           None, 1.0, 1, int(cur_steps)])  # reset the row
+            _rm.__name__ = f"lora_remove_{idx + 1}"
+            return _rm
+        for _idx, _btn in enumerate(lora_rm_btns):
+            _btn.click(_lora_remove(_idx), inputs=[lora_vis, steps],
+                       outputs=lora_groups + [lora_add_btn, lora_vis]
+                       + lora_inputs[4 * _idx: 4 * _idx + 4])
+
+        def on_steps_change(s):
+            # keep the 6 step-range sliders bounded by the schedule length
+            return [gr.update(maximum=int(s))] * 6
+        steps.change(on_steps_change, inputs=[steps],
+                     outputs=[c for i in range(3)
+                              for c in lora_inputs[4 * i + 2: 4 * i + 4]])
 
         ctrl_inputs = [dit_dd, decoder_dd, prompt, negative_prompt,
                        seconds, steps, seed, cfg, apg, sigma_global,

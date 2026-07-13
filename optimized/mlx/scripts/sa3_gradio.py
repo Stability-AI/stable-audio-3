@@ -145,6 +145,11 @@ _dit_lru: list[tuple[str, int]] = []
 _DIT_CACHE_MAX = 2
 _dec_cache: dict[str, tuple] = {}                        # decoder -> (model, chunk_fn, chunk_cfg)
 _enc_cache: dict[str, tuple] = {}                        # decoder -> (model, pad_modulo)
+# Encoded-latent cache: rerunning a2a/inpainting with the same input audio skips
+# the encoder entirely. Keyed on the file's CONTENT hash (gradio re-uploads get
+# fresh temp paths) + encoder + latent length; values are ~160 KB fp32 arrays.
+_latent_cache: dict[tuple, np.ndarray] = {}
+_LATENT_CACHE_MAX = 32
 
 
 def get_t5() -> T5Gemma:
@@ -243,8 +248,15 @@ def run_generation(dit_name: str, decoder_name: str, prompt: str,
     mx.eval(cross_attn, global_cond)
     t["cond_ms"] = (time.time() - t0) * 1000
 
-    # 3a. encode the provided audio inputs → latents (each is optional)
+    # 3a. encode the provided audio inputs → latents (each is optional).
+    # Latents are memoized by (file content, encoder, T_lat) so re-running
+    # a2a/inpainting with the same input audio skips the encoder.
     def encode_audio(path):
+        import hashlib
+        ck = (hashlib.sha1(Path(path).read_bytes()).hexdigest(), decoder_name, T_lat)
+        if ck in _latent_cache:
+            t["enc_cached"] = t.get("enc_cached", 0) + 1
+            return mx.array(_latent_cache[ck]).astype(dtype)
         enc_model, pad_mod = get_encoder(decoder_name)
         enc_T_lat = T_lat
         if (T_lat * 16) % pad_mod != 0:
@@ -258,6 +270,9 @@ def run_generation(dit_name: str, decoder_name: str, prompt: str,
         patches_np = patch_audio(audio_np[None, ...], patch_size=256)
         lat = enc_model(mx.array(patches_np))[..., :T_lat]
         mx.eval(lat)
+        while len(_latent_cache) >= _LATENT_CACHE_MAX:
+            _latent_cache.pop(next(iter(_latent_cache)))
+        _latent_cache[ck] = np.array(lat.astype(mx.float32))
         return lat.astype(dtype)
 
     a2a_latents = None      # start-point guide (whole clip)
@@ -630,7 +645,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
 
         load_note = (f"DiT-load {t['dit_load_ms']:.0f} ms ·&nbsp; "
                      if t.get("dit_load_ms", 0) > 100 else "")
-        enc_note = f"encode {t['enc_ms']:.0f} ms ·&nbsp; " if t.get("enc_ms") else ""
+        cached_tag = " (cached)" if t.get("enc_cached") else ""
+        enc_note = f"encode {t['enc_ms']:.0f} ms{cached_tag} ·&nbsp; " if t.get("enc_ms") else ""
         apg_note = f" (apg {apg:g})" if apg != 1.0 else ""
         cfg_note = f"cfg {cfg:g}{apg_note} ·&nbsp; " if cfg != 1.0 else ""
         timing_html = (

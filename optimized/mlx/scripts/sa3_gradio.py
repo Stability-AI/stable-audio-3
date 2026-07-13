@@ -389,6 +389,15 @@ _JS_PAUSE_OTHERS = ("var t=this;document.querySelectorAll('audio').forEach("
                     "function(o){if(o!==t)o.pause();});")
 _JS_PLAYHEAD = ("var p=this.closest('.blk').querySelector('.ph');"
                 "if(p&&this.duration)p.style.left=(this.currentTime/this.duration*100)+'%';")
+# Main-player position ledger (for Hotswap): every timeupdate/play/pause stamps
+# the current position so a freshly swapped-in element can resume exactly there.
+_JS_POS_RECORD = "window._sa3Pos={t:this.currentTime,playing:!this.paused,ts:Date.now()};"
+# Hotswap resume: if the previous main audio was playing when this one arrived,
+# jump to its position (+ the split-second since the last stamp) and keep going;
+# beyond the new clip's duration -> start at zero.
+_JS_HOTSWAP = ("if(this.dataset.hs==='1'){var s=window._sa3Pos;"
+               "if(s&&s.playing){var tt=s.t+(Date.now()-s.ts)/1000;"
+               "this.currentTime=(this.duration&&tt<this.duration)?tt:0;this.play();}}")
 _JS_SEEK = ("var a=this.closest('.blk').querySelector('audio');"
             "var r=this.getBoundingClientRect();"
             "if(a&&a.duration){a.currentTime=(event.clientX-r.left)/r.width*a.duration;a.play();}")
@@ -446,18 +455,29 @@ def _meta_suffix(entry) -> str:
 
 
 def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=False,
-                  bg=None, advance=False):
+                  bg=None, advance=False, loop=False, hotswap=False):
     """One self-contained player block: audio + caption + seekable spectrogram
     with playhead. Global one-at-a-time playback via onplay pause-others.
     small: audio + spectrogram side by side (half width each), 'Xm ago' caption.
-    advance: on ended, hop to the next history item's audio (Auto-play)."""
-    attrs = f'onplay="{_JS_PAUSE_OTHERS}" ontimeupdate="{_JS_PLAYHEAD}"'
+    advance: on ended, hop to the next history item's audio (Auto-play).
+    loop: native loop attribute — finished audio restarts (suppresses ended).
+    hotswap: main slot only — resume at the previous clip's position on arrival."""
+    if small:
+        attrs = f'onplay="{_JS_PAUSE_OTHERS}" ontimeupdate="{_JS_PLAYHEAD}"'
+    else:
+        attrs = (f'onplay="{_JS_PAUSE_OTHERS}{_JS_POS_RECORD}" '
+                 f'onpause="{_JS_POS_RECORD}" '
+                 f'ontimeupdate="{_JS_PLAYHEAD}{_JS_POS_RECORD}"')
+    if hotswap and not small:
+        attrs += f' data-hs="1" onloadedmetadata="{_JS_HOTSWAP}"'
     if autodl:
         js_name = entry["name"].replace("\\", "").replace("'", "\\'")
         attrs += (' oncanplay="if(!this.dataset.dld){this.dataset.dld=1;'
                   "var l=document.createElement('a');l.href=this.src;"
                   f"l.download='{js_name}';l.click();}}\"")
-    if radio:
+    if loop:
+        attrs += " loop"
+    elif radio:
         attrs += f' onended="{_JS_PROMOTE}"'
     elif advance:
         attrs += (' onended="var b=this.closest(\'.blk\');'
@@ -504,12 +524,12 @@ def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=Fal
             f'{audio_el}{cap}{spec}</div>')
 
 
-def render_history(hist, advance=False):
+def render_history(hist, advance=False, loop=False):
     if not hist:
         return ""
     # zebra striping instead of separators: light grey vs medium grey rows
     items = "".join(
-        render_player(e, small=True, advance=advance,
+        render_player(e, small=True, advance=advance, loop=loop,
                       bg="rgba(127,127,127,0.24)" if i % 2 else "rgba(127,127,127,0.08)")
         for i, e in enumerate(hist))
     boot = f'<img src="data:," style="display:none" onerror="{_JS_SCROLL_RESTORE}"/>'
@@ -685,12 +705,15 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         if state["current"] is not None:
             state["history"].insert(0, state["current"])
         state["current"] = entry
+        loop = "Loop" in opts
         main = render_player(entry,
                              autoplay=force_autoplay or "Auto-play" in opts,
                              autodl="Auto-download" in opts,
-                             radio="Infinite Radio" in opts)
+                             radio="Infinite Radio" in opts and not loop,
+                             loop=loop,
+                             hotswap="Hotswap" in opts)
         return (main, entry["timing"], "",
-                render_history(state["history"], advance="Auto-play" in opts),
+                render_history(state["history"], advance="Auto-play" in opts, loop=loop),
                 queued_panel, state)
 
     def generate(dit_name, decoder_name, prompt, negative_prompt,
@@ -812,8 +835,9 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
 
                 with gr.Accordion("Output", open=False):
                     output_opts = gr.CheckboxGroup(
-                        ["Auto-play", "Auto-download", "Infinite Radio"],
+                        ["Auto-play", "Auto-download", "Infinite Radio", "Loop", "Hotswap"],
                         value=["Auto-play"], label="Options")
+                    opts_state = gr.State(["Auto-play"])
                     file_format = gr.Radio(
                         [FORMAT_MP3, FORMAT_WAV] if FFMPEG else [FORMAT_WAV],
                         value=FORMAT_MP3 if FFMPEG else FORMAT_WAV,
@@ -833,6 +857,19 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         def on_seconds_change(sec):
             return gr.update(maximum=sec), gr.update(maximum=sec)
         seconds.change(on_seconds_change, inputs=[seconds], outputs=[inp_start, inp_end])
+
+        def on_opts_change(opts, prev):
+            """Loop and Infinite Radio are mutually exclusive — the one just
+            ticked wins, the other unticks."""
+            opts = opts or []
+            if "Loop" in opts and "Infinite Radio" in opts:
+                added = set(opts) - set(prev or [])
+                drop = "Infinite Radio" if "Loop" in added else "Loop"
+                opts = [o for o in opts if o != drop]
+                return gr.update(value=opts), opts
+            return gr.update(), opts
+        output_opts.change(on_opts_change, inputs=[output_opts, opts_state],
+                           outputs=[output_opts, opts_state])
 
         ctrl_inputs = [dit_dd, decoder_dd, prompt, negative_prompt,
                        seconds, steps, seed, cfg, apg, sigma_global,

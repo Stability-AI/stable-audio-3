@@ -170,7 +170,7 @@ def prompt_user_if_missing(args):
     return args
 
 
-def load_dit(dit_name: str, T_lat: int, dtype, lora_paths=None, lora_strength=1.0):
+def load_dit(dit_name: str, T_lat: int, dtype, lora_specs=None, num_steps=None):
     cfg = DIT_CHOICES[dit_name]
     ckpt = ensure_local(cfg["ckpt"])
     import importlib, io, contextlib
@@ -180,7 +180,7 @@ def load_dit(dit_name: str, T_lat: int, dtype, lora_paths=None, lora_strength=1.
     lora_log = lambda m: print(m, file=sys.stderr)
     with contextlib.redirect_stdout(io.StringIO()):
         model = mod.load_dit(str(ckpt), T_lat=T_lat, dtype=dtype, compile_=False,
-                             lora_paths=lora_paths, lora_strength=lora_strength,
+                             lora_specs=lora_specs, num_steps=num_steps,
                              lora_log=lora_log)
     return model, str(ckpt)
 
@@ -392,16 +392,24 @@ def main():
                     help="Path to the bundled T5Gemma FP16 .npz (weights + tokenizer). "
                          "Default points at models/mlx/t5gemma_f16.npz next to this script; "
                          "auto-downloaded from HuggingFace if not present.")
-    ap.add_argument("--lora", nargs="+", default=None, metavar="ADAPTER",
-                    help="One or more LoRA adapters to merge into the DiT at load time. "
-                         "Each is a .safetensors file (SA3-native train_lora.py output) or a "
-                         "PEFT adapter directory/.safetensors (with its adapter_config.json). "
-                         "ONLY .safetensors is accepted — a pickle .ckpt/.pt is refused (it "
-                         "would execute code on load). The adapter's base must match --dit "
-                         "(e.g. a medium adapter with --dit medium).")
+    ap.add_argument("--lora", action="append", nargs="+", default=None,
+                    metavar=("ADAPTER", "KEY=VAL"),
+                    help="A LoRA adapter to apply to the DiT — repeat the flag for several. "
+                         "Each --lora takes the adapter path followed by optional key=value "
+                         "options: strength=S (default --lora-strength) and steps=RANGE, a "
+                         "1-based inclusive sampling-step range: 2-8, 2- (2..last), -4 (1..4) "
+                         "or 3 (just step 3; default: all steps). Example: "
+                         "--lora plini.safetensors strength=0.8 steps=2- . Adapters covering "
+                         "every step are merged at load; step-gated ones are re-merged in "
+                         "place at the (few) step boundaries — ~80 ms each on medium, no "
+                         "extra memory, every step runs at full speed. The adapter is a "
+                         ".safetensors file (SA3-native train_lora.py / underfit output) or "
+                         "a PEFT adapter directory (with its adapter_config.json). ONLY "
+                         ".safetensors is accepted — a pickle .ckpt/.pt is refused (it would "
+                         "execute code on load). The adapter's base must match --dit.")
     ap.add_argument("--lora-strength", type=float, default=1.0,
-                    help="Application weight for every --lora delta (default 1.0). 0 disables "
-                         "the adapter (bit-identical to no LoRA); >1 amplifies it.")
+                    help="Default strength for --lora adapters without their own strength= "
+                         "(default 1.0). 0 disables (bit-identical to no LoRA); >1 amplifies.")
 
     # ── Sampling ──────────────────────────────────────────────────────────────
     ap.add_argument("--seconds", type=float, default=30.0,
@@ -463,6 +471,16 @@ def main():
     args = ap.parse_args()
     if args.steps < 1:
         ap.error(f"--steps must be ≥ 1 (got {args.steps})")
+
+    # Parse --lora groups into specs (fail fast, before any model loads).
+    args.lora_specs = None
+    if args.lora:
+        from models.defs.lora_merge import parse_lora_spec, LoraError
+        try:
+            args.lora_specs = [parse_lora_spec(toks, args.lora_strength)
+                               for toks in args.lora]
+        except LoraError as e:
+            ap.error(str(e))
 
     args = prompt_user_if_missing(args)
     if args.prompt is None:
@@ -578,6 +596,16 @@ def main():
     t0 = time.time()
     padding_emb, secs_embedder = load_conditioner_from_npz(
         str(ensure_local(DIT_CHOICES[args.dit]["ckpt"])), prefix="cond.")
+    if args.lora_specs:
+        # The conditioner is loaded straight from the npz, so the DiT-side merge
+        # never reaches it — apply any seconds-conditioner deltas (underfit
+        # adapters carry one) to the live embedder here. Whole-generation:
+        # conditioning runs once, before sampling, so steps= cannot gate it.
+        from models.defs.lora_merge import apply_conditioner_lora
+        secs_embedder.W, _n_cond = apply_conditioner_lora(secs_embedder.W,
+                                                          args.lora_specs)
+        if _n_cond:
+            sub(f"lora  conditioner delta applied ({_n_cond} adapter(s), whole generation)")
     embeds = embeds.astype(dtype)
     embeds_padded = apply_prompt_padding(embeds, mask, padding_emb.astype(dtype))
     seconds_embed = secs_embedder(args.seconds).astype(dtype)              # (1, 1, 768)
@@ -653,11 +681,15 @@ def main():
 
     # ── 3b. DiT pingpong sampling ──
     stage("[3/5]", f"DiT — load + sample ({args.steps} steps, σmax={sigma_max:.2f})")
-    if args.lora:
-        sub(f"lora  {', '.join(os.path.basename(p.rstrip('/')) for p in args.lora)}  "
-            f"(strength {args.lora_strength:g})")
+    if args.lora_specs:
+        for s in args.lora_specs:
+            rng = s["steps"]
+            rng_str = ("all steps" if rng is None else
+                       f"steps {rng[0] or 1}-{rng[1] if rng[1] is not None else args.steps}")
+            sub(f"lora  {os.path.basename(s['path'].rstrip('/'))}  "
+                f"(strength {s['strength']:g}, {rng_str})")
     t0 = time.time(); dit_model, _ = load_dit(args.dit, T_lat=T_lat, dtype=dtype,
-                                              lora_paths=args.lora, lora_strength=args.lora_strength)
+                                              lora_specs=args.lora_specs, num_steps=args.steps)
     _stage_peak_b('DiT load')
     sub(f"load {time.time()-t0:.1f}s")
 
@@ -746,8 +778,10 @@ def main():
         sys.stdout.flush()
 
     t0 = time.time()
+    _lora_plan = getattr(dit_model, "_lora_plan", None)
     latents = sample_flow_pingpong(model_fn, noise, sigmas, seed=args.seed + 1,
-                                    paste_back=paste_back, on_step=_on_step)
+                                    paste_back=paste_back, on_step=_on_step,
+                                    before_step=_lora_plan.sync if _lora_plan else None)
     mx.eval(latents)
     sample_ms = (time.time()-t0)*1000
     # Clear the progress line, then print the final summary in its place.

@@ -236,6 +236,170 @@ def test_underfit_wrapper_prefixes():
         "transformer.layers.3.to_local_embed.seq.0.weight"
 
 
+def test_lora_spec_parser():
+    s = lm.parse_lora_spec(["a.safetensors"], default_strength=0.5)
+    assert s == {"path": "a.safetensors", "strength": 0.5, "steps": None}
+    s = lm.parse_lora_spec(["a.safetensors", "strength=0.8", "steps=2-8"])
+    assert s["strength"] == 0.8 and s["steps"] == (2, 8)
+    assert lm.parse_lora_spec(["a", "steps=2-"])["steps"] == (2, None)
+    assert lm.parse_lora_spec(["a", "steps=-4"])["steps"] == (None, 4)
+    assert lm.parse_lora_spec(["a", "steps=3"])["steps"] == (3, 3)
+    for bad in (["a.st", "b.st"],            # two paths in one flag
+                ["a", "steps=8-2"],          # min > max
+                ["a", "steps=0-3"],          # 1-based
+                ["a", "steps=-"],            # empty range
+                ["a", "strength=loud"],      # not a float
+                []):
+        try:
+            lm.parse_lora_spec(bad)
+            assert False, f"should have rejected {bad}"
+        except lm.LoraError:
+            pass
+    # resolve against an 8-step schedule (0-based inclusive out)
+    assert lm.resolve_steps(None, 8) == (0, 7)
+    assert lm.resolve_steps((2, 8), 8) == (1, 7)
+    assert lm.resolve_steps((2, None), 8) == (1, 7)
+    assert lm.resolve_steps((None, 4), 8) == (0, 3)
+    assert lm.resolve_steps((2, 99), 8) == (1, 7)      # clamp
+    assert lm.resolve_steps((9, None), 8) is None      # misses the schedule
+
+
+class _StubModule:
+    """Bare object with .weight — stands in for nn.Linear in plan tests."""
+    def __init__(self, w):
+        self.weight = w
+
+
+def _stub_tree(weights):
+    """Build a walkable module tree for keys like 'foo.weight' and
+    'layers.0.lin.weight' (digits = list containers, as in the DiT)."""
+    class _NS:  # namespace node
+        pass
+    root = _NS()
+    for key, w in weights.items():
+        parts = key.split(".")[:-1]          # drop trailing 'weight'
+        obj = root
+        for j, p in enumerate(parts[:-1]):
+            nxt = parts[j + 1]
+            if p.isdigit():
+                obj = obj[int(p)]
+            else:
+                if not hasattr(obj, p):
+                    setattr(obj, p, [] if nxt.isdigit() else _NS())
+                obj = getattr(obj, p)
+            if isinstance(obj, list) and nxt.isdigit():
+                while len(obj) <= int(nxt):
+                    obj.append(_NS())
+        last = parts[-1]
+        mod = _StubModule(w)
+        if last.isdigit():
+            obj[int(last)] = mod
+        else:
+            setattr(obj, last, mod)
+    return root
+
+
+def test_step_plan_matches_reference():
+    """For every adapter type: gate two overlapping adapters across an 8-step
+    schedule and check the in-place weights at EVERY step against the from-
+    scratch reference W0 + Σ_active strength·(merged − W0)."""
+    num_steps = 8
+    K1, K2 = "foo.weight", "layers.0.lin.weight"
+    W = {K1: rng.standard_normal((6, 8)).astype(np.float32),
+         K2: rng.standard_normal((5, 7)).astype(np.float32)}
+    with tempfile.TemporaryDirectory() as tmp:
+        for atype in lm._PARAMS_FOR:
+            p1 = os.path.join(tmp, f"{atype}-1.safetensors")
+            p2 = os.path.join(tmp, f"{atype}-2.safetensors")
+            prm = {k: _init_params(atype, w, 3, nonzero=True) for k, w in W.items()}
+            d = {}
+            for k, w in W.items():
+                layer = k[: -len(".weight")]
+                for pk, pv in prm[k].items():
+                    d[f"{layer}.parametrizations.weight.0.{pk}"] = mx.array(pv)
+            mx.save_safetensors(p1, d, metadata={"lora_config": json.dumps(
+                {"adapter_type": atype, "rank": 3, "alpha": 3})})
+            prm2 = {K1: _init_params("lora", W[K1], 3, nonzero=True)}
+            d2 = {f"foo.parametrizations.weight.0.{pk}": mx.array(pv)
+                  for pk, pv in prm2[K1].items()}
+            mx.save_safetensors(p2, d2, metadata={"lora_config": json.dumps(
+                {"adapter_type": "lora", "rank": 3, "alpha": 3})})
+
+            specs = [{"path": p1, "strength": 0.7, "steps": (2, 5)},
+                     {"path": p2, "strength": 1.3, "steps": (4, None)}]
+            weights = {k: mx.array(w) for k, w in W.items()}
+            plan = lm.prepare_loras(weights, specs, num_steps=num_steps)
+            assert plan is not None and len(plan.layers) == 2
+
+            model = _stub_tree(weights)
+            plan.attach(model)
+            mods = {K1: model.foo, K2: model.layers[0].lin}
+
+            def ref(i):
+                out = {k: W[k].copy() for k in W}
+                if 1 <= i <= 4:  # adapter 1 (steps 2-5, 0-based 1..4)
+                    for k in W:
+                        m = lm._merged_weight(W[k], prm[k], atype, 1.0)
+                        out[k] += 0.7 * (m - W[k])
+                if i >= 3:       # adapter 2 (steps 4-, 0-based 3..7)
+                    m = lm._merged_weight(W[K1], prm2[K1], "lora", 1.0)
+                    out[K1] += 1.3 * (m - W[K1])
+                return out
+
+            for i in range(num_steps):
+                plan.sync(i)
+                expect = ref(i)
+                for k in W:
+                    got = _np(mods[k].weight)
+                    err = np.abs(got - expect[k]).max()
+                    assert err < 1e-3, f"{atype} step {i} {k}: max|d|={err:.2e}"
+
+
+def test_step_plan_round_trip_drift():
+    """50 on/off gating cycles on fp16 weights must not accumulate drift
+    (exact-inverse pairing — measured frozen-after-cycle-1 in the design
+    benchmarks; this guards the implementation)."""
+    K = "foo.weight"
+    W0 = rng.standard_normal((32, 48)).astype(np.float16)
+    prm = _init_params("dora-rows", W0.astype(np.float32), 4, nonzero=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "d.safetensors")
+        _save_native(path, "foo", prm, {"adapter_type": "dora-rows", "rank": 4, "alpha": 4})
+        weights = {K: mx.array(W0)}
+        plan = lm.prepare_loras(weights, [{"path": path, "strength": 1.0,
+                                           "steps": (2, None)}], num_steps=2)
+        model = _stub_tree(weights)
+        plan.attach(model)
+        drift1 = None
+        for cyc in range(50):
+            plan.sync(1)   # on
+            plan.sync(0)   # off
+            d = np.abs(_np(model.foo.weight) - W0.astype(np.float32)).max()
+            if cyc == 0:
+                drift1 = d
+        assert d <= drift1 + 1e-6, f"drift grew: cycle1 {drift1:.2e} → cycle50 {d:.2e}"
+        rel = (np.linalg.norm(_np(model.foo.weight) - W0.astype(np.float32))
+               / np.linalg.norm(W0.astype(np.float32)))
+        assert rel < 5e-3, f"round-trip rel drift {rel:.2e}"
+
+
+def test_full_interval_uses_merge_path():
+    """Specs without steps= (or covering every step) → no plan; weights match
+    the plain merge_loras_into_weights result exactly."""
+    W0 = rng.standard_normal((6, 8)).astype(np.float32)
+    prm = _init_params("lora", W0, 4, nonzero=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "l.safetensors")
+        _save_native(path, "foo", prm, {"adapter_type": "lora", "rank": 4, "alpha": 4})
+        wa = {"foo.weight": mx.array(W0)}
+        wb = {"foo.weight": mx.array(W0)}
+        plan = lm.prepare_loras(wa, [{"path": path, "strength": 0.6,
+                                      "steps": (1, 8)}], num_steps=8)
+        assert plan is None
+        lm.merge_loras_into_weights(wb, [path], strength=0.6)
+        assert np.array_equal(_np(wa["foo.weight"]), _np(wb["foo.weight"]))
+
+
 def _main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = []

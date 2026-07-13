@@ -410,6 +410,23 @@ def _ago(ts) -> str:
     return f"{int(d // 86400)}d ago"
 
 
+def _meta_suffix(entry) -> str:
+    """' · cfg 1.5 · smx 0.92 · audio2audio · inpainting' — only the non-defaults."""
+    parts = []
+    cfg = entry.get("cfg", 1.0)
+    smx = entry.get("smx", 1.0)
+    if cfg != 1.0:
+        parts.append(f"cfg {cfg:g}")
+    if smx != 1.0:
+        parts.append(f"smx {smx:g}")
+    mode = entry.get("mode", "")
+    if "a2a" in mode or mode == "audio-to-audio":
+        parts.append("audio2audio")
+    if "inpaint" in mode:
+        parts.append("inpainting")
+    return "".join(f" · {p}" for p in parts)
+
+
 def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=False,
                   bg=None, advance=False):
     """One self-contained player block: audio + caption + seekable spectrogram
@@ -451,7 +468,8 @@ def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=Fal
                f'<div style="flex:1; min-width:0">{audio_el}</div>'
                f'<div style="flex:1; min-width:0">{spec_core}</div></div>')
         cap = (f'<div style="font-size:0.8em; margin:2px 0; color:#888">'
-               f'{_ago(entry.get("ts"))} · {prompt_disp} · seed {entry["seed"]}</div>')
+               f'{_ago(entry.get("ts"))} · {prompt_disp} · seed {entry["seed"]}'
+               f'{_meta_suffix(entry)}</div>')
         style = f"padding:6px 8px;{' background:' + bg + ';' if bg else ''}"
         return (f'<div class="blk" data-key="{entry["key"]}" style="{style}">'
                 f'{row}{cap}</div>')
@@ -490,7 +508,7 @@ def render_queue_status(entry=None, generating=False):
         body = "generating…"
     elif entry is not None:
         p = html_lib.escape(entry["prompt"]) or "<i>(no prompt)</i>"
-        body = f"ready — {p} · seed {entry['seed']}"
+        body = f"ready — {p} · seed {entry['seed']}{_meta_suffix(entry)}"
     else:
         return ""
     return (f'<div style="margin-top:2px; color:#888; font-size:0.85em; opacity:0.7">'
@@ -625,6 +643,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         entry = {
             "key": f"k{time.time_ns()}",
             "ts": time.time(),
+            "cfg": float(cfg),
+            "smx": float(sigma_max),
             "b64": base64.b64encode(out_path.read_bytes()).decode("ascii"),
             "mime": mime,
             "name": out_path.name,

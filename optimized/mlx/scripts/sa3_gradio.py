@@ -743,8 +743,11 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                     decoder_dd = gr.Dropdown(label="Decoder (codec)",
                                              choices=list(DECODER_CHOICES.keys()),
                                              value=initial_decoder, scale=1)
-                prompt = gr.Textbox(label="Prompt", lines=2,
-                                    placeholder="e.g. 'Impending tribal, epic orchestral buildup'")
+                with gr.Row():
+                    prompt = gr.Textbox(label="Prompt", lines=2, scale=6,
+                                        placeholder="e.g. 'Impending tribal, epic orchestral buildup'")
+                    seed = gr.Textbox(label="Seed (optional)", max_lines=1, value="",
+                                      scale=1, min_width=80)
                 with gr.Row():
                     seconds = gr.Slider(label="Seconds", minimum=1,
                                         maximum=MAX_SECONDS.get(initial_dit, 120),
@@ -753,8 +756,6 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                                       value=default_steps, step=1)
                     cfg = gr.Slider(label="CFG", minimum=0.0, maximum=10.0,
                                     value=1.0, step=0.1)
-                seed = gr.Textbox(label="Seed (optional, blank = random)",
-                                  max_lines=1, value="")
                 generate_btn = gr.Button("Generate", variant="primary", size="lg",
                                          elem_id="sa3-generate")
                 promote_btn = gr.Button("", elem_id="sa3-promote")   # CSS-hidden, DOM-present

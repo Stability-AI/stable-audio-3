@@ -450,6 +450,9 @@ def _meta_suffix(entry) -> str:
     smx = entry.get("smx", 1.0)
     mode = entry.get("mode", "")
     is_a2a = "a2a" in mode or mode == "audio-to-audio"
+    dit = entry.get("dit", "")
+    if dit:
+        parts.append({"medium": "med", "sm-music": "sm-mus", "sm-sfx": "sm-sfx"}.get(dit, dit))
     if cfg != 1.0:
         parts.append(f"cfg {cfg:g}")
     if smx != 1.0:
@@ -698,6 +701,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         entry = {
             "key": f"k{time.time_ns()}",
             "ts": time.time(),
+            "dit": dit_name,
             "cfg": float(cfg),
             "smx": float(sigma_max),
             "b64": base64.b64encode(out_path.read_bytes()).decode("ascii"),

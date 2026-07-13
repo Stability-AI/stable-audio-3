@@ -27,8 +27,10 @@ Launch:
 from __future__ import annotations
 import argparse
 import base64
+import copy
 import html as html_lib
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -56,6 +58,10 @@ from models.defs.sa3_pipeline import (  # noqa: E402
     apply_prompt_padding, build_pingpong_schedule, sample_flow_pingpong,
     patched_decode, load_conditioner_from_npz,
 )
+from models.defs.lora_merge import (  # noqa: E402
+    prepare_loras, apply_conditioner_lora, LoraError,
+)
+from mlx.utils import tree_flatten  # noqa: E402
 from models.defs.t5gemma_mlx import T5Gemma  # noqa: E402
 from weights import ensure_local  # noqa: E402
 from spec import render_spectrogram_png  # noqa: E402
@@ -167,23 +173,78 @@ def get_conditioner(dit_name: str):
     return _cond_cache[dit_name]
 
 
-def get_dit(dit_name: str, T_lat: int, dtype):
+def _lora_sig(specs, num_steps: int) -> tuple:
+    """Identity of a LoRA config on a cached DiT: file (path+mtime+size —
+    gradio temp uploads keep their path within a session), strength, raw step
+    range, and the schedule length (the plan's step sets depend on it)."""
+    if not specs:
+        return ()
+    sig = []
+    for s in specs:
+        st = os.stat(s["path"])
+        sig.append((s["path"], st.st_mtime_ns, st.st_size,
+                    float(s["strength"]), s["steps"], int(num_steps)))
+    return tuple(sig)
+
+
+def _reconcile_lora(model, dit_name: str, specs, num_steps: int) -> None:
+    """Apply / replace / remove the LoRA config on a cached base DiT, in place.
+
+    A cached model always carries base weights + its current LoraStepPlan
+    state. Changing config = exact-inverse clear back to base, then a fresh
+    plan built from the live module weights (gate_all=True — a permanent merge
+    couldn't be undone in place). One boundary transition each way (~26/80 ms),
+    so tweaking strength or step ranges between generations never reloads the
+    DiT. Same config → no-op (before_step(0) rewinds the plan every run)."""
+    sig = _lora_sig(specs, num_steps)
+    if sig == getattr(model, "_gr_lora_sig", ()):
+        return
+    old = getattr(model, "_lora_plan", None)
+    if old is not None:
+        old.clear()
+    model._lora_plan, model._gr_lora_sig = None, ()
+    if not specs:
+        return
+    wd_view = dict(tree_flatten(model.parameters()))
+    try:
+        plan = prepare_loras(wd_view, specs, num_steps=num_steps,
+                             log=lambda m: print(f"  {m}"), gate_all=True)
+    except LoraError as e:
+        raise LoraError(f"{e} — selected model: {dit_name}") from None
+    if plan is None:
+        return
+    plan.attach(model)
+    # prepare_loras applied the step-1 state to the DICT slots (fp32) — point
+    # the live modules at the new arrays, in the model dtype.
+    swaps = []
+    for lkey, mod in plan.mods.items():
+        if wd_view[lkey] is not mod.weight:
+            mod.weight = wd_view[lkey].astype(mod.weight.dtype)
+            swaps.append(mod.weight)
+    if swaps:
+        mx.eval(swaps)
+    model._lora_plan, model._gr_lora_sig = plan, sig
+
+
+def get_dit(dit_name: str, T_lat: int, dtype, lora_specs=None, num_steps: int = 8):
     key = (dit_name, T_lat)
     if key in _dit_cache:
         if key in _dit_lru:
             _dit_lru.remove(key)
         _dit_lru.append(key)
-        return _dit_cache[key], 0.0
-    while len(_dit_cache) >= _DIT_CACHE_MAX:
-        oldest = _dit_lru.pop(0)
-        print(f"  ← LRU-evicting DiT {oldest}")
-        _dit_cache.pop(oldest, None)
-        _free_to_pool()
-    t0 = time.time()
-    model, _ = load_dit(dit_name, T_lat=T_lat, dtype=dtype)
-    load_ms = (time.time() - t0) * 1000
-    _dit_cache[key] = model
-    _dit_lru.append(key)
+        model, load_ms = _dit_cache[key], 0.0
+    else:
+        while len(_dit_cache) >= _DIT_CACHE_MAX:
+            oldest = _dit_lru.pop(0)
+            print(f"  ← LRU-evicting DiT {oldest}")
+            _dit_cache.pop(oldest, None)
+            _free_to_pool()
+        t0 = time.time()
+        model, _ = load_dit(dit_name, T_lat=T_lat, dtype=dtype)
+        load_ms = (time.time() - t0) * 1000
+        _dit_cache[key] = model
+        _dit_lru.append(key)
+    _reconcile_lora(model, dit_name, lora_specs, num_steps)
     return model, load_ms
 
 
@@ -205,7 +266,8 @@ def run_generation(dit_name: str, decoder_name: str, prompt: str,
                    seed: int, cfg: float, apg: float, sigma_max: float,
                    a2a_audio_path: str | None = None,
                    inpaint_audio_path: str | None = None,
-                   inpaint_range_sec=None):
+                   inpaint_range_sec=None,
+                   lora_specs=None):
     """Returns (audio_np (2,T) float32, timings dict).
 
     a2a and inpainting are independent and combinable:
@@ -230,6 +292,14 @@ def run_generation(dit_name: str, decoder_name: str, prompt: str,
     # 2. Conditioning
     t0 = time.time()
     padding_emb, secs_embedder = get_conditioner(dit_name)
+    if lora_specs:
+        # Seconds-conditioner deltas (underfit adapters carry one) apply to the
+        # whole generation — conditioning runs once, before sampling. Work on a
+        # copy so the cached embedder stays pristine.
+        W_lora, _n_cond = apply_conditioner_lora(secs_embedder.W, lora_specs)
+        if _n_cond:
+            secs_embedder = copy.copy(secs_embedder)
+            secs_embedder.W = W_lora
     embeds = embeds.astype(dtype)
     embeds_padded = apply_prompt_padding(embeds, mask, padding_emb.astype(dtype))
     seconds_embed = secs_embedder(seconds).astype(dtype)
@@ -289,7 +359,8 @@ def run_generation(dit_name: str, decoder_name: str, prompt: str,
         t["enc_ms"] += (time.time() - t0) * 1000
 
     # 3b. DiT + pingpong sample
-    dit_model, t["dit_load_ms"] = get_dit(dit_name, T_lat, dtype)
+    dit_model, t["dit_load_ms"] = get_dit(dit_name, T_lat, dtype,
+                                          lora_specs=lora_specs, num_steps=steps)
     sigmas = build_pingpong_schedule(steps, sigma_max=sigma_max, use_logsnr_shift=True)
 
     key = mx.random.key(seed)
@@ -346,8 +417,10 @@ def run_generation(dit_name: str, decoder_name: str, prompt: str,
         return cfg_v.astype(x.dtype)
 
     t0 = time.time()
+    _plan = getattr(dit_model, "_lora_plan", None)
     latents = sample_flow_pingpong(model_fn, noise, sigmas, seed=seed + 1,
-                                   paste_back=paste_back)
+                                   paste_back=paste_back,
+                                   before_step=_plan.sync if _plan else None)
     mx.eval(latents)
     t["sample_ms"] = (time.time() - t0) * 1000
 
@@ -485,6 +558,48 @@ def _ago(ts) -> str:
     return f"{int(d // 86400)}d ago"
 
 
+def _lora_specs_from_ui(vals, notes):
+    """Turn the 3 LoRA rows' flat values (file, strength, min, max)×3 into
+    lora_merge specs. Empty rows are skipped; half-sane inputs get a note and
+    the most permissive interpretation (never an error — matches the app's
+    permissive-by-design generation policy)."""
+    specs = []
+    for i in range(3):
+        path, strength, mn, mxx = vals[4 * i: 4 * i + 4]
+        if not path:
+            continue
+        mn = int(mn) if mn else None
+        mxx = int(mxx) if mxx else None
+        if mn is not None and mn < 1:
+            mn = 1
+        if mxx is not None and mxx < 1:
+            notes.append(f"LoRA {i + 1}: max step < 1 — treated as 'last step'")
+            mxx = None
+        if mn is not None and mxx is not None and mn > mxx:
+            notes.append(f"LoRA {i + 1}: min step {mn} > max step {mxx} — adapter skipped")
+            continue
+        steps = None if ((mn is None or mn == 1) and mxx is None) else (mn, mxx)
+        specs.append({"path": path, "strength": float(strength), "steps": steps})
+    return specs or None
+
+
+def _lora_disp(specs) -> str:
+    """Short human tag per adapter: 'plini×0.8 @2-8, rain @1-4'."""
+    tags = []
+    for s in specs or []:
+        name = Path(s["path"]).stem
+        if len(name) > 25:
+            name = name[:24] + "…"
+        tag = name
+        if s["strength"] != 1.0:
+            tag += f"×{s['strength']:g}"
+        if s["steps"]:
+            lo, hi = s["steps"]
+            tag += f" @{lo or 1}-{hi if hi is not None else 'end'}"
+        tags.append(tag)
+    return ", ".join(tags)
+
+
 def _meta_suffix(entry) -> str:
     """' · cfg 1.5 · noise 0.92 · audio2audio · inpainting' — only the non-defaults.
     The sigma tag reads 'noise' for a2a runs (it IS the init_noise_level there),
@@ -505,6 +620,8 @@ def _meta_suffix(entry) -> str:
         parts.append("audio2audio")
     if "inpaint" in mode:
         parts.append("inpainting")
+    if entry.get("lora"):
+        parts.append(f"lora {entry['lora']}")
     return "".join(f" · {p}" for p in parts)
 
 
@@ -651,13 +768,14 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
     def _generate_entry(dit_name, decoder_name, prompt, negative_prompt,
                         seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
                         a2a_audio, inpaint_audio, inp_start, inp_end,
-                        output_opts, file_format):
+                        output_opts, file_format, *lora_vals):
         """Run one generation and package it as a history entry.
         Returns (entry, None) or (None, error_message)."""
         prompt = (prompt or "").strip()
         # Permissive by design: a generation should succeed with whatever IS set.
         # Half-configured features are ignored with a visible note, never an error.
         notes = []
+        lora_specs = _lora_specs_from_ui(lora_vals, notes) if lora_vals else None
         # blank or -1 → random seed, kept small (1-9999) for readability
         try:
             seed = int(seed_text.strip()) if seed_text and seed_text.strip() else -1
@@ -705,7 +823,9 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 dit_name, decoder_name, prompt, negative_prompt or "",
                 float(seconds), int(steps), seed, float(cfg), float(apg),
                 float(sigma_max), a2a_audio or None, inpaint_audio or None,
-                inpaint_range)
+                inpaint_range, lora_specs)
+        except LoraError as e:
+            return None, f"LoRA error: {e}"
         except Exception as e:
             return None, f"error: {type(e).__name__}: {e}"
         if not np.isfinite(audio_np).all():
@@ -741,12 +861,14 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         enc_note = f"encode {t['enc_ms']:.0f} ms{cached_tag} ·&nbsp; " if t.get("enc_ms") else ""
         apg_note = f" (apg {apg:g})" if apg != 1.0 else ""
         cfg_note = f"cfg {cfg:g}{apg_note} ·&nbsp; " if cfg != 1.0 else ""
+        lora_note = (f"<b>lora</b>: {html_lib.escape(_lora_disp(lora_specs))} ·&nbsp; "
+                     if lora_specs else "")
         prompt_disp = html_lib.escape(prompt) or "<i>(no prompt)</i>"
         neg_disp = (f' · <span style="opacity:0.75">neg: {html_lib.escape(negative_prompt.strip())}</span>'
                     if negative_prompt and negative_prompt.strip() and cfg != 1.0 else "")
         timing_html = (
             f"{prompt_disp}{neg_disp} ·&nbsp; "
-            f"{load_note}{enc_note}{cfg_note}"
+            f"{load_note}{enc_note}{cfg_note}{lora_note}"
             f"<b>Inference</b>: {t['inference_ms']:.0f} ms "
             f"<span style='color:#888'>(t5={t['t5_ms']:.0f} · sample={t['sample_ms']:.0f} · "
             f"decode={t['decode_ms']:.0f})</span> ·&nbsp; "
@@ -772,6 +894,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
             "mode": mode,
             "prompt": prompt,
             "seed": seed,
+            "lora": _lora_disp(lora_specs),
             "spec_b64": spec_b64,
             "timing": timing_html,
         }
@@ -797,11 +920,13 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
     def generate(dit_name, decoder_name, prompt, negative_prompt,
                  seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
                  a2a_audio, inpaint_audio, inp_start, inp_end,
-                 output_opts, file_format, state):
+                 output_opts, file_format, *lora_and_state):
+        *lora_vals, state = lora_and_state
         entry, err_msg = _generate_entry(
             dit_name, decoder_name, prompt, negative_prompt, seconds, steps,
             seed_text, cfg, apg, sigma_max, init_noise, a2a_audio,
-            inpaint_audio, inp_start, inp_end, output_opts, file_format)
+            inpaint_audio, inp_start, inp_end, output_opts, file_format,
+            *lora_vals)
         if entry is None:
             return (gr.update(), gr.update(),
                     f"<span style='color:#f88'>{err_msg}</span>",
@@ -816,17 +941,19 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
     def promote(dit_name, decoder_name, prompt, negative_prompt,
                 seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
                 a2a_audio, inpaint_audio, inp_start, inp_end,
-                output_opts, file_format, state):
+                output_opts, file_format, *lora_and_state):
         """Infinite Radio: swap the pre-generated clip in when playback ends.
         Falls back to a full generate if the queue is empty. Either way the
         next track ALWAYS autoplays — Auto-play only governs whether a clip
         starts when nothing was playing; radio transitions are continuations."""
+        *lora_vals, state = lora_and_state
         q = state.get("queued")
         if q is None:
             entry, err_msg = _generate_entry(
                 dit_name, decoder_name, prompt, negative_prompt, seconds, steps,
                 seed_text, cfg, apg, sigma_max, init_noise, a2a_audio,
-                inpaint_audio, inp_start, inp_end, output_opts, file_format)
+                inpaint_audio, inp_start, inp_end, output_opts, file_format,
+                *lora_vals)
             if entry is None:
                 return (gr.update(), gr.update(),
                         f"<span style='color:#f88'>{err_msg}</span>",
@@ -839,16 +966,18 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
     def pregen(dit_name, decoder_name, prompt, negative_prompt,
                seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
                a2a_audio, inpaint_audio, inp_start, inp_end,
-               output_opts, file_format, state):
+               output_opts, file_format, *lora_and_state):
         """Chained after generate/promote: pre-generate the NEXT clip while the
         current one plays (Infinite Radio only)."""
+        *lora_vals, state = lora_and_state
         if "Infinite Radio" not in (output_opts or []):
             state["queued"] = None
             return "", state
         entry, err_msg = _generate_entry(
             dit_name, decoder_name, prompt, negative_prompt, seconds, steps,
             seed_text, cfg, apg, sigma_max, init_noise, a2a_audio,
-            inpaint_audio, inp_start, inp_end, output_opts, file_format)
+            inpaint_audio, inp_start, inp_end, output_opts, file_format,
+            *lora_vals)
         if entry is None:
             return (f"<div style='color:#f88; font-size:0.85em'>queue: {err_msg}</div>",
                     state)
@@ -898,6 +1027,33 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                         sigma_global = gr.Slider(label="sigma_max",
                                                  minimum=0.0, maximum=1.0, value=1.0, step=0.01)
                     negative_prompt = gr.Textbox(label="Negative prompt", lines=1)
+
+                with gr.Accordion("LoRA", open=False):
+                    gr.Markdown(
+                        "<span style='font-size:0.85em;color:#888'>"
+                        "Up to 3 adapters (.safetensors — SA3-native / underfit / "
+                        "PEFT), each with its own strength and 1-based inclusive "
+                        "sampling-step range (blank max = last step; skipping "
+                        "step 1 often helps). Adapters must be trained for the "
+                        "selected DiT model. Step-gated adapters are re-merged "
+                        "in place at step boundaries — no reload, no per-step "
+                        "cost.</span>")
+                    lora_inputs = []
+                    for _i in range(1, 4):
+                        with gr.Row():
+                            _lf = gr.File(label=f"LoRA {_i} (.safetensors)",
+                                          file_types=[".safetensors"],
+                                          type="filepath", scale=3, height=88)
+                            _ls = gr.Slider(label="Strength", minimum=0.0,
+                                            maximum=2.0, value=1.0, step=0.05,
+                                            scale=2)
+                            _ln = gr.Number(label="Min step", value=1,
+                                            precision=0, minimum=1, scale=1,
+                                            min_width=80)
+                            _lx = gr.Number(label="Max step (blank = last)",
+                                            value=None, precision=0, minimum=1,
+                                            scale=1, min_width=80)
+                        lora_inputs += [_lf, _ls, _ln, _lx]
 
                 with gr.Accordion("Audio-to-audio (guide the whole clip)", open=False):
                     a2a_audio = gr.Audio(label="Guide audio — generation starts from its latents",
@@ -959,7 +1115,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         ctrl_inputs = [dit_dd, decoder_dd, prompt, negative_prompt,
                        seconds, steps, seed, cfg, apg, sigma_global,
                        sigma_slider, a2a_audio, inpaint_audio,
-                       inp_start, inp_end, output_opts, file_format]
+                       inp_start, inp_end, output_opts, file_format] + lora_inputs
         main_outputs = [output_player, timing, error_box, queued_html, history_html, st]
 
         # NB: _present returns (player, timing, err, history, queued, state) —

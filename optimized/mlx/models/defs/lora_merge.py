@@ -162,7 +162,7 @@ def _check_shapes(layer: str, W0: np.ndarray, p: dict, adapter_type: str) -> Non
         if rank > min(fan_out, fan_in):
             raise LoraError(
                 f"{layer}: LoRA-XS rank {rank} exceeds base min-dim "
-                f"{min(fan_out, fan_in)} for weight {W0.shape} — wrong base for --dit?"
+                f"{min(fan_out, fan_in)} for weight {W0.shape} — wrong base model?"
             )
         return
     b_out, b_rank = p["lora_B"].shape
@@ -170,7 +170,7 @@ def _check_shapes(layer: str, W0: np.ndarray, p: dict, adapter_type: str) -> Non
     if b_out != fan_out or a_in != fan_in or a_rank != b_rank:
         raise LoraError(
             f"{layer}: adapter lora_B{p['lora_B'].shape}·lora_A{p['lora_A'].shape} "
-            f"does not fit base weight {W0.shape} — wrong base for --dit?"
+            f"does not fit base weight {W0.shape} — wrong base model?"
         )
 
 
@@ -368,7 +368,7 @@ def merge_loras_into_weights(weights: dict, lora_paths, strength: float = 1.0,
             f"(e.g. {skipped[0]})")
     if not accum:
         log("lora: WARNING — merged 0 layers; the adapter targets nothing in this "
-            "DiT (wrong base for --dit, or unsupported target modules)")
+            "DiT (wrong base model, or unsupported target modules)")
     return {"merged": len(accum), "skipped": skipped, "adapters": len(parsed)}
 
 
@@ -712,9 +712,17 @@ class LoraStepPlan:
         self._transition_model(self.current, tgt)
         self.current = tgt
 
+    def clear(self) -> None:
+        """Restore the attached model to its base weights (exact-inverse
+        transition to the empty set). Used by long-lived hosts (gradio) before
+        applying a different adapter configuration to a cached model."""
+        if self.current:
+            self._transition_model(self.current, frozenset())
+            self.current = frozenset()
+
 
 def prepare_loras(weights: dict, specs: list, num_steps: int,
-                  log=lambda _m: None):
+                  log=lambda _m: None, gate_all: bool = False):
     """Entry point for the step-gated path. ``specs`` come from
     :func:`parse_lora_spec`. Full-interval adapters are merged permanently via
     :func:`merge_loras_into_weights` (bit-identical to the plain --lora path);
@@ -722,7 +730,12 @@ def prepare_loras(weights: dict, specs: list, num_steps: int,
     applied to ``weights`` here. Returns the plan, or None when nothing is
     step-gated. The seconds-conditioner delta (underfit adapters) cannot be
     step-gated — conditioning is computed once per generation — so it is left
-    to :func:`apply_conditioner_lora` and excluded from the plan."""
+    to :func:`apply_conditioner_lora` and excluded from the plan.
+
+    gate_all=True routes full-interval adapters through the plan too (they just
+    never transition mid-run). Long-lived hosts use this so plan.clear() can
+    restore the base weights for a cached model — permanent merges can't be
+    undone in place."""
     full, partial = [], []
     for s in specs:
         rs = resolve_steps(s["steps"], num_steps)
@@ -730,7 +743,7 @@ def prepare_loras(weights: dict, specs: list, num_steps: int,
             log(f"lora: {os.path.basename(s['path'])} steps="
                 f"{s['steps']} misses the {num_steps}-step schedule — inactive")
             continue
-        if rs == (0, num_steps - 1):
+        if rs == (0, num_steps - 1) and not gate_all:
             full.append(s)
         else:
             partial.append((s, rs))
@@ -749,9 +762,11 @@ def prepare_loras(weights: dict, specs: list, num_steps: int,
         adapter_type, scaling, layers = _parse_adapter(path)
         ai = plan.add_adapter(os.path.basename(path), s["strength"], lo, hi)
         skipped = []
+        matched = has_cond = 0
         for layer, params in layers.items():
             key = _layer_to_npz_key(layer)
             if key == "cond.seconds_total_weight":
+                has_cond = 1
                 log(f"lora: {os.path.basename(path)} conditioner delta applies "
                     f"to the whole generation (conditioning runs once, before "
                     f"sampling — steps= does not gate it)")
@@ -768,6 +783,12 @@ def prepare_loras(weights: dict, specs: list, num_steps: int,
             row, col, Bp, Ap = _delta_form(W0, params, adapter_type, scaling,
                                            s["strength"])
             plan.add_layer_part(key, ai, row, col, Bp, Ap)
+            matched += 1
+        if not matched and not has_cond:
+            raise LoraError(
+                f"{os.path.basename(path)}: none of this adapter's "
+                f"{len(layers)} layer(s) exist in the target DiT — it was "
+                f"trained for a different base model")
         if skipped:
             log(f"lora: skipped {len(skipped)} layer(s) not in this DiT "
                 f"(e.g. {skipped[0]})")

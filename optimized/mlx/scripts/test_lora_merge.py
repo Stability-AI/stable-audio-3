@@ -400,6 +400,34 @@ def test_full_interval_uses_merge_path():
         assert np.array_equal(_np(wa["foo.weight"]), _np(wb["foo.weight"]))
 
 
+def test_gate_all_and_clear_restore_base():
+    """The gradio path: gate_all=True routes even full-range adapters through
+    the plan so clear() can restore a cached model to base in place; an adapter
+    matching zero layers raises a clear wrong-base error."""
+    W0 = rng.standard_normal((6, 8)).astype(np.float32)
+    prm = _init_params("dora-rows", W0, 4, nonzero=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "g.safetensors")
+        _save_native(path, "foo", prm, {"adapter_type": "dora-rows", "rank": 4, "alpha": 4})
+        w = {"foo.weight": mx.array(W0)}
+        plan = lm.prepare_loras(w, [{"path": path, "strength": 1.0, "steps": None}],
+                                num_steps=8, gate_all=True)
+        assert plan is not None, "gate_all must plan-manage full-range adapters"
+        model = _stub_tree(w)
+        plan.attach(model)
+        assert not np.allclose(_np(model.foo.weight), W0), "step-1 state not applied"
+        plan.clear()
+        assert np.abs(_np(model.foo.weight) - W0).max() < 1e-4, "clear() must restore base"
+        # an adapter whose layers don't exist in the target → clear error
+        w2 = {"bar.weight": mx.array(W0)}
+        try:
+            lm.prepare_loras(w2, [{"path": path, "strength": 1.0, "steps": (2, None)}],
+                             num_steps=8)
+            assert False, "zero-match adapter should raise"
+        except lm.LoraError as e:
+            assert "different base model" in str(e)
+
+
 def _main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = []

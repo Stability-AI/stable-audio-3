@@ -16,7 +16,10 @@ Two on-disk conventions are supported:
     magnitude_r,magnitude_c}`` with the adapter config
     (``adapter_type``/``rank``/``alpha``/``include``/``exclude``) JSON-encoded in
     the safetensors **metadata** under ``"lora_config"``. Covers all nine adapter
-    types (lora, dora-rows/cols, bora, and the four -xs variants).
+    types (lora, dora-rows/cols, bora, and the four -xs variants). Underfit
+    (github.com/dada-bots/underfit) checkpoints are this convention with
+    full-wrapper layer names (``model.…`` / ``conditioners.…``) — handled by
+    ``_layer_to_npz_key``.
   * **PEFT** (huggingface `peft`): keys ``base_model.model.<layer>.lora_{A,B}.weight``
     with ``r``/``lora_alpha`` in a sibling ``adapter_config.json``. Standard LoRA,
     plus DoRA when ``use_dora`` is set.
@@ -182,10 +185,23 @@ def _mag_2d(mag: np.ndarray, norm_dim: int) -> np.ndarray:
 
 # ── checkpoint parsing → normalized per-layer adapter ──────────────────────────
 
+# Underfit (github.com/dada-bots/underfit) saves adapters with full-wrapper
+# layer names: DiT layers as ``model.transformer...`` and the seconds
+# conditioner Linear as ``conditioners.seconds_total.embedder.embedding.1``.
+# The MLX npz bakes that conditioner Linear as ``cond.seconds_total_weight``.
+_COND_SECONDS_LAYER = "conditioners.seconds_total.embedder.embedding.1"
+
+
 def _layer_to_npz_key(layer: str) -> str:
-    """Map a checkpoint layer name to its DiT npz weight key. The MLX converter
-    renames ``to_local_embed.{0,2}`` → ``to_local_embed.seq.{0,2}`` (dit_mlx.py);
-    every other Linear/Conv1d name passes through unchanged."""
+    """Map a checkpoint layer name to its DiT npz weight key. Strips the
+    full-model ``model.`` prefix (underfit / torch-wrapper checkpoints; bare-DiT
+    names pass through), maps the seconds-conditioner Linear onto its baked npz
+    key, and renames ``to_local_embed.{0,2}`` → ``to_local_embed.seq.{0,2}``
+    (dit_mlx.py); every other Linear/Conv1d name passes through unchanged."""
+    if layer == _COND_SECONDS_LAYER:
+        return "cond.seconds_total_weight"
+    if layer.startswith("model."):
+        layer = layer[len("model."):]
     layer = layer.replace(".to_local_embed.0", ".to_local_embed.seq.0")
     layer = layer.replace(".to_local_embed.2", ".to_local_embed.seq.2")
     return f"{layer}.weight"

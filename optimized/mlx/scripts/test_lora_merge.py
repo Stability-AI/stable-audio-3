@@ -199,6 +199,43 @@ def test_svd_bases_orthonormal():
     assert np.allclose(V.T @ V, np.eye(6), atol=1e-4)
 
 
+def test_underfit_wrapper_prefixes():
+    """Underfit (github.com/dada-bots/underfit) saves full-wrapper layer names:
+    DiT layers as ``model.transformer...`` and the seconds conditioner as
+    ``conditioners.seconds_total.embedder.embedding.1``. Both must land on the
+    bare npz keys; bare names keep working."""
+    W_dit = rng.standard_normal((6, 8)).astype(np.float32)
+    W_cond = rng.standard_normal((5, 7)).astype(np.float32)
+    A_d = rng.standard_normal((4, 8)).astype(np.float32)
+    B_d = rng.standard_normal((6, 4)).astype(np.float32)
+    A_c = rng.standard_normal((4, 7)).astype(np.float32)
+    B_c = rng.standard_normal((5, 4)).astype(np.float32)
+    cfg = {"adapter_type": "lora", "rank": 4, "alpha": 4}
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "underfit.safetensors")
+        d = {}
+        for layer, (A, B) in {
+            "model.transformer.layers.0.self_attn.to_qkv": (A_d, B_d),
+            "conditioners.seconds_total.embedder.embedding.1": (A_c, B_c),
+        }.items():
+            d[f"{layer}.parametrizations.weight.0.lora_A"] = mx.array(A)
+            d[f"{layer}.parametrizations.weight.0.lora_B"] = mx.array(B)
+        mx.save_safetensors(path, d, metadata={"lora_config": json.dumps(cfg)})
+        w = {"transformer.layers.0.self_attn.to_qkv.weight": mx.array(W_dit),
+             "cond.seconds_total_weight": mx.array(W_cond)}
+        stats = lm.merge_loras_into_weights(w, [path])
+        assert stats["merged"] == 2 and not stats["skipped"], stats
+        assert np.allclose(_np(w["transformer.layers.0.self_attn.to_qkv.weight"]),
+                           W_dit + B_d @ A_d, atol=1e-4)
+        assert np.allclose(_np(w["cond.seconds_total_weight"]),
+                           W_cond + B_c @ A_c, atol=1e-4)
+    # bare names still pass through, and model.-prefixed to_local_embed remaps
+    assert lm._layer_to_npz_key("transformer.layers.3.ff.ff.2") == \
+        "transformer.layers.3.ff.ff.2.weight"
+    assert lm._layer_to_npz_key("model.transformer.layers.3.to_local_embed.0") == \
+        "transformer.layers.3.to_local_embed.seq.0.weight"
+
+
 def _main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = []

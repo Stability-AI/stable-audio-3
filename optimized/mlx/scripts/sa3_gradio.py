@@ -441,10 +441,15 @@ def render_history(hist):
         return ""
     items = "".join(render_player(e, small=True) for e in hist)
     boot = f'<img src="data:," style="display:none" onerror="{_JS_SCROLL_RESTORE}"/>'
-    return (f'<div style="font-weight:600; margin-top:14px">Previous generations ({len(hist)})</div>'
+    # darker grey box so the history reads as subdued background material
+    return (f'<div style="margin-top:14px; background:rgba(0,0,0,0.3); '
+            f'border:1px solid #2a2a2a; border-radius:8px; padding:10px 12px">'
+            f'<div style="font-weight:600; font-size:0.85em; color:#999">'
+            f'Previous generations ({len(hist)})</div>'
             f'<div id="sa3-hist" onscroll="{_JS_SCROLL_RECORD}" '
-            f'style="max-height:480px; overflow-y:auto; position:relative; margin-top:6px; '
-            f'padding-right:6px">{boot}{items}</div>')
+            f'style="max-height:480px; overflow-y:auto; position:relative; margin-top:8px; '
+            f'padding-right:6px; opacity:0.85">{boot}{items}</div>'
+            f'</div>')
 
 
 def render_queue_status(entry=None, generating=False):

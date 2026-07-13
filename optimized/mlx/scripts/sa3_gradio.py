@@ -386,8 +386,18 @@ def run_generation(dit_name: str, decoder_name: str, prompt: str,
 
 # ── HTML rendering (inline handlers only — gradio HTML runs attributes, not
 # <script> tags) ────────────────────────────────────────────────────────────
-_JS_PAUSE_OTHERS = ("var t=this;document.querySelectorAll('audio').forEach("
-                    "function(o){if(o!==t)o.pause();});")
+# One-at-a-time playback. Chrome does NOT stop a playing <audio> when it's
+# removed from the DOM (verified via CDP: swapped-out elements keep playing as
+# detached ghosts), and querySelectorAll can't see detached nodes — so every
+# player registers itself in window._sa3All on play, and pause-others sweeps
+# that registry (reaching ghosts) plus the document. Entries that are detached
+# AND paused drop from the registry so ghosts can be garbage-collected.
+_JS_PAUSE_OTHERS = (
+    "var t=this;var L=window._sa3All=(window._sa3All||[]);"
+    "if(L.indexOf(t)<0)L.push(t);"
+    "L.forEach(function(o){if(o!==t){try{o.pause()}catch(e){}}});"
+    "document.querySelectorAll('audio').forEach(function(o){if(o!==t)o.pause();});"
+    "window._sa3All=L.filter(function(o){return o===t||o.isConnected;});")
 _JS_PLAYHEAD = ("var p=this.closest('.blk').querySelector('.ph');"
                 "if(p&&this.duration)p.style.left=(this.currentTime/this.duration*100)+'%';")
 # Main-player position ledger (for Hotswap): every timeupdate/play/pause stamps
@@ -688,7 +698,9 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         enc_note = f"encode {t['enc_ms']:.0f} ms{cached_tag} ·&nbsp; " if t.get("enc_ms") else ""
         apg_note = f" (apg {apg:g})" if apg != 1.0 else ""
         cfg_note = f"cfg {cfg:g}{apg_note} ·&nbsp; " if cfg != 1.0 else ""
+        prompt_disp = html_lib.escape(prompt) or "<i>(no prompt)</i>"
         timing_html = (
+            f"{prompt_disp} ·&nbsp; "
             f"{load_note}{enc_note}{cfg_note}"
             f"<b>Inference</b>: {t['inference_ms']:.0f} ms "
             f"<span style='color:#888'>(t5={t['t5_ms']:.0f} · sample={t['sample_ms']:.0f} · "
@@ -853,7 +865,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 with gr.Accordion("Output", open=False):
                     output_opts = gr.CheckboxGroup(
                         ["Auto-play", "Auto-download", "Infinite Radio", "Loop", "Hotswap"],
-                        value=["Auto-play"], label="Options")
+                        value=["Auto-play"], label="Playback Options")
                     opts_state = gr.State(["Auto-play"])
                     file_format = gr.Radio(
                         [FORMAT_MP3, FORMAT_WAV] if FFMPEG else [FORMAT_WAV],

@@ -391,11 +391,12 @@ _JS_PLAYHEAD = ("var p=this.closest('.blk').querySelector('.ph');"
                 "if(p&&this.duration)p.style.left=(this.currentTime/this.duration*100)+'%';")
 # Main-player position ledger (for Hotswap): every timeupdate/play/pause stamps
 # the current position so a freshly swapped-in element can resume exactly there.
-_JS_POS_RECORD = "window._sa3Pos={t:this.currentTime,playing:!this.paused,ts:Date.now()};"
-# Pause events also fire when the old element is REMOVED from the DOM during the
-# swap — that teardown-pause must not overwrite the playing:true stamp, or the
-# new element would think nothing was playing. Only record user pauses.
-_JS_POS_RECORD_PAUSE = f"if(this.isConnected){{{_JS_POS_RECORD}}}"
+# EVERY recorder is guarded on isConnected: when the old element is removed
+# during the swap, the browser fires a teardown pause AND a final timeupdate on
+# the detached element — either would overwrite the playing:true stamp and kill
+# the resume. Detached elements never get to write the ledger.
+_JS_POS_RECORD = ("if(this.isConnected){window._sa3Pos="
+                  "{t:this.currentTime,playing:!this.paused,ts:Date.now()};}")
 # Hotswap resume: if the previous main audio was playing when this one arrived,
 # jump to its position (+ the split-second since the last stamp) and keep going;
 # beyond the new clip's duration -> start at zero. Guarded (hsd) so it applies
@@ -475,7 +476,7 @@ def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=Fal
         attrs = f'onplay="{_JS_PAUSE_OTHERS}" ontimeupdate="{_JS_PLAYHEAD}"'
     else:
         attrs = (f'onplay="{_JS_PAUSE_OTHERS}{_JS_POS_RECORD}" '
-                 f'onpause="{_JS_POS_RECORD_PAUSE}" '
+                 f'onpause="{_JS_POS_RECORD}" '
                  f'ontimeupdate="{_JS_PLAYHEAD}{_JS_POS_RECORD}"')
     if hotswap and not small:
         attrs += f' data-hs="1" onloadedmetadata="{_JS_HOTSWAP}"'

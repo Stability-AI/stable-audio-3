@@ -730,9 +730,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
     with gr.Blocks(title="SA3 MLX", css="#sa3-promote{display:none !important}") as demo:
         gr.Markdown(
             "# SA3 MLX — Apple Silicon\n"
-            "All modes wired: text-to-audio, CFG + negative prompt, audio-to-audio "
-            "(upload + σmax), inpainting (upload + range). Models cache in unified "
-            "memory — first use of a model loads weights, subsequent runs are instant."
+            "Text-to-audio, CFG + negative prompt, audio-to-audio, inpainting. "
+            "First use of a model loads weights, subsequent runs are cached."
         )
         st = gr.State({"current": None, "queued": None, "history": []})
         with gr.Row():

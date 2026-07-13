@@ -6,12 +6,18 @@ generation mode wired (the TRT one only exposes text-to-audio):
     memory, LRU-evicted — first switch loads weights, subsequent instant)
   - CFG 0-10 next to seconds/steps (0 = negative prompt takes over, 0.5 = halfway
     between prompts, 1 = off, >1 = extrapolate) + negative prompt/APG under Advanced
-  - Audio-to-audio: guide audio + σmax slider (whole clip starts from its latents)
+  - Audio-to-audio: guide audio + init_noise_level (whole clip starts from its
+    latents); global sigma_max under Advanced for prompt-only generations
   - Inpainting: separate reference audio + start/end range sliders (kept bit-exact
     outside the range). Combinable with a2a: the regenerated span then starts
     from the guide audio instead of noise.
-  - Spectrogram display: 3-band tinted stereo mel spectrogram (numpy port —
-    no torch), rendered inline alongside the audio
+  - Spectrogram-as-player: 3-band tinted stereo mel spectrogram (numpy port — no
+    torch) with a white playhead; click to seek. Only one audio plays at a time.
+  - History: previous generations in a scroll panel (newest on top, scroll
+    position anchored while new items arrive), each replayable.
+  - Output options: Auto-play, Auto-download, Infinite Radio (pre-generates the
+    next clip while the current one plays, swaps it in when playback ends),
+    MP3 (V0, via ffmpeg) or WAV saving.
 
 Launch:
     ./sa3-gradio                  # share=True by default, sm-music + same-s
@@ -21,6 +27,7 @@ Launch:
 from __future__ import annotations
 import argparse
 import base64
+import html as html_lib
 import math
 import re
 import shutil
@@ -108,7 +115,7 @@ def condense_prompt(prompt: str) -> str:
 
 def verbose_basename(prompt, negative_prompt, cfg, sigma_max, seed) -> str:
     """prompt[.neg-…].cfg{scale}[.smx{σ}].{seed} — matches the main repo's
-    gradio 'verbose' file naming."""
+    gradio 'verbose' file naming (cfg segment only when cfg != 1)."""
     base = condense_prompt(prompt)
     if negative_prompt and negative_prompt.strip():
         base += ".neg-" + condense_prompt(negative_prompt.strip())
@@ -361,6 +368,92 @@ def run_generation(dit_name: str, decoder_name: str, prompt: str,
     return audio_np, t
 
 
+# ── HTML rendering (inline handlers only — gradio HTML runs attributes, not
+# <script> tags) ────────────────────────────────────────────────────────────
+_JS_PAUSE_OTHERS = ("var t=this;document.querySelectorAll('audio').forEach("
+                    "function(o){if(o!==t)o.pause();});")
+_JS_PLAYHEAD = ("var p=this.closest('.blk').querySelector('.ph');"
+                "if(p&&this.duration)p.style.left=(this.currentTime/this.duration*100)+'%';")
+_JS_SEEK = ("var a=this.closest('.blk').querySelector('audio');"
+            "var r=this.getBoundingClientRect();"
+            "if(a&&a.duration){a.currentTime=(event.clientX-r.left)/r.width*a.duration;a.play();}")
+_JS_PROMOTE = ("var b=document.getElementById('sa3-promote');"
+               "if(b){(b.tagName==='BUTTON'?b:b.querySelector('button')||b).click();}")
+# Scroll anchoring for the history panel: onscroll continuously records which
+# item sits at the viewport top (+offset); after every re-render a hidden
+# bootstrap <img onerror> restores that anchor — stick-to-top when at top,
+# otherwise keep hovering over the same old item as new ones prepend.
+_JS_SCROLL_RECORD = (
+    "var c=this,k=null,off=0,ch=c.querySelectorAll('[data-key]');"
+    "for(var i=0;i<ch.length;i++){if(ch[i].offsetTop+ch[i].offsetHeight>c.scrollTop)"
+    "{k=ch[i].getAttribute('data-key');off=ch[i].offsetTop-c.scrollTop;break}}"
+    "window._sa3S={atTop:c.scrollTop<8,key:k,off:off};")
+_JS_SCROLL_RESTORE = (
+    "var c=document.getElementById('sa3-hist');var s=window._sa3S||{};"
+    "if(c){var el=s.key?c.querySelector('[data-key=&quot;'+s.key+'&quot;]'):null;"
+    "if(el&&!s.atTop){c.scrollTop=el.offsetTop-(s.off||0)}else{c.scrollTop=0}}"
+    "this.remove();")
+
+
+def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=False):
+    """One self-contained player block: audio + caption + seekable spectrogram
+    with playhead. Global one-at-a-time playback via onplay pause-others."""
+    attrs = f'onplay="{_JS_PAUSE_OTHERS}" ontimeupdate="{_JS_PLAYHEAD}"'
+    if autodl:
+        js_name = entry["name"].replace("\\", "").replace("'", "\\'")
+        attrs += (' oncanplay="if(!this.dataset.dld){this.dataset.dld=1;'
+                  "var l=document.createElement('a');l.href=this.src;"
+                  f"l.download='{js_name}';l.click();}}\"")
+    if radio:
+        attrs += f' onended="{_JS_PROMOTE}"'
+    auto = "autoplay " if autoplay else ""
+    audio_el = (f'<audio controls {auto}style="width:100%" {attrs} '
+                f'src="data:{entry["mime"]};base64,{entry["b64"]}"></audio>')
+    prompt_disp = html_lib.escape(entry["prompt"]) or "<i>(no prompt)</i>"
+    if small:
+        cap = (f'<div style="font-size:0.8em; margin:2px 0; color:#888">'
+               f'{prompt_disp} · seed {entry["seed"]} · <code>{html_lib.escape(entry["name"])}</code></div>')
+    else:
+        cap = (f'<div style="font-size:0.85em; margin:4px 0; color:#888">'
+               f'{entry["size_mb"]:.1f} MB · {entry["mode"]} · saved as '
+               f'<code>{html_lib.escape(entry["name"])}</code></div>')
+    spec = ""
+    if entry.get("spec_b64"):
+        height = "height:64px;" if small else ""
+        spec = (f'<div style="position:relative; cursor:pointer" onclick="{_JS_SEEK}">'
+                f'<img src="data:image/png;base64,{entry["spec_b64"]}" '
+                f'style="width:100%; {height} display:block; image-rendering:pixelated; '
+                f'border:1px solid #333" alt="spectrogram"/>'
+                f'<div class="ph" style="position:absolute; top:0; bottom:0; left:0%; width:2px; '
+                f'background:#fff; pointer-events:none; box-shadow:0 0 4px rgba(0,0,0,.8)"></div>'
+                f'</div>')
+        if not small:
+            spec += ('<div style="font-size:0.75em; color:#666; margin-top:2px">'
+                     '3-band tinted stereo mel · red=bass / green=mid / blue=high · '
+                     'L top, R bottom · click to seek</div>')
+    style = "margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid #333;" if small else ""
+    return (f'<div class="blk" data-key="{entry["key"]}" style="{style}">'
+            f'{audio_el}{cap}{spec}</div>')
+
+
+def render_history(hist):
+    if not hist:
+        return ""
+    items = "".join(render_player(e, small=True) for e in hist)
+    boot = f'<img src="data:," style="display:none" onerror="{_JS_SCROLL_RESTORE}"/>'
+    return (f'<div style="font-weight:600; margin-top:14px">Previous generations ({len(hist)})</div>'
+            f'<div id="sa3-hist" onscroll="{_JS_SCROLL_RECORD}" '
+            f'style="max-height:480px; overflow-y:auto; position:relative; margin-top:6px; '
+            f'padding-right:6px">{boot}{items}</div>')
+
+
+def render_queued(entry):
+    if entry is None:
+        return ""
+    return ('<div style="font-weight:600; margin-top:14px">Queued next ▶</div>'
+            + render_player(entry, small=True))
+
+
 # ── Gradio UI ──────────────────────────────────────────────────────────────
 def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
              default_seconds: float, default_steps: int):
@@ -382,11 +475,12 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         return (gr.update(value=DEFAULT_DECODERS.get(dit_name, "same-s")),
                 gr.update(maximum=max_s, value=min(cur_seconds, max_s)))
 
-    def generate(dit_name, decoder_name, prompt, negative_prompt,
-                 seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
-                 a2a_audio, inpaint_audio, inp_start, inp_end,
-                 output_opts, file_format):
-        err = lambda m: ("", "", f"<span style='color:#f88'>{m}</span>")
+    def _generate_entry(dit_name, decoder_name, prompt, negative_prompt,
+                        seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
+                        a2a_audio, inpaint_audio, inp_start, inp_end,
+                        output_opts, file_format):
+        """Run one generation and package it as a history entry.
+        Returns (entry, None) or (None, error_message)."""
         prompt = (prompt or "").strip()
         # Permissive by design: a generation should succeed with whatever IS set.
         # Half-configured features are ignored with a visible note, never an error.
@@ -423,6 +517,12 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         elif inp_end > inp_start:
             notes.append("inpaint range ignored — no reference audio uploaded")
 
+        opts = output_opts or []
+        if ("Infinite Radio" in opts and seed_text and seed_text.strip()
+                and seed_text.strip() != "-1"):
+            notes.append("Infinite Radio with a fixed seed repeats the same clip — "
+                         "clear the seed for endless variety")
+
         mode = ("a2a+inpaint" if (a2a_audio and inpaint_range) else
                 "inpaint" if inpaint_range else
                 "audio-to-audio" if a2a_audio else "text-to-audio")
@@ -434,9 +534,9 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 float(sigma_max), a2a_audio or None, inpaint_audio or None,
                 inpaint_range)
         except Exception as e:
-            return err(f"error: {type(e).__name__}: {e}")
+            return None, f"error: {type(e).__name__}: {e}"
         if not np.isfinite(audio_np).all():
-            return err("error: model produced non-finite audio (try a higher σmax or different seed)")
+            return None, "error: model produced non-finite audio (try a higher σmax or different seed)"
 
         pcm = (np.clip(audio_np, -1, 1) * 32767.0).astype(np.int16).T   # (T, 2)
         basename = verbose_basename(prompt, negative_prompt, cfg, sigma_max, seed)
@@ -453,55 +553,14 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 out_path, mime = mp3_path, "audio/mpeg"
             else:
                 notes.append("mp3 encode failed — saved WAV instead")
-        b64 = base64.b64encode(out_path.read_bytes()).decode("ascii")
-        # Audio + spectrogram in ONE block so inline handlers can couple them:
-        # the audio's timeupdate drives the white playhead; clicking the
-        # spectrogram seeks (gradio HTML runs attributes, not <script> tags).
-        opts = output_opts or []
-        autoplay = "autoplay " if "Auto-play" in opts else ""
-        extra_attrs = ""
-        if "Auto-download" in opts:
-            js_name = out_path.name.replace("\\", "").replace("'", "\\'")
-            extra_attrs += (' oncanplay="if(!this.dataset.dld){this.dataset.dld=1;'
-                            "var l=document.createElement('a');l.href=this.src;"
-                            f"l.download='{js_name}';l.click();}}\"")
-        if "Infinite Radio" in opts:
-            extra_attrs += (' onended="var b=document.getElementById(\'sa3-generate\');'
-                            "if(b){(b.tagName==='BUTTON'?b:b.querySelector('button')||b).click();}\"")
-            if seed_text and seed_text.strip() and seed_text.strip() != "-1":
-                notes.append("Infinite Radio with a fixed seed repeats the same clip — "
-                             "clear the seed for endless variety")
-        audio_el = (
-            f'<audio controls {autoplay}style="width:100%" '
-            f'ontimeupdate="var p=this.parentNode.querySelector(\'.ph\');'
-            f'if(p&&this.duration)p.style.left=(this.currentTime/this.duration*100)+\'%\';"'
-            f'{extra_attrs} '
-            f'src="data:{mime};base64,{b64}"></audio>'
-            f'<div style="font-size:0.85em; margin:4px 0; color:#888">'
-            f'{out_path.stat().st_size/1e6:.1f} MB · {mode} · saved as <code>{out_path.name}</code></div>'
-        )
+
+        spec_b64 = None
         try:
             spec_png = render_spectrogram_png(pcm, sample_rate=SAMPLE_RATE,
                                               width=1200, height=240)
             spec_b64 = base64.b64encode(spec_png).decode("ascii")
-            spec_el = (
-                f'<div style="position:relative; cursor:pointer" '
-                f'onclick="var a=this.parentNode.querySelector(\'audio\');'
-                f'var r=this.getBoundingClientRect();'
-                f'if(a&&a.duration){{a.currentTime=(event.clientX-r.left)/r.width*a.duration;a.play();}}">'
-                f'<img src="data:image/png;base64,{spec_b64}" '
-                f'style="width:100%; display:block; image-rendering:pixelated; border:1px solid #333" '
-                f'alt="spectrogram"/>'
-                f'<div class="ph" style="position:absolute; top:0; bottom:0; left:0%; width:2px; '
-                f'background:#fff; pointer-events:none; box-shadow:0 0 4px rgba(0,0,0,.8)"></div>'
-                f'</div>'
-                f'<div style="font-size:0.75em; color:#666; margin-top:2px">'
-                f'3-band tinted stereo mel · red=bass / green=mid / blue=high · L top, R bottom · '
-                f'click to seek</div>'
-            )
         except Exception as e:
-            spec_el = f"<span style='color:#fa3'>spectrogram failed: {type(e).__name__}: {e}</span>"
-        player_html = f"<div>{audio_el}{spec_el}</div>"
+            notes.append(f"spectrogram failed: {type(e).__name__}: {e}")
 
         load_note = (f"DiT-load {t['dit_load_ms']:.0f} ms ·&nbsp; "
                      if t.get("dit_load_ms", 0) > 100 else "")
@@ -519,7 +578,85 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         if notes:
             timing_html = ("".join(f"<div style='color:#fa3; font-size:0.85em'>note: {n}</div>"
                                    for n in notes) + timing_html)
-        return player_html, timing_html, ""
+
+        entry = {
+            "key": f"k{time.time_ns()}",
+            "b64": base64.b64encode(out_path.read_bytes()).decode("ascii"),
+            "mime": mime,
+            "name": out_path.name,
+            "size_mb": out_path.stat().st_size / 1e6,
+            "mode": mode,
+            "prompt": prompt,
+            "seed": seed,
+            "spec_b64": spec_b64,
+            "timing": timing_html,
+        }
+        return entry, None
+
+    def _present(state, entry, opts, *, force_autoplay=False):
+        """Make `entry` the current clip (previous current moves to history top)
+        and render all output panels."""
+        if state["current"] is not None:
+            state["history"].insert(0, state["current"])
+        state["current"] = entry
+        main = render_player(entry,
+                             autoplay=force_autoplay or "Auto-play" in opts,
+                             autodl="Auto-download" in opts,
+                             radio="Infinite Radio" in opts)
+        return (main, entry["timing"], "",
+                render_history(state["history"]),
+                render_queued(state["queued"]), state)
+
+    def generate(dit_name, decoder_name, prompt, negative_prompt,
+                 seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
+                 a2a_audio, inpaint_audio, inp_start, inp_end,
+                 output_opts, file_format, state):
+        entry, err_msg = _generate_entry(
+            dit_name, decoder_name, prompt, negative_prompt, seconds, steps,
+            seed_text, cfg, apg, sigma_max, init_noise, a2a_audio,
+            inpaint_audio, inp_start, inp_end, output_opts, file_format)
+        if entry is None:
+            return (gr.update(), gr.update(),
+                    f"<span style='color:#f88'>{err_msg}</span>",
+                    gr.update(), gr.update(), state)
+        # a manual Generate makes any queued clip stale (settings may have changed);
+        # the chained pregen refills it when Infinite Radio is on
+        state["queued"] = None
+        return _present(state, entry, output_opts or [])
+
+    def promote(dit_name, decoder_name, prompt, negative_prompt,
+                seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
+                a2a_audio, inpaint_audio, inp_start, inp_end,
+                output_opts, file_format, state):
+        """Infinite Radio: swap the pre-generated clip in when playback ends.
+        Falls back to a full generate if the queue is empty."""
+        q = state.get("queued")
+        if q is None:
+            return generate(dit_name, decoder_name, prompt, negative_prompt,
+                            seconds, steps, seed_text, cfg, apg, sigma_max,
+                            init_noise, a2a_audio, inpaint_audio, inp_start,
+                            inp_end, output_opts, file_format, state)
+        state["queued"] = None
+        return _present(state, q, output_opts or [], force_autoplay=True)
+
+    def pregen(dit_name, decoder_name, prompt, negative_prompt,
+               seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
+               a2a_audio, inpaint_audio, inp_start, inp_end,
+               output_opts, file_format, state):
+        """Chained after generate/promote: pre-generate the NEXT clip while the
+        current one plays (Infinite Radio only)."""
+        if "Infinite Radio" not in (output_opts or []):
+            state["queued"] = None
+            return "", state
+        entry, err_msg = _generate_entry(
+            dit_name, decoder_name, prompt, negative_prompt, seconds, steps,
+            seed_text, cfg, apg, sigma_max, init_noise, a2a_audio,
+            inpaint_audio, inp_start, inp_end, output_opts, file_format)
+        if entry is None:
+            return (f"<div style='color:#f88; font-size:0.85em'>queue: {err_msg}</div>",
+                    state)
+        state["queued"] = entry
+        return render_queued(entry), state
 
     with gr.Blocks(title="SA3 MLX") as demo:
         gr.Markdown(
@@ -528,6 +665,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
             "(upload + σmax), inpainting (upload + range). Models cache in unified "
             "memory — first use of a model loads weights, subsequent runs are instant."
         )
+        st = gr.State({"current": None, "queued": None, "history": []})
         with gr.Row():
             with gr.Column(scale=3):
                 with gr.Row():
@@ -550,6 +688,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                                   max_lines=1, value="")
                 generate_btn = gr.Button("Generate", variant="primary", size="lg",
                                          elem_id="sa3-generate")
+                promote_btn = gr.Button("", visible=False, elem_id="sa3-promote")
 
                 with gr.Accordion("Advanced", open=False):
                     with gr.Row():
@@ -589,6 +728,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 output_player = gr.HTML()
                 timing = gr.HTML()
                 error_box = gr.HTML()
+                queued_html = gr.HTML()
+                history_html = gr.HTML()
 
         dit_dd.change(on_dit_change, inputs=[dit_dd, seconds],
                       outputs=[decoder_dd, seconds])
@@ -597,12 +738,29 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
             return gr.update(maximum=sec), gr.update(maximum=sec)
         seconds.change(on_seconds_change, inputs=[seconds], outputs=[inp_start, inp_end])
 
-        generate_btn.click(generate,
-                           inputs=[dit_dd, decoder_dd, prompt, negative_prompt,
-                                   seconds, steps, seed, cfg, apg, sigma_global,
-                                   sigma_slider, a2a_audio, inpaint_audio,
-                                   inp_start, inp_end, output_opts, file_format],
-                           outputs=[output_player, timing, error_box])
+        ctrl_inputs = [dit_dd, decoder_dd, prompt, negative_prompt,
+                       seconds, steps, seed, cfg, apg, sigma_global,
+                       sigma_slider, a2a_audio, inpaint_audio,
+                       inp_start, inp_end, output_opts, file_format]
+        main_outputs = [output_player, timing, error_box, queued_html, history_html, st]
+
+        # NB: _present returns (player, timing, err, history, queued, state) —
+        # map onto components in that order.
+        def _reorder(fn):
+            def wrapped(*args):
+                player, tim, err_, hist, queued, state = fn(*args)
+                return player, tim, err_, queued, hist, state
+            wrapped.__name__ = fn.__name__
+            return wrapped
+
+        generate_btn.click(_reorder(generate), inputs=ctrl_inputs + [st],
+                           outputs=main_outputs
+                           ).then(pregen, inputs=ctrl_inputs + [st],
+                                  outputs=[queued_html, st])
+        promote_btn.click(_reorder(promote), inputs=ctrl_inputs + [st],
+                          outputs=main_outputs
+                          ).then(pregen, inputs=ctrl_inputs + [st],
+                                 outputs=[queued_html, st])
 
         gr.Markdown(
             "<p style='color:#888; font-size:0.85em'>"

@@ -1041,23 +1041,25 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                         "no reload, no per-step cost.</span>")
                     lora_inputs, lora_rows, lora_rm_btns = [], [], []
                     for _i in range(1, 4):
-                        with gr.Row(visible=False, equal_height=True) as _row:
-                            _lf = gr.File(label=f"LoRA {_i} (.safetensors)",
-                                          file_types=[".safetensors"],
-                                          type="filepath", scale=3, height=88)
-                            _ls = gr.Slider(label="strength", minimum=0.0,
-                                            maximum=10.0, value=1.0, step=0.1,
-                                            scale=2, min_width=110)
-                            _ln = gr.Slider(label="Min step", minimum=1,
-                                            maximum=default_steps, value=1,
-                                            step=1, scale=1, min_width=80)
-                            _lx = gr.Slider(label="Max step", minimum=1,
-                                            maximum=default_steps,
-                                            value=default_steps, step=1,
-                                            scale=1, min_width=80)
-                            _rm = gr.Button("✕", size="sm", scale=0,
-                                            min_width=36)
-                        lora_rows.append(_row)
+                        with gr.Group(visible=False) as _grp:
+                            with gr.Row(equal_height=True):
+                                _lf = gr.File(label=f"LoRA {_i} (.safetensors)",
+                                              file_types=[".safetensors"],
+                                              type="filepath", scale=1, height=88)
+                                _rm = gr.Button("✕", size="sm", scale=0,
+                                                min_width=36)
+                            with gr.Row():
+                                _ls = gr.Slider(label="strength", minimum=0.0,
+                                                maximum=10.0, value=1.0, step=0.1,
+                                                scale=2, min_width=110)
+                                _ln = gr.Slider(label="Min step", minimum=1,
+                                                maximum=default_steps, value=1,
+                                                step=1, scale=1, min_width=80)
+                                _lx = gr.Slider(label="Max step", minimum=1,
+                                                maximum=default_steps,
+                                                value=default_steps, step=1,
+                                                scale=1, min_width=80)
+                        lora_rows.append(_grp)
                         lora_rm_btns.append(_rm)
                         lora_inputs += [_lf, _ls, _ln, _lx]
                     lora_add_btn = gr.Button("+ Add LoRA", size="sm")

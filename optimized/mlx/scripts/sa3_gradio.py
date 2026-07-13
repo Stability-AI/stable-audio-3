@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 import wave
 from pathlib import Path
 
@@ -501,8 +502,12 @@ def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=Fal
                   "while(n&&!n.classList.contains('blk'))n=n.nextElementSibling;"
                   "if(n){var a=n.querySelector('audio');if(a)a.play();}\"")
     auto = "autoplay " if autoplay else ""
+    # Serve audio via gradio's file route instead of a data: URI — the URL ends
+    # with the real (verbose) filename, so right-click "Save audio as…" offers
+    # it instead of download.mp3, and the page stays light as history grows.
+    src = "gradio_api/file=" + urllib.parse.quote(entry["path"], safe="/")
     audio_el = (f'<audio controls {auto}style="width:100%" {attrs} '
-                f'src="data:{entry["mime"]};base64,{entry["b64"]}"></audio>')
+                f'src="{src}"></audio>')
     prompt_disp = html_lib.escape(entry["prompt"]) or "<i>(no prompt)</i>"
 
     spec_core = ""
@@ -528,16 +533,13 @@ def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=Fal
         return (f'<div class="blk" data-key="{entry["key"]}" style="{style}">'
                 f'{row}{cap}</div>')
 
-    cap = (f'<div style="font-size:0.85em; margin:4px 0; color:#888">'
-           f'{entry["size_mb"]:.1f} MB · {entry["mode"]} · saved as '
-           f'<code>{html_lib.escape(entry["name"])}</code></div>')
     spec = spec_core
     if spec_core:
         spec += ('<div style="font-size:0.75em; color:#666; margin-top:2px">'
                  '3-band tinted stereo mel · red=bass / green=mid / blue=high · '
                  'L top, R bottom · click to seek</div>')
     return (f'<div class="blk" data-key="{entry["key"]}">'
-            f'{audio_el}{cap}{spec}</div>')
+            f'{audio_el}{spec}</div>')
 
 
 def render_history(hist, advance=False, loop=False):
@@ -704,7 +706,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
             "dit": dit_name,
             "cfg": float(cfg),
             "smx": float(sigma_max),
-            "b64": base64.b64encode(out_path.read_bytes()).decode("ascii"),
+            "path": str(out_path),
             "mime": mime,
             "name": out_path.name,
             "size_mb": out_path.stat().st_size / 1e6,
@@ -919,6 +921,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         )
 
     demo.queue(max_size=16).launch(share=share, server_name="0.0.0.0",
+                                   allowed_paths=[str(OUTPUT_DIR)],
                                    prevent_thread_lock=False, show_error=True)
 
 

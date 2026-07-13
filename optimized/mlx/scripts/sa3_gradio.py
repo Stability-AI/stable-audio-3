@@ -1030,15 +1030,6 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                     negative_prompt = gr.Textbox(label="Negative prompt", lines=1)
 
                 with gr.Accordion("LoRA", open=False):
-                    gr.Markdown(
-                        "<span style='font-size:0.85em;color:#888'>"
-                        "Adapters (.safetensors — SA3-native / underfit / PEFT), "
-                        "each with its own strength and 1-based inclusive "
-                        "sampling-step range (max slider at the top = last "
-                        "step; skipping step 1 often helps). Adapters must be "
-                        "trained for the selected DiT model. Step-gated "
-                        "adapters are re-merged in place at step boundaries — "
-                        "no reload, no per-step cost.</span>")
                     lora_inputs, lora_rows, lora_rm_btns = [], [], []
                     for _i in range(1, 4):
                         with gr.Group(visible=False) as _grp:

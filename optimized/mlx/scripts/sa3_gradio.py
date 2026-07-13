@@ -1039,26 +1039,25 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                         "trained for the selected DiT model. Step-gated "
                         "adapters are re-merged in place at step boundaries — "
                         "no reload, no per-step cost.</span>")
-                    lora_inputs, lora_groups, lora_rm_btns = [], [], []
+                    lora_inputs, lora_rows, lora_rm_btns = [], [], []
                     for _i in range(1, 4):
-                        with gr.Group(visible=False) as _grp:
-                            with gr.Row():
-                                _lf = gr.File(label=f"LoRA {_i} (.safetensors)",
-                                              file_types=[".safetensors"],
-                                              type="filepath", scale=4, height=88)
-                                _ls = gr.Slider(label="strength", minimum=0.0,
-                                                maximum=10.0, value=1.0, step=0.1,
-                                                scale=3)
-                                _rm = gr.Button("✕ remove", size="sm", scale=0,
-                                                min_width=90)
-                            with gr.Row():
-                                _ln = gr.Slider(label="Min step", minimum=1,
-                                                maximum=default_steps, value=1,
-                                                step=1)
-                                _lx = gr.Slider(label="Max step", minimum=1,
-                                                maximum=default_steps,
-                                                value=default_steps, step=1)
-                        lora_groups.append(_grp)
+                        with gr.Row(visible=False, equal_height=True) as _row:
+                            _lf = gr.File(label=f"LoRA {_i} (.safetensors)",
+                                          file_types=[".safetensors"],
+                                          type="filepath", scale=3, height=88)
+                            _ls = gr.Slider(label="strength", minimum=0.0,
+                                            maximum=10.0, value=1.0, step=0.1,
+                                            scale=2, min_width=110)
+                            _ln = gr.Slider(label="Min step", minimum=1,
+                                            maximum=default_steps, value=1,
+                                            step=1, scale=1, min_width=80)
+                            _lx = gr.Slider(label="Max step", minimum=1,
+                                            maximum=default_steps,
+                                            value=default_steps, step=1,
+                                            scale=1, min_width=80)
+                            _rm = gr.Button("✕", size="sm", scale=0,
+                                            min_width=36)
+                        lora_rows.append(_row)
                         lora_rm_btns.append(_rm)
                         lora_inputs += [_lf, _ls, _ln, _lx]
                     lora_add_btn = gr.Button("+ Add LoRA", size="sm")
@@ -1131,7 +1130,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
             return ([gr.update(visible=v) for v in vis]
                     + [gr.update(visible=not all(vis)), vis])
         lora_add_btn.click(lora_add, inputs=[lora_vis],
-                           outputs=lora_groups + [lora_add_btn, lora_vis])
+                           outputs=lora_rows + [lora_add_btn, lora_vis])
 
         def _lora_remove(idx):
             def _rm(vis, cur_steps):
@@ -1144,7 +1143,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
             return _rm
         for _idx, _btn in enumerate(lora_rm_btns):
             _btn.click(_lora_remove(_idx), inputs=[lora_vis, steps],
-                       outputs=lora_groups + [lora_add_btn, lora_vis]
+                       outputs=lora_rows + [lora_add_btn, lora_vis]
                        + lora_inputs[4 * _idx: 4 * _idx + 4])
 
         def on_steps_change(s):

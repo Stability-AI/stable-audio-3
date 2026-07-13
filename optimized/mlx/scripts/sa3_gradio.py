@@ -411,16 +411,19 @@ def _ago(ts) -> str:
 
 
 def _meta_suffix(entry) -> str:
-    """' · cfg 1.5 · smx 0.92 · audio2audio · inpainting' — only the non-defaults."""
+    """' · cfg 1.5 · noise 0.92 · audio2audio · inpainting' — only the non-defaults.
+    The sigma tag reads 'noise' for a2a runs (it IS the init_noise_level there),
+    'smx' otherwise."""
     parts = []
     cfg = entry.get("cfg", 1.0)
     smx = entry.get("smx", 1.0)
+    mode = entry.get("mode", "")
+    is_a2a = "a2a" in mode or mode == "audio-to-audio"
     if cfg != 1.0:
         parts.append(f"cfg {cfg:g}")
     if smx != 1.0:
-        parts.append(f"smx {smx:g}")
-    mode = entry.get("mode", "")
-    if "a2a" in mode or mode == "audio-to-audio":
+        parts.append(f"{'noise' if is_a2a else 'smx'} {smx:g}")
+    if is_a2a:
         parts.append("audio2audio")
     if "inpaint" in mode:
         parts.append("inpainting")
@@ -511,7 +514,9 @@ def render_queue_status(entry=None, generating=False):
         body = f"ready — {p} · seed {entry['seed']}{_meta_suffix(entry)}"
     else:
         return ""
-    return (f'<div style="margin-top:2px; color:#888; font-size:0.85em; opacity:0.7">'
+    return (f'<div style="margin-top:2px; padding:6px 10px; '
+            f'background:rgba(127,127,127,0.12); border-radius:6px; '
+            f'color:#888; font-size:0.85em">'
             f'<b>Queued next</b> · {body}</div>')
 
 
@@ -626,7 +631,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         load_note = (f"DiT-load {t['dit_load_ms']:.0f} ms ·&nbsp; "
                      if t.get("dit_load_ms", 0) > 100 else "")
         enc_note = f"encode {t['enc_ms']:.0f} ms ·&nbsp; " if t.get("enc_ms") else ""
-        cfg_note = f"cfg {cfg} (apg {apg}) ·&nbsp; " if cfg != 1.0 else ""
+        apg_note = f" (apg {apg:g})" if apg != 1.0 else ""
+        cfg_note = f"cfg {cfg:g}{apg_note} ·&nbsp; " if cfg != 1.0 else ""
         timing_html = (
             f"{load_note}{enc_note}{cfg_note}"
             f"<b>Inference</b>: {t['inference_ms']:.0f} ms "

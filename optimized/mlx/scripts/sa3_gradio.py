@@ -411,10 +411,11 @@ def _ago(ts) -> str:
 
 
 def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=False,
-                  bg=None):
+                  bg=None, advance=False):
     """One self-contained player block: audio + caption + seekable spectrogram
     with playhead. Global one-at-a-time playback via onplay pause-others.
-    small: audio + spectrogram side by side (half width each), 'Xm ago' caption."""
+    small: audio + spectrogram side by side (half width each), 'Xm ago' caption.
+    advance: on ended, hop to the next history item's audio (Auto-play)."""
     attrs = f'onplay="{_JS_PAUSE_OTHERS}" ontimeupdate="{_JS_PLAYHEAD}"'
     if autodl:
         js_name = entry["name"].replace("\\", "").replace("'", "\\'")
@@ -423,6 +424,11 @@ def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=Fal
                   f"l.download='{js_name}';l.click();}}\"")
     if radio:
         attrs += f' onended="{_JS_PROMOTE}"'
+    elif advance:
+        attrs += (' onended="var b=this.closest(\'.blk\');'
+                  "var n=b?b.nextElementSibling:null;"
+                  "while(n&&!n.classList.contains('blk'))n=n.nextElementSibling;"
+                  "if(n){var a=n.querySelector('audio');if(a)a.play();}\"")
     auto = "autoplay " if autoplay else ""
     audio_el = (f'<audio controls {auto}style="width:100%" {attrs} '
                 f'src="data:{entry["mime"]};base64,{entry["b64"]}"></audio>')
@@ -445,8 +451,7 @@ def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=Fal
                f'<div style="flex:1; min-width:0">{audio_el}</div>'
                f'<div style="flex:1; min-width:0">{spec_core}</div></div>')
         cap = (f'<div style="font-size:0.8em; margin:2px 0; color:#888">'
-               f'{_ago(entry.get("ts"))} · {prompt_disp} · seed {entry["seed"]} · '
-               f'<code>{html_lib.escape(entry["name"])}</code></div>')
+               f'{_ago(entry.get("ts"))} · {prompt_disp} · seed {entry["seed"]}</div>')
         style = f"padding:6px 8px;{' background:' + bg + ';' if bg else ''}"
         return (f'<div class="blk" data-key="{entry["key"]}" style="{style}">'
                 f'{row}{cap}</div>')
@@ -463,12 +468,13 @@ def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=Fal
             f'{audio_el}{cap}{spec}</div>')
 
 
-def render_history(hist):
+def render_history(hist, advance=False):
     if not hist:
         return ""
-    # zebra striping instead of separators: light grey on every other row
+    # zebra striping instead of separators: light grey vs medium grey rows
     items = "".join(
-        render_player(e, small=True, bg="rgba(127,127,127,0.12)" if i % 2 else None)
+        render_player(e, small=True, advance=advance,
+                      bg="rgba(127,127,127,0.24)" if i % 2 else "rgba(127,127,127,0.08)")
         for i, e in enumerate(hist))
     boot = f'<img src="data:," style="display:none" onerror="{_JS_SCROLL_RESTORE}"/>'
     return (f'<div style="font-weight:600; margin-top:14px">Previous generations ({len(hist)})</div>'
@@ -487,7 +493,7 @@ def render_queue_status(entry=None, generating=False):
         body = f"ready — {p} · seed {entry['seed']}"
     else:
         return ""
-    return (f'<div style="margin-top:14px; color:#888; font-size:0.85em; opacity:0.7">'
+    return (f'<div style="margin-top:2px; color:#888; font-size:0.85em; opacity:0.7">'
             f'<b>Queued next</b> · {body}</div>')
 
 
@@ -642,7 +648,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                              autodl="Auto-download" in opts,
                              radio="Infinite Radio" in opts)
         return (main, entry["timing"], "",
-                render_history(state["history"]),
+                render_history(state["history"], advance="Auto-play" in opts),
                 queued_panel, state)
 
     def generate(dit_name, decoder_name, prompt, negative_prompt,

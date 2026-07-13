@@ -478,6 +478,14 @@ def _meta_suffix(entry) -> str:
     return "".join(f" · {p}" for p in parts)
 
 
+def _neg_disp(entry) -> str:
+    """Labeled negative prompt, shown only when it actually acted (cfg != 1)."""
+    neg = (entry.get("neg") or "").strip()
+    if neg and entry.get("cfg", 1.0) != 1.0:
+        return f' · <span style="opacity:0.75">neg: {html_lib.escape(neg)}</span>'
+    return ""
+
+
 def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=False,
                   bg=None, advance=False, loop=False, hotswap=False):
     """One self-contained player block: audio + caption + seekable spectrogram
@@ -543,7 +551,7 @@ def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=Fal
                f'<div style="flex:1; min-width:0">{audio_el}</div>'
                f'<div style="flex:1; min-width:0">{spec_core}</div></div>')
         cap = (f'<div style="font-size:0.8em; margin:2px 0; color:#888">'
-               f'{_ago(entry.get("ts"))} · {prompt_disp} · seed {entry["seed"]}'
+               f'{_ago(entry.get("ts"))} · {prompt_disp}{_neg_disp(entry)} · seed {entry["seed"]}'
                f'{_meta_suffix(entry)}</div>')
         style = f"padding:6px 8px;{' background:' + bg + ';' if bg else ''}"
         return (f'<div class="blk" data-key="{entry["key"]}" style="{style}">'
@@ -575,7 +583,7 @@ def render_queue_status(entry=None, generating=False):
         body = "generating…"
     elif entry is not None:
         p = html_lib.escape(entry["prompt"]) or "<i>(no prompt)</i>"
-        body = f"ready — {p} · seed {entry['seed']}{_meta_suffix(entry)}"
+        body = f"ready — {p}{_neg_disp(entry)} · seed {entry['seed']}{_meta_suffix(entry)}"
     else:
         return ""
     return (f'<div style="margin-top:2px; padding:6px 10px; '
@@ -699,8 +707,10 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         apg_note = f" (apg {apg:g})" if apg != 1.0 else ""
         cfg_note = f"cfg {cfg:g}{apg_note} ·&nbsp; " if cfg != 1.0 else ""
         prompt_disp = html_lib.escape(prompt) or "<i>(no prompt)</i>"
+        neg_disp = (f' · <span style="opacity:0.75">neg: {html_lib.escape(negative_prompt.strip())}</span>'
+                    if negative_prompt and negative_prompt.strip() and cfg != 1.0 else "")
         timing_html = (
-            f"{prompt_disp} ·&nbsp; "
+            f"{prompt_disp}{neg_disp} ·&nbsp; "
             f"{load_note}{enc_note}{cfg_note}"
             f"<b>Inference</b>: {t['inference_ms']:.0f} ms "
             f"<span style='color:#888'>(t5={t['t5_ms']:.0f} · sample={t['sample_ms']:.0f} · "
@@ -717,6 +727,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
             "key": f"k{time.time_ns()}",
             "ts": time.time(),
             "dit": dit_name,
+            "neg": (negative_prompt or "").strip(),
             "cfg": float(cfg),
             "smx": float(sigma_max),
             "path": str(out_path),

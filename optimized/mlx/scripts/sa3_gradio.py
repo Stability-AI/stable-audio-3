@@ -392,12 +392,16 @@ def run_generation(dit_name: str, decoder_name: str, prompt: str,
 # player registers itself in window._sa3All on play, and pause-others sweeps
 # that registry (reaching ghosts) plus the document. Entries that are detached
 # AND paused drop from the registry so ghosts can be garbage-collected.
+# A DETACHED element's play event must never silence the living player (the
+# swap can briefly leave a superseded copy whose pending play() resolves late).
 _JS_PAUSE_OTHERS = (
+    "if(this.isConnected){"
     "var t=this;var L=window._sa3All=(window._sa3All||[]);"
     "if(L.indexOf(t)<0)L.push(t);"
     "L.forEach(function(o){if(o!==t){try{o.pause()}catch(e){}}});"
     "document.querySelectorAll('audio').forEach(function(o){if(o!==t)o.pause();});"
-    "window._sa3All=L.filter(function(o){return o===t||o.isConnected;});")
+    "window._sa3All=L.filter(function(o){return o===t||o.isConnected;});}"
+    "else{this.pause();}")
 _JS_PLAYHEAD = ("var p=this.closest('.blk').querySelector('.ph');"
                 "if(p&&this.duration)p.style.left=(this.currentTime/this.duration*100)+'%';")
 # Main-player position ledger (for Hotswap): every timeupdate/play/pause stamps
@@ -411,14 +415,40 @@ _JS_PLAYHEAD = ("var p=this.closest('.blk').querySelector('.ph');"
 #    handler reads it.
 _JS_POS_RECORD = ("if(this.isConnected&&!(this.dataset.hs==='1'&&!this.dataset.hsd))"
                   "{window._sa3Pos={t:this.currentTime,playing:!this.paused,ts:Date.now()};}")
+# timeupdate variant: a PAUSED element only fires timeupdate on seeks — e.g. the
+# resume handler's own currentTime assignment. Stamping playing:false there
+# poisons the ledger for any second render of the same clip (gradio sometimes
+# renders a component update twice), which froze the handoff chain. While
+# paused, only real pause events may write.
+_JS_POS_RECORD_TU = ("if(this.isConnected&&!this.paused&&"
+                     "!(this.dataset.hs==='1'&&!this.dataset.hsd))"
+                     "{window._sa3Pos={t:this.currentTime,playing:true,ts:Date.now()};}")
+# Resilient play: Chrome's autoplay policy can reject programmatic play() once
+# the transient user activation from the Generate click has expired (seconds),
+# leaving the clip correctly positioned but paused. Try, retry shortly after,
+# and as a last resort arm a one-shot listener so the user's next click or
+# keypress anywhere resumes playback.
+# Every attempt re-checks isConnected: a superseded (detached) element must
+# never revive itself from a queued retry and fight the current player.
+_JS_TRY_PLAY = (
+    "var A=this;A.play().catch(function(){setTimeout(function(){"
+    "if(!A.isConnected)return;"
+    "A.play().catch(function(){console.warn('play blocked by autoplay policy — "
+    "will resume on next interaction');"
+    "var f=function(){if(A.isConnected)A.play();"
+    "document.removeEventListener('pointerdown',f,true);"
+    "document.removeEventListener('keydown',f,true);};"
+    "document.addEventListener('pointerdown',f,true);"
+    "document.addEventListener('keydown',f,true);});},150);});")
 # Hotswap resume: if the previous main audio was playing when this one arrived,
 # jump to its position (+ the split-second since the last stamp) and keep going;
 # beyond the new clip's duration -> start at zero. Guarded (hsd) so it applies
 # once, on whichever of loadedmetadata/canplay fires first.
-_JS_HOTSWAP = ("if(this.dataset.hs==='1'&&!this.dataset.hsd&&this.duration){"
+_JS_HOTSWAP = ("if(this.isConnected&&this.dataset.hs==='1'&&!this.dataset.hsd&&this.duration){"
                "this.dataset.hsd=1;var s=window._sa3Pos;"
+               "this.dataset.dbg=s?(s.playing?'playing@'+s.t.toFixed(2):'notplaying@'+s.t.toFixed(2)):'noledger';"
                "if(s&&s.playing){var tt=s.t+(Date.now()-s.ts)/1000;"
-               "this.currentTime=(tt<this.duration)?tt:0;this.play();}}")
+               "this.currentTime=(tt<this.duration)?tt:0;" + _JS_TRY_PLAY + "}}")
 _JS_SEEK = ("var a=this.closest('.blk').querySelector('audio');"
             "var r=this.getBoundingClientRect();"
             "if(a&&a.duration){a.currentTime=(event.clientX-r.left)/r.width*a.duration;a.play();}")
@@ -502,10 +532,15 @@ def render_player(entry, *, small=False, autoplay=False, autodl=False, radio=Fal
     else:
         attrs = (f'onplay="{_JS_PAUSE_OTHERS}{_JS_POS_RECORD}" '
                  f'onpause="{_JS_POS_RECORD}" '
-                 f'ontimeupdate="{_JS_PLAYHEAD}{_JS_POS_RECORD}"')
+                 f'ontimeupdate="{_JS_PLAYHEAD}{_JS_POS_RECORD_TU}"')
     if hotswap and not small:
         attrs += f' data-hs="1" onloadedmetadata="{_JS_HOTSWAP}"'
         on_canplay.append(_JS_HOTSWAP)   # fallback if loadedmetadata already passed
+    if autoplay and not small:
+        # the autoplay attribute is subject to the same policy — rescue a
+        # policy-paused clip (radio transitions, long generations)
+        on_canplay.append("if(this.paused&&!(this.dataset.hs==='1'&&!this.dataset.hsd))"
+                          "{" + _JS_TRY_PLAY + "}")
     if autodl:
         js_name = entry["name"].replace("\\", "").replace("'", "\\'")
         on_canplay.append("if(!this.dataset.dld){this.dataset.dld=1;"

@@ -23,6 +23,8 @@ import argparse
 import base64
 import math
 import re
+import shutil
+import subprocess
 import sys
 import time
 import wave
@@ -53,6 +55,9 @@ from spec import render_spectrogram_png  # noqa: E402
 OUTPUT_DIR = REPO / "output" / "gradio"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 MIN_SIGMA = 0.01
+# MP3 (V0) saving needs ffmpeg; without it we save WAV and hide the choice.
+FFMPEG = shutil.which("ffmpeg") is not None
+FORMAT_MP3, FORMAT_WAV = "Save to MP3 (V0)", "Save to WAV"
 DEFAULT_DECODERS = {name: cfg["default_decoder"] for name, cfg in DIT_CHOICES.items()}
 # Trained max clip length per model (repo README model table).
 MAX_SECONDS = {"sm-music": 120, "sm-sfx": 120, "medium": 380}
@@ -379,7 +384,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
 
     def generate(dit_name, decoder_name, prompt, negative_prompt,
                  seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
-                 a2a_audio, inpaint_audio, inp_start, inp_end):
+                 a2a_audio, inpaint_audio, inp_start, inp_end,
+                 output_opts, file_format):
         err = lambda m: ("", "", f"<span style='color:#f88'>{m}</span>")
         prompt = (prompt or "").strip()
         # Permissive by design: a generation should succeed with whatever IS set.
@@ -433,17 +439,44 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
             return err("error: model produced non-finite audio (try a higher σmax or different seed)")
 
         pcm = (np.clip(audio_np, -1, 1) * 32767.0).astype(np.int16).T   # (T, 2)
-        out_path = OUTPUT_DIR / f"{verbose_basename(prompt, negative_prompt, cfg, sigma_max, seed)}.wav"
+        basename = verbose_basename(prompt, negative_prompt, cfg, sigma_max, seed)
+        out_path = OUTPUT_DIR / f"{basename}.wav"
         _save_wav(pcm, out_path)
+        mime = "audio/wav"
+        if FFMPEG and file_format == FORMAT_MP3:
+            mp3_path = OUTPUT_DIR / f"{basename}.mp3"
+            r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(out_path),
+                                "-codec:a", "libmp3lame", "-q:a", "0", str(mp3_path)],
+                               capture_output=True)
+            if r.returncode == 0 and mp3_path.exists():
+                out_path.unlink()
+                out_path, mime = mp3_path, "audio/mpeg"
+            else:
+                notes.append("mp3 encode failed — saved WAV instead")
         b64 = base64.b64encode(out_path.read_bytes()).decode("ascii")
         # Audio + spectrogram in ONE block so inline handlers can couple them:
         # the audio's timeupdate drives the white playhead; clicking the
         # spectrogram seeks (gradio HTML runs attributes, not <script> tags).
+        opts = output_opts or []
+        autoplay = "autoplay " if "Auto-play" in opts else ""
+        extra_attrs = ""
+        if "Auto-download" in opts:
+            js_name = out_path.name.replace("\\", "").replace("'", "\\'")
+            extra_attrs += (' oncanplay="if(!this.dataset.dld){this.dataset.dld=1;'
+                            "var l=document.createElement('a');l.href=this.src;"
+                            f"l.download='{js_name}';l.click();}}\"")
+        if "Infinite Radio" in opts:
+            extra_attrs += (' onended="var b=document.getElementById(\'sa3-generate\');'
+                            "if(b){(b.tagName==='BUTTON'?b:b.querySelector('button')||b).click();}\"")
+            if seed_text and seed_text.strip() and seed_text.strip() != "-1":
+                notes.append("Infinite Radio with a fixed seed repeats the same clip — "
+                             "clear the seed for endless variety")
         audio_el = (
-            f'<audio controls autoplay style="width:100%" '
+            f'<audio controls {autoplay}style="width:100%" '
             f'ontimeupdate="var p=this.parentNode.querySelector(\'.ph\');'
-            f'if(p&&this.duration)p.style.left=(this.currentTime/this.duration*100)+\'%\';" '
-            f'src="data:audio/wav;base64,{b64}"></audio>'
+            f'if(p&&this.duration)p.style.left=(this.currentTime/this.duration*100)+\'%\';"'
+            f'{extra_attrs} '
+            f'src="data:{mime};base64,{b64}"></audio>'
             f'<div style="font-size:0.85em; margin:4px 0; color:#888">'
             f'{out_path.stat().st_size/1e6:.1f} MB · {mode} · saved as <code>{out_path.name}</code></div>'
         )
@@ -515,7 +548,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                                     value=1.0, step=0.1)
                 seed = gr.Textbox(label="Seed (optional, blank = random)",
                                   max_lines=1, value="")
-                generate_btn = gr.Button("Generate", variant="primary", size="lg")
+                generate_btn = gr.Button("Generate", variant="primary", size="lg",
+                                         elem_id="sa3-generate")
 
                 with gr.Accordion("Advanced", open=False):
                     with gr.Row():
@@ -541,6 +575,15 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                         inp_end = gr.Slider(label="End (s)", minimum=0, maximum=120,
                                             value=0, step=0.5)
 
+                with gr.Accordion("Output", open=False):
+                    output_opts = gr.CheckboxGroup(
+                        ["Auto-play", "Auto-download", "Infinite Radio"],
+                        value=["Auto-play"], label="Options")
+                    file_format = gr.Radio(
+                        [FORMAT_MP3, FORMAT_WAV] if FFMPEG else [FORMAT_WAV],
+                        value=FORMAT_MP3 if FFMPEG else FORMAT_WAV,
+                        label="Format", visible=FFMPEG)
+
             with gr.Column(scale=2):
                 gr.Markdown("**Output**")
                 output_player = gr.HTML()
@@ -558,7 +601,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                            inputs=[dit_dd, decoder_dd, prompt, negative_prompt,
                                    seconds, steps, seed, cfg, apg, sigma_global,
                                    sigma_slider, a2a_audio, inpaint_audio,
-                                   inp_start, inp_end],
+                                   inp_start, inp_end, output_opts, file_format],
                            outputs=[output_player, timing, error_box])
 
         gr.Markdown(

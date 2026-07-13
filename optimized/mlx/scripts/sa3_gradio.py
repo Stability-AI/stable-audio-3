@@ -727,7 +727,12 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
 
     # sa3-promote must stay MOUNTED for the onended click to find it —
     # visible=False would remove it from the DOM entirely, so hide via CSS.
-    with gr.Blocks(title="SA3 MLX", css="#sa3-promote{display:none !important}") as demo:
+    # sa3-out: collapse the column's flex gap + wrapper padding so the
+    # spectrogram caption / timing line / queued status sit tightly together.
+    _css = ("#sa3-promote{display:none !important}"
+            "#sa3-out{gap:4px !important}"
+            "#sa3-out .html-container{padding:0 !important; margin:0 !important}")
+    with gr.Blocks(title="SA3 MLX", css=_css) as demo:
         gr.Markdown(
             "# SA3 MLX — Apple Silicon\n"
             "Text-to-audio, CFG + negative prompt, audio-to-audio, inpainting. "
@@ -792,7 +797,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                         value=FORMAT_MP3 if FFMPEG else FORMAT_WAV,
                         label="Format", visible=FFMPEG)
 
-            with gr.Column(scale=2):
+            with gr.Column(scale=2, elem_id="sa3-out"):
                 gr.Markdown("**Output**")
                 output_player = gr.HTML()
                 timing = gr.HTML()

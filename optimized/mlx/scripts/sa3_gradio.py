@@ -772,13 +772,20 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 a2a_audio, inpaint_audio, inp_start, inp_end,
                 output_opts, file_format, state):
         """Infinite Radio: swap the pre-generated clip in when playback ends.
-        Falls back to a full generate if the queue is empty."""
+        Falls back to a full generate if the queue is empty. Either way the
+        next track ALWAYS autoplays — Auto-play only governs whether a clip
+        starts when nothing was playing; radio transitions are continuations."""
         q = state.get("queued")
         if q is None:
-            return generate(dit_name, decoder_name, prompt, negative_prompt,
-                            seconds, steps, seed_text, cfg, apg, sigma_max,
-                            init_noise, a2a_audio, inpaint_audio, inp_start,
-                            inp_end, output_opts, file_format, state)
+            entry, err_msg = _generate_entry(
+                dit_name, decoder_name, prompt, negative_prompt, seconds, steps,
+                seed_text, cfg, apg, sigma_max, init_noise, a2a_audio,
+                inpaint_audio, inp_start, inp_end, output_opts, file_format)
+            if entry is None:
+                return (gr.update(), gr.update(),
+                        f"<span style='color:#f88'>{err_msg}</span>",
+                        gr.update(), gr.update(), state)
+            q = entry
         state["queued"] = None
         return _present(state, q, output_opts or [],
                         render_queue_status(generating=True), force_autoplay=True)

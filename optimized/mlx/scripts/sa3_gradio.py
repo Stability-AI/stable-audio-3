@@ -447,11 +447,18 @@ def render_history(hist):
             f'padding-right:6px">{boot}{items}</div>')
 
 
-def render_queued(entry):
-    if entry is None:
+def render_queue_status(entry=None, generating=False):
+    """Subdued status chip for the Infinite Radio queue — no audio/spectrogram,
+    just Generating…/Ready (the swap uses the entry held in server state)."""
+    if generating:
+        body = "generating…"
+    elif entry is not None:
+        p = html_lib.escape(entry["prompt"]) or "<i>(no prompt)</i>"
+        body = f"ready — {p} · seed {entry['seed']}"
+    else:
         return ""
-    return ('<div style="font-weight:600; margin-top:14px">Queued next ▶</div>'
-            + render_player(entry, small=True))
+    return (f'<div style="margin-top:14px; color:#888; font-size:0.85em; opacity:0.7">'
+            f'<b>Queued next</b> · {body}</div>')
 
 
 # ── Gradio UI ──────────────────────────────────────────────────────────────
@@ -593,7 +600,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         }
         return entry, None
 
-    def _present(state, entry, opts, *, force_autoplay=False):
+    def _present(state, entry, opts, queued_panel, *, force_autoplay=False):
         """Make `entry` the current clip (previous current moves to history top)
         and render all output panels."""
         if state["current"] is not None:
@@ -605,7 +612,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                              radio="Infinite Radio" in opts)
         return (main, entry["timing"], "",
                 render_history(state["history"]),
-                render_queued(state["queued"]), state)
+                queued_panel, state)
 
     def generate(dit_name, decoder_name, prompt, negative_prompt,
                  seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
@@ -622,7 +629,9 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         # a manual Generate makes any queued clip stale (settings may have changed);
         # the chained pregen refills it when Infinite Radio is on
         state["queued"] = None
-        return _present(state, entry, output_opts or [])
+        opts = output_opts or []
+        queued_panel = render_queue_status(generating=True) if "Infinite Radio" in opts else ""
+        return _present(state, entry, opts, queued_panel)
 
     def promote(dit_name, decoder_name, prompt, negative_prompt,
                 seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
@@ -637,7 +646,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                             init_noise, a2a_audio, inpaint_audio, inp_start,
                             inp_end, output_opts, file_format, state)
         state["queued"] = None
-        return _present(state, q, output_opts or [], force_autoplay=True)
+        return _present(state, q, output_opts or [],
+                        render_queue_status(generating=True), force_autoplay=True)
 
     def pregen(dit_name, decoder_name, prompt, negative_prompt,
                seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
@@ -656,9 +666,11 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
             return (f"<div style='color:#f88; font-size:0.85em'>queue: {err_msg}</div>",
                     state)
         state["queued"] = entry
-        return render_queued(entry), state
+        return render_queue_status(entry), state
 
-    with gr.Blocks(title="SA3 MLX") as demo:
+    # sa3-promote must stay MOUNTED for the onended click to find it —
+    # visible=False would remove it from the DOM entirely, so hide via CSS.
+    with gr.Blocks(title="SA3 MLX", css="#sa3-promote{display:none !important}") as demo:
         gr.Markdown(
             "# SA3 MLX — Apple Silicon\n"
             "All modes wired: text-to-audio, CFG + negative prompt, audio-to-audio "
@@ -688,7 +700,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                                   max_lines=1, value="")
                 generate_btn = gr.Button("Generate", variant="primary", size="lg",
                                          elem_id="sa3-generate")
-                promote_btn = gr.Button("", visible=False, elem_id="sa3-promote")
+                promote_btn = gr.Button("", elem_id="sa3-promote")   # CSS-hidden, DOM-present
 
                 with gr.Accordion("Advanced", open=False):
                     with gr.Row():

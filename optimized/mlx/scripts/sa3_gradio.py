@@ -1162,6 +1162,15 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 queued_html = gr.HTML()
                 history_html = gr.HTML()
 
+        def _sync_dd_vis(dit_name):
+            """Second batch after any group (re)mount: gradio 6 drops visibility
+            updates sent to components inside a hidden container (the component
+            isn't in the DOM), so dropdown show/hide must be applied AFTER the
+            slot groups are mounted — chained via .then() on every event that
+            reveals them."""
+            v = len(_lora_dd_choices(dit_name)) > 1
+            return [gr.update(visible=v) for _ in range(3)]
+
         dit_dd.change(on_dit_change,
                       inputs=[dit_dd, seconds, steps, prev_dit, lora_mem,
                               lora_vis] + lora_inputs,
@@ -1170,7 +1179,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                               + [lora_add_btn, lora_vis, prev_dit, lora_mem]
                               + lora_files
                               + [c for i in range(3)
-                                 for c in lora_inputs[5 * i + 2: 5 * i + 5]])
+                                 for c in lora_inputs[5 * i + 2: 5 * i + 5]]
+                      ).then(_sync_dd_vis, inputs=[dit_dd], outputs=lora_dds)
 
         def on_seconds_change(sec):
             return gr.update(maximum=sec), gr.update(maximum=sec)
@@ -1189,17 +1199,30 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         output_opts.change(on_opts_change, inputs=[output_opts, opts_state],
                            outputs=[output_opts, opts_state])
 
-        def lora_add(vis):
-            """Reveal the first hidden LoRA row; hide the button at 3/3."""
+        def lora_add(vis, dit_name, f1, d1, f2, d2, f3, d3):
+            """Reveal the first hidden LoRA slot; hide the button at 3/3.
+            Slider-row and dropdown visibility are recomputed from slot content
+            and the current model's library on every add, so a re-opened slot
+            can never inherit a stale visible state — sliders only show once
+            THIS slot has an adapter, and the dropdown only when
+            loras/<model>/ has any."""
             vis = list(vis)
             for i, v in enumerate(vis):
                 if not v:
                     vis[i] = True
                     break
-            return ([gr.update(visible=v) for v in vis]
+            srows = [gr.update(visible=bool(f or (d and d != _DD_NONE)))
+                     for f, d in ((f1, d1), (f2, d2), (f3, d3))]
+            return ([gr.update(visible=v) for v in vis] + srows
                     + [gr.update(visible=not all(vis)), vis])
-        lora_add_btn.click(lora_add, inputs=[lora_vis],
-                           outputs=lora_rows + [lora_add_btn, lora_vis])
+
+        lora_add_btn.click(lora_add,
+                           inputs=[lora_vis, dit_dd]
+                           + [c for i in range(3)
+                              for c in lora_inputs[5 * i: 5 * i + 2]],
+                           outputs=lora_rows + lora_srows
+                           + [lora_add_btn, lora_vis]
+                           ).then(_sync_dd_vis, inputs=[dit_dd], outputs=lora_dds)
 
         def _lora_remove(idx):
             def _rm(vis, cur_steps):

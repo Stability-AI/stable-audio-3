@@ -14,3 +14,6 @@ output/gradio/
 
 # Local LoRA library scanned by the gradio UI (user adapters, never committed)
 loras/
+
+# Trainer telemetry (written to cwd, underfit convention)
+loss_by_timestep.bin

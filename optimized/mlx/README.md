@@ -94,6 +94,18 @@ Apple Silicon only (MLX is Metal-backed). Python 3.10+. `./install.sh
 ./sa3 --prompt "ambient drone" --cfg 3.0 --negative-prompt "drums, vocals" \
       --dit sm-music --decoder same-s --out drone.wav
 
+# Apply a LoRA finetune (merged into the DiT at load; base must match --dit)
+./sa3 --prompt "arabic maqam oud taqsim" --dit medium --decoder same-l \
+      --lora ./my_lora.safetensors --lora-strength 1.0 --out maqam.wav
+
+# Per-LoRA strength + sampling-step gating (skipping step 1 often helps).
+# steps= is 1-based inclusive: 2-8, 2- (2..last), -4 (1..4), 3 (just step 3).
+# Step-gated adapters are re-merged in place at the few step boundaries
+# (~80 ms each on medium) — no extra memory, every step runs at full speed.
+./sa3 --prompt "progressive metal instrumental" --dit medium --decoder same-l \
+      --lora plini.safetensors strength=0.8 steps=2- \
+      --lora rain_texture.safetensors steps=-4 --out prog.wav
+
 # Generate + play immediately (afplay; Ctrl-C stops both)
 ./sa3 --prompt "rainforest" --dit sm-sfx --decoder same-s --play
 
@@ -196,6 +208,8 @@ Sample run on **M4 Pro / 48 GB**:
 | `--init-noise-level`  | 1.0      | σmax; 0.4–0.8 typical for variation, 1.0 = full regen, >1 = overshoot |
 | `--inpaint-range`     | —        | `START,END` seconds; regenerate that span, keep the rest              |
 | `--dit-dtype`         | fp16     | DiT compute dtype (decoder always FP32; T5Gemma always fp16)          |
+| `--lora`              | —        | A `.safetensors` LoRA adapter (SA3-native/underfit or PEFT) with optional `strength=S` and `steps=MIN-MAX` tokens; repeat the flag to stack adapters. Full-range adapters merge at load; step-gated ones re-merge in place at step boundaries. Pickle `.ckpt/.pt` is refused. Base must match `--dit` |
+| `--lora-strength`     | 1.0      | Default strength for adapters without their own `strength=`; 0 = bit-exact bypass, >1 amplifies |
 | `--free-models`       | on       | Progressive model freeing; `--no-free-models` keeps them resident     |
 | `--out`               | out.wav  | Relative → `output/<file>`; absolute → as-is. 16-bit PCM stereo @ 44.1 kHz, trimmed to exactly `--seconds` |
 | `--play`              | off      | After writing, play via `afplay`; Ctrl-C stops both processes         |

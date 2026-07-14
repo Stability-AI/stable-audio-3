@@ -779,20 +779,47 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         get_dit(initial_dit, warm_T, mx.float16); get_decoder(initial_decoder)
     mlx_call(_warm)
 
-    def on_dit_change(dit_name, cur_seconds, f1, f2, f3):
-        """Model switch: pair the decoder, clamp seconds, rescan the local LoRA
-        library for the new model (dropdowns reset to the placeholder and hide
-        when loras/<model>/ is empty; slider rows stay only for slots with a
-        dropped file)."""
+    def on_dit_change(dit_name, cur_seconds, cur_steps, prev, mem, vis, *slot_vals):
+        """Model switch: pair the decoder, clamp seconds, and swap the LoRA
+        panel to the new model — the outgoing model's slots (files, picks,
+        strengths, ranges, visibility) are snapshotted into per-model memory
+        and the incoming model's snapshot is restored (or an empty panel if it
+        has none). Dropdowns rescan loras/<model>/ (hidden when empty); a
+        remembered pick that no longer exists on disk falls back to the
+        placeholder."""
         max_s = MAX_SECONDS.get(dit_name, 120)
         ch = _lora_dd_choices(dit_name)
+        valid = {v for _, v in ch}
         lbl = f"…or pick from loras/{LORA_DIR_NAMES.get(dit_name, dit_name)}/"
-        dd_ups = [gr.update(choices=ch, value=_DD_NONE, visible=len(ch) > 1,
-                            label=lbl) for _ in range(3)]
-        srow_ups = [gr.update(visible=bool(f)) for f in (f1, f2, f3)]
+
+        mem = dict(mem or {})
+        mem[prev] = {"vis": list(vis),
+                     "slots": [list(slot_vals[5 * i: 5 * i + 5]) for i in range(3)]}
+        snap = mem.get(dit_name)
+        if snap:
+            nvis = list(snap["vis"])
+            slots = [list(s) for s in snap["slots"]]
+            for s in slots:
+                if s[1] not in valid:
+                    s[1] = _DD_NONE
+            # a slot with an adapter must never be an invisible-but-active one
+            nvis = [v or bool(s[0] or s[1] != _DD_NONE)
+                    for v, s in zip(nvis, slots)]
+        else:
+            nvis = [False, False, False]
+            slots = [[None, _DD_NONE, 1.0, 1, int(cur_steps)] for _ in range(3)]
+
+        dd_ups = [gr.update(choices=ch, value=slots[i][1], visible=len(ch) > 1,
+                            label=lbl) for i in range(3)]
+        srow_ups = [gr.update(visible=bool(slots[i][0] or slots[i][1] != _DD_NONE))
+                    for i in range(3)]
+        row_ups = [gr.update(visible=v) for v in nvis]
         return (gr.update(value=DEFAULT_DECODERS.get(dit_name, "same-s")),
                 gr.update(maximum=max_s, value=min(cur_seconds, max_s)),
-                *dd_ups, *srow_ups)
+                *dd_ups, *srow_ups, *row_ups,
+                gr.update(visible=not all(nvis)), nvis, dit_name, mem,
+                slots[0][0], slots[1][0], slots[2][0],
+                *(slots[i][j] for i in range(3) for j in (2, 3, 4)))
 
     def _generate_entry(dit_name, decoder_name, prompt, negative_prompt,
                         seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
@@ -1093,6 +1120,10 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                         lora_inputs += [_lf, _ld, _ls, _ln, _lx]
                     lora_add_btn = gr.Button("+ Add LoRA", size="sm")
                     lora_vis = gr.State([False, False, False])
+                    # Per-model LoRA memory: switching DiT saves the outgoing
+                    # model's slots and restores the incoming model's.
+                    lora_mem = gr.State({})
+                    prev_dit = gr.State(initial_dit)
 
                 with gr.Accordion("Audio-to-audio (guide the whole clip)", open=False):
                     a2a_audio = gr.Audio(label="Guide audio — generation starts from its latents",
@@ -1131,8 +1162,15 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 queued_html = gr.HTML()
                 history_html = gr.HTML()
 
-        dit_dd.change(on_dit_change, inputs=[dit_dd, seconds] + lora_files,
-                      outputs=[decoder_dd, seconds] + lora_dds + lora_srows)
+        dit_dd.change(on_dit_change,
+                      inputs=[dit_dd, seconds, steps, prev_dit, lora_mem,
+                              lora_vis] + lora_inputs,
+                      outputs=[decoder_dd, seconds] + lora_dds + lora_srows
+                              + lora_rows
+                              + [lora_add_btn, lora_vis, prev_dit, lora_mem]
+                              + lora_files
+                              + [c for i in range(3)
+                                 for c in lora_inputs[5 * i + 2: 5 * i + 5]])
 
         def on_seconds_change(sec):
             return gr.update(maximum=sec), gr.update(maximum=sec)

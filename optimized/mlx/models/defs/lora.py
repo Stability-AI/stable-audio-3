@@ -39,12 +39,17 @@ _SUPPORTED_ADAPTER_TYPES = {
     *_XS_ADAPTER_TYPES,
 }
 _FULL_WEIGHT_ADAPTER_TYPES = _SUPPORTED_ADAPTER_TYPES - {"lora"}
-# bora/bora-xs stay on the full-weight-materializing path: their column norm
-# is taken over the row-rescaled intermediate m_r·V/rownorm(V), which has no
-# rank-r expansion without also storing W0**2 — and bora is rare. Every other
-# adapted type uses the reformulated low-rank forward (see
-# _reformulated_linear_forward), which never builds the [out, in] weight.
-_NAIVE_ONLY_ADAPTER_TYPES = {"bora", "bora-xs"}
+# bora/bora-xs have a selectable forward (LoRALinear ``bora_mode``): their
+# column norm is taken over the row-rescaled intermediate diag(α)·V with
+# α = m_r/rownorm(V), which has no rank-r expansion without also storing
+# W0**2. "speed" (default) caches that W0² once at init (+1 weight copy per
+# bora layer, native dtype) and uses the reformulated low-rank forward;
+# "memory" keeps the original full-weight-materializing forward and
+# allocates no cache. Every other adapted type always uses the reformulated
+# forward (see _reformulated_linear_forward), which never builds the
+# [out, in] weight.
+_BORA_ADAPTER_TYPES = {"bora", "bora-xs"}
+_BORA_MODES = {"speed", "memory"}
 _DORA_ROW_ADAPTER_TYPES = {"dora-rows", "dora-rows-xs"}
 _DORA_COL_ADAPTER_TYPES = {"dora-cols", "dora-cols-xs"}
 
@@ -86,10 +91,16 @@ class LoRALinear(nn.Module):
         source_name: str,
         adapter_type: str = "lora",
         checkpoint_prefix: str = "model.",
+        bora_mode: str = "speed",
     ):
         super().__init__()
         if rank <= 0:
             raise ValueError(f"LoRA rank must be positive, got {rank}.")
+        if bora_mode not in _BORA_MODES:
+            raise ValueError(
+                f"bora_mode must be one of {sorted(_BORA_MODES)}, "
+                f"got {bora_mode!r}."
+            )
 
         self.base = base
         self.base.freeze()
@@ -99,6 +110,7 @@ class LoRALinear(nn.Module):
         self.source_name = str(source_name)
         self.checkpoint_name = _checkpoint_name(source_name, checkpoint_prefix)
         self.adapter_type = canonical_adapter_type(adapter_type)
+        self.bora_mode = str(bora_mode)
 
         fan_out, fan_in = (int(value) for value in base.weight.shape)
         source_weight = _linear_source_weight_2d(base.weight)
@@ -109,17 +121,28 @@ class LoRALinear(nn.Module):
             source_name=self.source_name,
         )
         _initialize_adapter(self, source_weight, fan_out=fan_out, fan_in=fan_in)
-        # Frozen-base row/column energy Σ W0² for the reformulated DoRA norm.
-        # The base never trains, so this is a constant computed once. The
-        # leading underscore keeps it out of MLX parameters()/checkpoints.
+        # Frozen-base row/column energy Σ W0² for the reformulated DoRA/BoRA
+        # norms. The base never trains, so this is a constant computed once.
+        # The leading underscore keeps it out of MLX parameters()/checkpoints.
         if self.adapter_type in _DORA_ROW_ADAPTER_TYPES:
             self._w0_sq = mx.sum(source_weight * source_weight, axis=1)
         elif self.adapter_type in _DORA_COL_ADAPTER_TYPES:
             self._w0_sq = mx.sum(source_weight * source_weight, axis=0)
+        elif self.adapter_type in _BORA_ADAPTER_TYPES and self.bora_mode == "speed":
+            # BoRA rownorm(V) reuses the dora-rows closed form (row Σ W0²);
+            # its colnorm(diag(α)·V) additionally needs the FULL element-wise
+            # W0² (α² re-weights the rows), cached once in the weight's native
+            # dtype — this is speed mode's memory cost: +1 weight copy per
+            # bora layer. "memory" mode allocates neither.
+            self._w0_sq = mx.sum(source_weight * source_weight, axis=1)
+            self._w0_sq_full = self.base.weight * self.base.weight
 
     def __call__(self, x):
         if self.adapter_type in _FULL_WEIGHT_ADAPTER_TYPES:
-            if _NAIVE_DORA or self.adapter_type in _NAIVE_ONLY_ADAPTER_TYPES:
+            if _NAIVE_DORA or (
+                self.adapter_type in _BORA_ADAPTER_TYPES
+                and self.bora_mode == "memory"
+            ):
                 return self._full_weight_forward(x)
             return _reformulated_linear_forward(self, x)
 
@@ -130,8 +153,9 @@ class LoRALinear(nn.Module):
     def _full_weight_forward(self, x):
         """Original forward: materialize the full adapted weight per call.
 
-        Kept verbatim as the bora/bora-xs path and as the
-        SA3_LORA_NAIVE_DORA=1 ablation fallback for the reformulated types.
+        Kept verbatim as the bora/bora-xs ``bora_mode="memory"`` path and as
+        the SA3_LORA_NAIVE_DORA=1 ablation fallback for the reformulated
+        types.
         """
 
         adapted_weight = _adapted_weight_2d(
@@ -152,6 +176,8 @@ class LoRAConv1d(nn.Module):
     Stays on the original (full-weight for DoRA/BoRA) paths: the underfit
     product exclude list removes all convs, so this wrapper is never on the
     training hot path and does not need the reformulated forward.
+    ``bora_mode`` intentionally does not apply here — bora/bora-xs convs
+    always use the full-weight forward (equivalent to "memory" mode).
     """
 
     def __init__(
@@ -339,6 +365,7 @@ def inject_trainable_lora(
     exclude: tp.Sequence[str] | None = None,
     adapter_type: str = "lora",
     checkpoint_prefix: str = "model.",
+    bora_mode: str = "speed",
 ) -> LoRAInjectionReport:
     """Freeze an MLX model and replace selected Linear/Conv1d layers.
 
@@ -348,6 +375,11 @@ def inject_trainable_lora(
     ``conditioners.seconds_total.<name>``). Include/exclude patterns match
     against both the bare runtime name and the full checkpoint name, so
     underfit dashboard filter strings work verbatim.
+
+    ``bora_mode`` selects the bora/bora-xs Linear forward: "speed" (default)
+    caches W0² per layer for the reformulated forward, "memory" keeps the
+    original full-weight forward with no cache. It only affects bora-family
+    Linear layers (Conv1d always uses the full-weight path).
     """
 
     alpha = float(rank if alpha is None else alpha)
@@ -371,6 +403,7 @@ def inject_trainable_lora(
                 source_name=name,
                 adapter_type=adapter_type,
                 checkpoint_prefix=checkpoint_prefix,
+                bora_mode=bora_mode,
             )
         elif isinstance(layer, nn.Conv1d):
             replacement = LoRAConv1d(
@@ -432,6 +465,7 @@ def inject_from_lora_config(
     lora_config: dict[str, tp.Any] | None,
     *,
     checkpoint_prefix: str = "model.",
+    bora_mode: str = "speed",
 ) -> tuple[LoRAInjectionReport, dict[str, tp.Any]]:
     """Inject adapters from an underfit ``lora_config`` dict.
 
@@ -439,7 +473,9 @@ def inject_from_lora_config(
     defaults to 8, alpha defaults to rank, adapter_type defaults to "lora"
     (legacy "dora" resolves to "dora-rows"). Returns the injection report and
     the saved-config dict ({rank, alpha, adapter_type, include, exclude})
-    ready to pass to save metadata.
+    ready to pass to save metadata. ``bora_mode`` is a runtime speed-vs-memory
+    knob (see inject_trainable_lora), not checkpoint semantics, so it is not
+    part of the saved config.
     """
 
     lora_config = dict(lora_config or {})
@@ -459,6 +495,7 @@ def inject_from_lora_config(
         exclude=exclude,
         adapter_type=adapter_type,
         checkpoint_prefix=checkpoint_prefix,
+        bora_mode=bora_mode,
     )
     saved_config = {
         "rank": rank,
@@ -851,7 +888,8 @@ def _reformulated_linear_forward(layer, x):
     """Adapted-linear forward without materializing the [out, in] weight.
 
     Mathematically identical to ``x @ _adapted_weight_2d(...).T + bias`` for
-    lora-xs / dora-rows(-xs) / dora-cols(-xs), with V = W0 + s·B@A:
+    lora-xs / dora-rows(-xs) / dora-cols(-xs) / bora(-xs), with
+    V = W0 + s·B@A:
 
     * lora-xs:   y = x @ W0.T + s·((x @ Ã.T) @ B̃.T) + bias
     * dora-rows: W' = diag(m / rownorm(V)) · V, a row scale of the output:
@@ -859,6 +897,8 @@ def _reformulated_linear_forward(layer, x):
     * dora-cols: W' = V · diag(m / colnorm(V)), a scale of the input features
       (x @ W'.T = (x ⊙ c) @ V.T):
       y = ((x ⊙ c) @ W0.T + s·(((x ⊙ c) @ A.T) @ B.T)) + bias
+    * bora(-xs): W' = diag(α) · V · diag(β), both scales at once (see
+      _bora_reformulated_forward)
 
     The bias is NOT parametrized (torch applies the parametrization to the
     weight only: y = x @ W'.T + bias), so it is added un-scaled after the
@@ -866,6 +906,9 @@ def _reformulated_linear_forward(layer, x):
     the low-rank term, norms, and scaling are fp32; the result is cast back
     to x.dtype like the original path.
     """
+
+    if layer.adapter_type in _BORA_ADAPTER_TYPES:
+        return _bora_reformulated_forward(layer, x)
 
     a, b = _effective_low_rank_factors(layer)
     scaling = float(layer.scaling)
@@ -889,8 +932,91 @@ def _reformulated_linear_forward(layer, x):
     return output.astype(x.dtype)
 
 
+def _bora_reformulated_forward(layer, x):
+    """BoRA speed-mode forward: W' = diag(α)·V·diag(β) without building V.
+
+    With V = W0 + s·B@A, α = m_r / rownorm(V) and
+    β = m_c / colnorm(diag(α)·V):
+
+      y = (((x ⊙ β) @ W0.T + s·(((x ⊙ β) @ A.T) @ B.T)) ⊙ α) + bias
+
+    α reuses the dora-rows closed-form rownorm (_v_norm_no_materialize with
+    the cached row ΣW0²); β needs the α²-reweighted column norm, which is
+    where the cached full W0² comes in (_bora_col_scale_no_materialize). α
+    depends on m_r, A, B; β depends on everything including α — all
+    differentiable, autodiff handles it. Same dtype policy as the other
+    reformulated types: base matmul in the layer's native dtype, low-rank
+    term and scales in fp32, bias un-scaled last, result cast to x.dtype.
+    """
+
+    a, b = _effective_low_rank_factors(layer)
+    scaling = float(layer.scaling)
+    weight = layer.base.weight
+    bias = getattr(layer.base, "bias", None)
+
+    row_scale = layer.magnitude_r.astype(mx.float32) / _v_norm_no_materialize(
+        layer, a, b, weight, norm_dim=1
+    )
+    col_scale = _bora_col_scale_no_materialize(layer, a, b, weight, row_scale)
+
+    x32 = x.astype(mx.float32) * col_scale
+    base_output = x32.astype(x.dtype) @ weight.T
+    output = base_output.astype(mx.float32) + ((x32 @ a.T) @ b.T) * scaling
+    output = output * row_scale
+    if bias is not None:
+        output = output + bias.astype(mx.float32)
+    return output.astype(x.dtype)
+
+
+def _bora_col_scale_no_materialize(layer, a, b, weight, row_scale):
+    """``m_c / colnorm(diag(α)·V)`` without materializing V or diag(α)·V.
+
+    colnorm²(diag(α)·V) per column j is Σᵢ αᵢ²·Vᵢⱼ², expanded into three
+    terms with V = W0 + s·B@A:
+
+      1. Σᵢ αᵢ²·W0ᵢⱼ²      = α² @ W0²         (cached _w0_sq_full, native
+                                               dtype — one weight-sized read)
+      2. 2s·Σᵢ αᵢ²·W0ᵢⱼ·(BA)ᵢⱼ = 2s·rowsum((W0.T @ (α²[:,None] ⊙ B)) ⊙ A.T)
+                                               (one W0 read into a rank-r
+                                               matmul)
+      3. s²·Σᵢ αᵢ²·(BA)ᵢⱼ²  = s²·colsum((M@A) ⊙ A),  M = B.T @ (α²[:,None]⊙B)
+                                               [r, r] — tiny
+
+    Term 1 runs the matvec in the cache's native dtype (fp16 for an fp16
+    base — accepted accumulation precision, validated by the equivalence
+    tests) and casts the result to fp32; terms 2-3 follow the existing
+    _v_norm_no_materialize dtype pattern.
+    """
+
+    scaling = float(layer.scaling)
+    alpha_sq = row_scale * row_scale  # [out] fp32
+    w0_sq = layer._w0_sq_full
+    base_term = mx.matmul(
+        alpha_sq.astype(w0_sq.dtype)[None, :], w0_sq
+    ).astype(mx.float32)[0]  # α² @ W0² -> [in]
+    weighted_b = alpha_sq[:, None] * b  # [out, r] fp32
+    cross_lhs = mx.matmul(weight.T, weighted_b.astype(weight.dtype)).astype(
+        mx.float32
+    )  # W0.T @ (α² ⊙ B) -> [in, r]
+    cross = mx.sum(cross_lhs * a.T, axis=1)
+    gram = b.T @ weighted_b
+    quad = mx.sum((gram @ a) * a, axis=0)
+    norm_sq = base_term + 2.0 * scaling * cross + scaling * scaling * quad
+    # Same clamp semantics as _v_norm_no_materialize / _bora_weight_2d.
+    norm = mx.sqrt(mx.maximum(norm_sq, 0.0))
+    return layer.magnitude_c.astype(mx.float32) / mx.maximum(norm, 1e-12)
+
+
 def _dora_scale_no_materialize(layer, a, b, weight, *, norm_dim: int):
-    """``m / norm(V, axis=norm_dim)`` without materializing V = W0 + s·B@A.
+    """``m / norm(V, axis=norm_dim)`` without materializing V = W0 + s·B@A."""
+
+    return layer.magnitude.astype(mx.float32) / _v_norm_no_materialize(
+        layer, a, b, weight, norm_dim=norm_dim
+    )
+
+
+def _v_norm_no_materialize(layer, a, b, weight, *, norm_dim: int):
+    """Clamped ``norm(V, axis=norm_dim)`` without materializing V = W0 + s·B@A.
 
     Expands the squared norm so only rank-r matmuls touch W0 (read once, in
     its native dtype), with the constant ΣW0² cached at init:
@@ -920,7 +1046,7 @@ def _dora_scale_no_materialize(layer, a, b, weight, *, norm_dim: int):
     # Match _dora_weight_2d semantics: clamp the NORM (not norm²) at 1e-12;
     # the max(·, 0) only guards tiny negative rounding in the expansion.
     norm = mx.sqrt(mx.maximum(norm_sq, 0.0))
-    return layer.magnitude.astype(mx.float32) / mx.maximum(norm, 1e-12)
+    return mx.maximum(norm, 1e-12)
 
 
 def _linear_source_weight_2d(weight):

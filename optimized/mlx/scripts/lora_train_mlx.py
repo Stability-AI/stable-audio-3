@@ -165,6 +165,12 @@ def parse_args():
     ap.add_argument("--no-conditioner-lora", action="store_true",
                     help="Skip the seconds-conditioner adapter (underfit adapts it "
                          "by default — e.g. the plini checkpoint carries its delta)")
+    ap.add_argument("--bora-mode", default="speed", choices=["speed", "memory"],
+                    help="bora/bora-xs forward: 'speed' (default) caches W0² per "
+                         "adapted layer (+1 weight copy) for the reformulated "
+                         "no-materialize forward; 'memory' keeps the original "
+                         "full-weight forward with no cache. Ignored for other "
+                         "adapter types.")
     # data
     ap.add_argument("--latent-crop-length", type=int, default=None,
                     help="Default per model: 1300 (sm-*) / 4096 (medium)")
@@ -323,7 +329,8 @@ def main():
 
     # ── inject adapters ─────────────────────────────────────────────────────
     report, saved_config = inject_from_lora_config(
-        dit_model, lora_config, checkpoint_prefix="model.")
+        dit_model, lora_config, checkpoint_prefix="model.",
+        bora_mode=args.bora_mode)
     print(f"lora: {report.layer_count} DiT layer(s), {report.adapter_type}, "
           f"rank {args.rank}, alpha {alpha:g} "
           f"({report.trainable_parameters/1e6:.2f}M trainable)")
@@ -341,7 +348,8 @@ def main():
         try:
             cond_report, _ = inject_from_lora_config(
                 secs_module, lora_config,
-                checkpoint_prefix="conditioners.seconds_total.")
+                checkpoint_prefix="conditioners.seconds_total.",
+                bora_mode=args.bora_mode)
             print(f"lora: conditioner seconds embedder adapted "
                   f"({cond_report.layer_count} layer)")
         except ValueError:

@@ -611,12 +611,17 @@ def test_load_trainable_lora_state_round_trips_saved_adapters(tmp_path: Path):
 
 # lora-xs is included: it moved off the full-weight path onto the cheap
 # low-rank path (delta == (U @ M_xs) @ V.T needs no materialization either).
+# bora/bora-xs are included in their default "speed" mode, which caches W0²
+# once at init to expand colnorm(diag(α)·V) without materializing V
+# ("memory" mode keeps the naive full-weight forward).
 REFORMULATED_ADAPTER_TYPES = (
     "dora-rows",
     "dora-cols",
     "dora-rows-xs",
     "dora-cols-xs",
     "lora-xs",
+    "bora",
+    "bora-xs",
 )
 
 
@@ -653,6 +658,13 @@ def _build_reform_layer(
         layer.magnitude = layer.magnitude * (
             1.0 + 0.1 * mx.random.normal(layer.magnitude.shape)
         )
+    elif "bora" in adapter_type:
+        layer.magnitude_r = layer.magnitude_r * (
+            1.0 + 0.1 * mx.random.normal(layer.magnitude_r.shape)
+        )
+        layer.magnitude_c = layer.magnitude_c * (
+            1.0 + 0.1 * mx.random.normal(layer.magnitude_c.shape)
+        )
     return layer
 
 
@@ -673,6 +685,9 @@ def test_reformulated_dora_forward_matches_naive(
     monkeypatch.setattr(lora_module, "_NAIVE_DORA", True)
     naive = np.asarray(layer(x), dtype=np.float32)
 
+    # bora needs NO looser fp16 tolerance: its colnorm term-1 matvec runs in
+    # the cache's native dtype (fp16 for an fp16 base), but the resulting
+    # error stays ~4e-3 max abs — within the shared 2e-2 fp16 tolerance.
     tol = 1e-4 if dtype == mx.float32 else 2e-2
     np.testing.assert_allclose(reformed, naive, rtol=tol, atol=tol)
 
@@ -701,6 +716,8 @@ def test_reformulated_dora_gradients_match_naive(monkeypatch, adapter_type, dtyp
     )
     if "dora" in adapter_type:
         expected_params = expected_params | {"magnitude"}
+    elif "bora" in adapter_type:
+        expected_params = expected_params | {"magnitude_r", "magnitude_c"}
     assert expected_params.issubset(new_flat)
     assert set(new_flat) == set(old_flat)
 
@@ -764,6 +781,142 @@ def test_reformulated_dora_forward_backward_is_faster(monkeypatch):
     assert reformed < naive, (
         f"reformed {reformed * 1e3:.2f} ms/iter is not faster than naive "
         f"{naive * 1e3:.2f} ms/iter"
+    )
+
+
+@pytest.mark.parametrize("adapter_type", ["bora", "bora-xs"])
+def test_bora_memory_mode_is_naive_and_mode_threads_from_config(
+    monkeypatch, adapter_type
+):
+    """bora_mode="memory" IS the naive full-weight code path (bit-identical),
+    allocates no W0² cache, and the mode threads through
+    inject_from_lora_config → inject_trainable_lora → LoRALinear."""
+
+    def build(bora_mode):
+        mx.random.seed(9)
+        model = WideMLXRegressor()
+        report, _ = inject_from_lora_config(
+            model,
+            {"adapter_type": adapter_type, "rank": 4},
+            bora_mode=bora_mode,
+        )
+        assert report.adapter_type == adapter_type
+        for layer in iter_trainable_lora_layers(model):
+            if not adapter_type.endswith("-xs"):
+                layer.lora_B = mx.random.normal(layer.lora_B.shape) * 0.3
+            else:
+                layer.M_xs = mx.random.normal(layer.M_xs.shape) * 0.3
+        return model
+
+    x = mx.random.normal((3, 16))
+
+    memory_model = build("memory")
+    for layer in iter_trainable_lora_layers(memory_model):
+        assert layer.bora_mode == "memory"
+        assert not hasattr(layer, "_w0_sq_full")  # no cache allocated
+        assert not hasattr(layer, "_w0_sq")
+    memory_output = memory_model(x)
+
+    # Bit-identical to SA3_LORA_NAIVE_DORA=1 — memory mode dispatches to the
+    # very same _full_weight_forward, not a numerically-close reimplementation.
+    monkeypatch.setattr(lora_module, "_NAIVE_DORA", True)
+    assert bool(mx.array_equal(memory_output, memory_model(x)))
+    monkeypatch.setattr(lora_module, "_NAIVE_DORA", False)
+
+    # Default mode is "speed": cache allocated, same math within fp32 tol.
+    speed_model = build("speed")
+    for layer in iter_trainable_lora_layers(speed_model):
+        assert layer.bora_mode == "speed"
+        assert layer._w0_sq_full.dtype == layer.base.weight.dtype
+        assert layer._w0_sq_full.shape == layer.base.weight.shape
+    np.testing.assert_allclose(
+        np.asarray(speed_model(x), dtype=np.float32),
+        np.asarray(memory_output, dtype=np.float32),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+    # The env ablation toggle still overrides bora_mode="speed" too.
+    monkeypatch.setattr(lora_module, "_NAIVE_DORA", True)
+    assert bool(mx.array_equal(speed_model(x), memory_output))
+
+    with pytest.raises(ValueError, match="bora_mode"):
+        build("fast")
+
+
+def test_bora_w0_sq_cache_stays_out_of_parameters_and_checkpoints(
+    tmp_path: Path,
+):
+    mx.random.seed(13)
+    model = WideMLXRegressor()
+    inject_trainable_lora(model, rank=4, alpha=4, adapter_type="bora")
+
+    param_names = [name for name, _ in tree_flatten(model.parameters())]
+    assert any(name.endswith(".lora_A") for name in param_names)
+    assert not any("_w0_sq" in name for name in param_names)  # incl. _w0_sq_full
+    assert not any(
+        "_w0_sq" in name for name, _ in tree_flatten(model.trainable_parameters())
+    )
+
+    checkpoint = save_lora_checkpoint(model, tmp_path / "bora.safetensors")
+    state_dict, config = load_lora_checkpoint(checkpoint)
+
+    assert config["adapter_type"] == "bora"
+    assert not any("_w0_sq" in key for key in state_dict)
+    assert sorted(key.rsplit(".", 1)[1] for key in state_dict) == sorted(
+        ["lora_A", "lora_B", "magnitude_r", "magnitude_c"] * 2
+    )
+
+
+def test_reformulated_bora_forward_backward_is_faster():
+    """Micro-timing: one medium-sized bora layer, fwd+bwd, 20 iters.
+
+    Direction-only check like the dora-rows one: speed mode (reformulated,
+    cached W0²) must beat memory mode (materializing the full 12288x1536
+    weight). Expected in the same ballpark as the dora-rows reform (7.2x)
+    minus the extra α² @ W0² matvec.
+    """
+
+    fan_in, fan_out = 1536, 12288
+    mx.random.seed(0)
+    base = nn.Linear(fan_in, fan_out, bias=True)
+    layer = lora_module.LoRALinear(
+        base,
+        rank=16,
+        alpha=16.0,
+        source_name="layer",
+        adapter_type="bora",
+    )
+    layer.lora_B = mx.random.normal((fan_out, 16)) * 0.02
+    x = mx.random.normal((64, fan_in))
+
+    def loss_fn(model, values):
+        return mx.mean(model(values) ** 2)
+
+    loss_and_grad = nn.value_and_grad(layer, loss_fn)
+
+    def average_step_seconds(iterations: int = 20) -> float:
+        for _ in range(3):  # warmup
+            loss, grads = loss_and_grad(layer, x)
+            mx.eval(loss, grads)
+        start = time.perf_counter()
+        for _ in range(iterations):
+            loss, grads = loss_and_grad(layer, x)
+            mx.eval(loss, grads)
+        return (time.perf_counter() - start) / iterations
+
+    assert layer.bora_mode == "speed"
+    speed = average_step_seconds()
+    layer.bora_mode = "memory"  # dispatch-only switch; cache is just unused
+    memory = average_step_seconds()
+
+    print(
+        f"\nbora 12288x1536 fwd+bwd: speed {speed * 1e3:.2f} ms/iter"
+        f" vs memory {memory * 1e3:.2f} ms/iter ({memory / speed:.1f}x)"
+    )
+    assert speed < memory, (
+        f"speed mode {speed * 1e3:.2f} ms/iter is not faster than memory "
+        f"mode {memory * 1e3:.2f} ms/iter"
     )
 
 

@@ -1,0 +1,2 @@
+# Batch files must keep CRLF line endings on every checkout (cmd.exe quirk-proofing).
+*.bat text eol=crlf

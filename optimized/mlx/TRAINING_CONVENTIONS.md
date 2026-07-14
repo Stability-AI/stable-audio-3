@@ -153,3 +153,34 @@ To build (roughly in order):
 5. **pre-encode CLI** on top of `audio_encoding.py` (600 s cap, fp32, unscaled fp32
    npy + json sidecar with the exact metadata fields).
 6. **demos** (optional, last): pipeline-based demo step with underfit cadence/format.
+
+## 9. Training-forward conventions discovered by parity testing (2026-07-14)
+
+Verified by a controlled forward (identical latents crop, numpy-seeded noise,
+t=0.5, fixed prompt, fp32) through underfit's torch loop on MPS vs the MLX
+trainer — final agreement **loss 3.9829 vs 3.9823, prediction PSNR 80.7 dB**
+(bounded by the fp16 npz weights; torch MPS-vs-CPU agrees at 3e-6 rel):
+
+- **Train on the BASE checkpoint** (`stabilityai/stable-audio-3-*-base`,
+  rectified_flow), NOT the shipped ARC (rf_denoiser) weights that inference
+  uses. `lora_train_mlx.py --dit-weights` + a 441-key npz conversion
+  (strip `model.model.`, `.gamma`→`.weight`, conv (out,in,k)→(out,k,in),
+  `to_local_embed.{0,2}`→`.seq.{0,2}`, conditioner keys → `cond.*`).
+- **local_add_cond during training = all-ONES inpaint mask + zero context**
+  (the models are the diffusion_cond_inpaint variant). The inference path's
+  `local_add_cond=None` (≡ zeros) is an inference-only convention — using it
+  in training changes the loss by ~4x (wrong conditioning regime).
+- **Cross-attention runs over all 257 tokens at training time too**: the
+  torch conditioner substitutes the learned padding_embedding into padded
+  positions (exactly like the optimized runtimes) and the attention mask is
+  effectively pass-through. Do NOT mask/slice to valid tokens.
+
+## 10. MPS vs MLX benchmark (M4 Pro 48 GB, sm-music base, 30 steps,
+## dora-rows r16 α16 = 141 layers / 9.2M params, batch 1, crop 256, fp16 base)
+
+| | MPS (underfit loop, torch 2.13) | MLX (lora_train_mlx.py) |
+|---|---|---|
+| steady it/s | 0.668 (1498 ms/step) | **1.65 (2.47x faster)** |
+| peak memory | 3.67 GiB driver-allocated | (not instrumented; comparable class) |
+| loss regime | 1–43, spikes at low t | same (0.9–35, spikes at low t) |
+| checkpoint | underfit-valid, 423 keys | underfit-valid, identical key set |

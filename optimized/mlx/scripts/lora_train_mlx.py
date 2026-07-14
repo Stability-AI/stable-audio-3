@@ -100,6 +100,13 @@ def parse_args():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dit", required=True, choices=list(DIT_CHOICES.keys()))
+    ap.add_argument("--dit-weights", default=None,
+                    help="Override the DiT weight file — REQUIRED in practice for "
+                         "training parity with underfit: train on the BASE "
+                         "(rectified-flow) checkpoint, not the shipped ARC "
+                         "(rf_denoiser) weights that inference uses. Convert the "
+                         "HF *-base model.safetensors to npz first (441-key "
+                         "layout; see TRAINING_CONVENTIONS.md).")
     ap.add_argument("--latents-dir", required=True,
                     help="Root of pre-encoded npy+json pairs (scripts/pre_encode_mlx.py)")
     ap.add_argument("--lr", type=float, required=True,
@@ -210,11 +217,21 @@ def main():
 
     # ── models ───────────────────────────────────────────────────────────────
     t0 = time.time()
-    dit_model, _ = load_dit(args.dit, T_lat=crop_len, dtype=mx.float16)
+    if args.dit_weights:
+        import importlib
+        mod = importlib.import_module(DIT_CHOICES[args.dit]["loader"])
+        dit_model = mod.load_dit(args.dit_weights, T_lat=crop_len,
+                                 dtype=mx.float16, compile_=False)
+        cond_src = args.dit_weights
+    else:
+        print("WARNING: training on the shipped (ARC/rf_denoiser) weights — "
+              "underfit convention is to train on the BASE checkpoint "
+              "(pass --dit-weights)")
+        dit_model, _ = load_dit(args.dit, T_lat=crop_len, dtype=mx.float16)
+        cond_src = str(ensure_local(DIT_CHOICES[args.dit]["ckpt"]))
     print(f"DiT loaded ({time.time()-t0:.1f}s, fp16 base, T_lat={crop_len})")
     t5 = T5Gemma.from_npz(str(ensure_local(T5GEMMA_NPZ_REL)))  # frozen
-    padding_emb, secs_embedder = load_conditioner_from_npz(
-        str(ensure_local(DIT_CHOICES[args.dit]["ckpt"])), prefix="cond.")
+    padding_emb, secs_embedder = load_conditioner_from_npz(cond_src, prefix="cond.")
 
     # ── inject adapters ─────────────────────────────────────────────────────
     report, saved_config = inject_from_lora_config(
@@ -254,6 +271,17 @@ def main():
     optimizer = optim.AdamW(learning_rate=args.lr, betas=[0.9, 0.999],
                             eps=1e-8, weight_decay=0.0)
 
+    # ── training-time local conditioning (underfit/upstream convention) ──────
+    # The SA3 models are the diffusion_cond_inpaint variant: the trainer feeds
+    # pure generation as an all-ONES inpaint mask + zero context (verified at
+    # 80.7 dB forward parity vs the torch loop; the inference path's
+    # local_add_cond=None ≡ zeros is an inference-only convention and trains
+    # against the wrong conditioning regime — 4x loss difference).
+    lac_const = mx.array(
+        np.concatenate([np.ones((1, 1, crop_len), np.float32),
+                        np.zeros((1, 256, crop_len), np.float32)],
+                       axis=1).transpose(0, 2, 1)).astype(mx.float16)
+
     # ── loss (adapters in the bundle are the only trainable params) ──────────
     def loss_fn(bundle, latents, timesteps, loss_mask, prompt_cond,
                 seconds_totals, drop_mask):
@@ -271,7 +299,8 @@ def main():
         global16 = global_cond.astype(mx.float16)
 
         def model_fn(noised, t):
-            return bundle.dit(noised, t.astype(noised.dtype), cross16, global16)
+            return bundle.dit(noised, t.astype(noised.dtype), cross16, global16,
+                              local_add_cond=lac_const)
 
         return rectified_flow_loss(model_fn, latents, timesteps,
                                    loss_mask=loss_mask)

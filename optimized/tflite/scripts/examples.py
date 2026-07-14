@@ -16,6 +16,20 @@ import os
 import sys
 from pathlib import Path
 
+# Windows consoles default to a legacy code page (cp1252/cp437) that can't encode
+# the emoji/box-drawing characters below. Force UTF-8 with replacement; no-op on
+# macOS/Linux. (sa3_tflite.py/install.py do this too — reconfigure is idempotent.)
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass   # exotic stream without reconfigure() — leave as-is
+
+# Enable ANSI/VT escape processing in legacy Windows consoles (cmd.exe);
+# harmless elsewhere and on modern Windows Terminal.
+if os.name == "nt":
+    os.system("")
+
 # This file lives in <project>/scripts/. SCRIPT_DIR points at the project
 # root (where ./sa3, ./install.sh, models/, .venv/ live).
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
@@ -41,9 +55,16 @@ def _have(binary: str) -> bool:
 def _py_invocation() -> tuple[str, str, bool]:
     """Return (command-to-print, tip-or-empty, is_wrapper).
 
-    Prefer the ./sa3 wrapper if present, else `.venv/bin/python scripts/sa3_tflite.py`,
-    else fall back to a bare `python scripts/sa3_tflite.py`.
+    Prefer the sa3 wrapper if present (./sa3 on POSIX, sa3.bat on Windows), else
+    the .venv python + scripts/sa3_tflite.py, else a bare `python scripts/sa3_tflite.py`.
     """
+    if os.name == "nt":
+        if (SCRIPT_DIR / "sa3.bat").exists():
+            return "sa3.bat", "the sa3.bat wrapper uses .venv automatically", True
+        venv_py = SCRIPT_DIR / ".venv" / "Scripts" / "python.exe"
+        if venv_py.exists():
+            return str(venv_py.relative_to(SCRIPT_DIR)), "", False
+        return "python", "", False
     wrapper = SCRIPT_DIR / "sa3"
     if wrapper.exists() and os.access(wrapper, os.X_OK):
         return "./sa3", "the ./sa3 wrapper uses .venv automatically", True
@@ -108,7 +129,7 @@ def print_example_commands(header: str | None = None) -> None:
     one_dec = "same-l" if one_dit == "medium" else "same-s"
     cmd(f'--prompt "ambient drone" --dit {one_dit} --decoder {one_dec} \\\n'
         f'        --seconds 20 --out drone.wav --play',
-        "writes WAV + plays via afplay (Ctrl-C stops both)")
+        "writes WAV + plays it (afplay/winsound/aplay; Ctrl-C stops both)")
 
     # ── Audio-to-audio + inpaint ─────────────────────────────────────
     hdr("🎚️  Audio-to-audio & inpainting (requires an input WAV)")

@@ -4,7 +4,8 @@ Portable CPU inference for **Stable Audio 3** — the LiteRT/TFLite sibling of t
 [MLX](../mlx) (Apple Silicon) and [TensorRT](../tensorRT) (NVIDIA GPU) releases.
 No PyTorch, transformers, or stable-audio-tools at runtime — just `ai_edge_litert`
 (LiteRT) driving fully self-contained `.tflite` graphs through the XNNPACK CPU
-delegate. Runs anywhere LiteRT runs: **macOS / Linux, x86 / ARM**.
+delegate. Runs anywhere LiteRT runs: **macOS / Linux / Windows, x86 / ARM**
+(Windows is x64-only — see [Windows](#windows)).
 
 ## Quick Install
 
@@ -133,6 +134,34 @@ End-to-end on a fresh machine: **~10 seconds** + weight downloads.
 Portable CPU (no GPU required). Python 3.9+. `./install.sh --python 3.12` to
 pin a different Python.
 
+### Windows
+
+The stack runs natively on Windows x64 — no WSL needed. `ai-edge-litert`
+ships `win_amd64` wheels for Python **3.10–3.13** (x64 only; no Windows-ARM
+wheels), so install a Python in that range from
+[python.org](https://www.python.org/downloads/) (check *"Add python.exe to
+PATH"*), then from `optimized\tflite\`:
+
+```bat
+install.bat                          :: one-time setup (python -m venv + pip)
+sa3.bat --prompt "lofi house loop" --dit sm-music --decoder same-s
+```
+
+`install.bat` / `sa3.bat` are the Windows twins of `./install.sh` / `./sa3`
+(plain venv + pip; uv not required). Notes:
+
+- **ffmpeg is optional** — only needed for mp3 / 24-bit / non-44.1 kHz
+  `--init-audio` inputs: `winget install ffmpeg` (or `choco install ffmpeg`).
+- **Symlinks**: downloaded weights are exposed via symlinks where possible;
+  without Developer Mode, Windows disallows creating them, so the downloader
+  automatically falls back to a hardlink (zero-copy) or a plain copy. No
+  action needed either way.
+- **Long paths**: the HuggingFace cache nests deeply — if downloads fail with
+  path-length errors, enable Windows long paths once (admin PowerShell):
+  `Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled -Value 1`
+  (the `LongPathsEnabled` registry switch), then restart the terminal.
+- `--play` uses the stdlib `winsound` player (macOS uses `afplay`).
+
 ## Run
 
 `./sa3` is a thin shell wrapper around `.venv/bin/python scripts/sa3_tflite.py
@@ -161,7 +190,7 @@ pin a different Python.
 ./sa3 --prompt "ambient drone" --cfg 3.0 --negative-prompt "drums, vocals" \
       --dit sm-music --decoder same-s --out drone.wav
 
-# Generate + play immediately (afplay; Ctrl-C stops both)
+# Generate + play immediately (afplay/winsound/aplay; Ctrl-C stops both)
 ./sa3 --prompt "rainforest" --dit sm-sfx --decoder same-s --play
 
 # All options + categorised examples
@@ -215,7 +244,7 @@ For sub-realtime latency on a supported device, prefer the GPU siblings:
 | `--threads`           | 8        | XNNPACK CPU threads (all TFLite models run on CPU)                    |
 | `--free-models`       | on       | Free each model after its last use; `--no-free-models` keeps them resident |
 | `--out` / `-o`        | (auto)   | Relative → `output/<file>`; absolute → as-is. 16-bit PCM stereo @ 44.1 kHz, trimmed to exactly `--seconds` |
-| `--play`              | off      | After writing, play via `afplay` (macOS); Ctrl-C stops both           |
+| `--play`              | off      | After writing, play the WAV: `afplay` (macOS) / `winsound` (Windows) / `aplay` (Linux); Ctrl-C stops both |
 
 All `.tflite` models are **fp32** except T5Gemma, which is **fp16** (numerically
 lossless there). There is no dtype knob: on CPU, int8/fp16 weights buy size, not
@@ -228,6 +257,7 @@ speed (XNNPACK dequantizes to fp32 to matmul), and int8 costs quality on the DiT
 sa3_tflite/
 ├── sa3                            ← shell wrapper (use this)
 ├── install.sh                     ← uv bootstrap (run once)
+├── sa3.bat / install.bat          ← Windows twins of sa3 / install.sh
 ├── bootstrap.sh                   ← one-line curl installer
 ├── README.md
 ├── requirements.txt               ← ai_edge_litert, numpy, sentencepiece, soundfile, huggingface_hub

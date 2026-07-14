@@ -28,9 +28,32 @@ All model files auto-download from HuggingFace (stabilityai/stable-audio-3-optim
 on first use and symlink into models/tflite/ from the HF cache. See scripts/weights.py.
 """
 from __future__ import annotations
-import argparse, math, os, random, re, subprocess, sys, termios, time, tty, wave
+import argparse, math, os, random, re, subprocess, sys, time, wave
 from pathlib import Path
 import numpy as np
+
+# Windows consoles default to a legacy code page (cp1252/cp437) that can't encode
+# the banners' box-drawing / emoji characters. Force UTF-8 with replacement so no
+# print can crash the CLI. No-op on macOS/Linux, where stdout is UTF-8 already.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass   # exotic stream without reconfigure() (non-TextIOWrapper) — leave as-is
+
+# Enable ANSI/VT escape processing in legacy Windows consoles (cmd.exe). Calling
+# os.system("") flips the console into VT mode; harmless elsewhere and on
+# modern Windows Terminal, which has it on already.
+if os.name == "nt":
+    os.system("")
+
+# The arrow-key picker below uses POSIX terminal APIs.  Keep the non-interactive
+# CLI usable on Windows, where those modules are not available.
+try:
+    import termios
+    import tty
+except ImportError:
+    termios = tty = None
 
 REPO = Path(__file__).resolve().parent.parent   # project root (scripts/ is one level down)
 sys.path.insert(0, str(REPO))                    # so `from models.defs.* import` resolves
@@ -104,7 +127,7 @@ def _arrow_pick(prompt: str, options: list[str], default: str | None = None) -> 
     Up/Down to move, Enter to select, Ctrl-C to abort. Falls back to a
     numeric prompt when stdin isn't a TTY (piped input, CI, etc.).
     """
-    if not sys.stdin.isatty():
+    if termios is None or tty is None or not sys.stdin.isatty():
         print(prompt)
         for i, o in enumerate(options):
             mark = "*" if o == default else " "
@@ -196,8 +219,11 @@ def read_wav(path: str) -> np.ndarray:
                             "-ar", str(SAMPLE_RATE), "-ac", "2", "-"],
                            capture_output=True, check=True)
     except FileNotFoundError:
+        ffmpeg_hint = {"darwin": "brew install ffmpeg",
+                       "win32": "winget install ffmpeg  (or: choco install ffmpeg)",
+                       }.get(sys.platform, "apt install ffmpeg")
         raise RuntimeError(f"{path}: unsupported WAV format. Install ffmpeg for 24/32-bit or "
-                           f"non-44.1kHz input: brew install ffmpeg")
+                           f"non-44.1kHz input: {ffmpeg_hint}")
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"{path}: ffmpeg failed — {e.stderr.decode().strip()}")
     raw = np.frombuffer(r.stdout, np.int16).astype(np.float32) / 32767.0
@@ -425,6 +451,28 @@ def valid_T_lat(seconds):
     return max(1, int(np.ceil(seconds * SAMPLE_RATE / SAMPLES_PER_LATENT)))
 
 
+def _play_backend(platform: str | None = None) -> tuple[str, list[str] | None]:
+    """Pick the --play playback backend for `platform` (default: sys.platform)
+    WITHOUT executing anything. Split out of main() so it can be import-tested.
+
+    Returns (kind, argv_prefix):
+      ("subprocess", ["afplay"])    macOS — argv_prefix + [wav_path] is run
+      ("subprocess", ["aplay", …])  Linux with alsa-utils installed
+      ("winsound", None)            Windows — stdlib winsound.PlaySound (blocking)
+      ("none", None)                no player available — caller prints the path
+    """
+    plat = sys.platform if platform is None else platform
+    if plat == "darwin":
+        return ("subprocess", ["afplay"])
+    if plat == "win32":
+        return ("winsound", None)
+    if plat.startswith("linux"):
+        from shutil import which
+        if which("aplay") is not None:
+            return ("subprocess", ["aplay", "-q"])
+    return ("none", None)
+
+
 class _HelpfulParser(argparse.ArgumentParser):
     """argparse that prints full help (not just usage) when a flag is unknown / invalid,
     and tacks the shared example-commands block onto the end of -h / --help."""
@@ -524,7 +572,9 @@ def main():
                     help="Output WAV path. Relative → output/<file>; absolute → as-is. "
                          "If omitted, auto-named from the prompt + seed.")
     ap.add_argument("--play", action="store_true",
-                    help="Play the WAV via macOS `afplay` after writing (blocking).")
+                    help="Play the WAV after writing (blocking): `afplay` on macOS, "
+                         "winsound on Windows, `aplay` on Linux (prints the path if "
+                         "no player is available).")
     args = ap.parse_args()
     if args.steps < 1:
         ap.error(f"--steps must be ≥ 1 (got {args.steps})")
@@ -785,9 +835,18 @@ def main():
     rule()
 
     if args.play:
+        kind, argv = _play_backend()
         try:
-            print(f"  {bold('▶ playing')}   {args.out}   {dim('(Ctrl-C to stop)')}")
-            subprocess.run(["afplay", args.out], check=False)
+            if kind == "winsound":
+                print(f"  {bold('▶ playing')}   {args.out}   {dim('(Ctrl-C to stop)')}")
+                import winsound
+                winsound.PlaySound(args.out, winsound.SND_FILENAME)   # blocking, like afplay
+            elif kind == "subprocess":
+                print(f"  {bold('▶ playing')}   {args.out}   {dim('(Ctrl-C to stop)')}")
+                subprocess.run(argv + [args.out], check=False)
+            else:
+                print(f"  {bold('▶ play')}   no audio player found ('aplay' missing) — "
+                      f"file saved at {args.out}")
         except KeyboardInterrupt:
             print()
 

@@ -12,6 +12,7 @@ Empirically verified on torch 2.13.0 + macOS 15 (Apple Silicon):
   - @autocast("cuda", enabled=False) does NOT disable an active MPS autocast,
     so fp32 islands need the device-aware `disable_autocast` below.
 """
+
 import functools
 
 import torch

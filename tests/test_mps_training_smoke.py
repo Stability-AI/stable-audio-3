@@ -15,6 +15,7 @@ Verifies the device-neutral AMP plumbing added for MPS training support:
 Skipped entirely when MPS is unavailable. Runnable standalone:
     python tests/test_mps_training_smoke.py
 """
+
 import os
 import sys
 from functools import partial
@@ -36,19 +37,25 @@ DEVICE = "mps"
 # underfit loss (real module when importable, faithful mirror otherwise)
 # ---------------------------------------------------------------------------
 
+
 def _underfit_loss_fns():
     try:
         from underfit.training.loss import compute_masked_loss, compute_normalized_mse
+
         return compute_normalized_mse, compute_masked_loss
     except ImportError:
         pass
 
     # Mirror of underfit/training/loss.py (loss_normalization="none",
     # mask_padding_attention=True → signal-only masked MSE).
-    def compute_normalized_mse(pred, target, loss_mask, loss_normalization="none", loss_norm_eps=1e-6):
+    def compute_normalized_mse(
+        pred, target, loss_mask, loss_normalization="none", loss_norm_eps=1e-6
+    ):
         return (pred - target) ** 2
 
-    def compute_masked_loss(loss_full, loss_mask, mask_padding_attention, mask_loss_weight=0.0):
+    def compute_masked_loss(
+        loss_full, loss_mask, mask_padding_attention, mask_loss_weight=0.0
+    ):
         signal = torch.where(loss_mask.unsqueeze(1), loss_full, 0.0)
         signal_sum = signal.sum(dim=(1, 2))
         n_channels = loss_full.shape[1]
@@ -64,6 +71,7 @@ def _underfit_loss_fns():
 # ---------------------------------------------------------------------------
 # Device helper probes
 # ---------------------------------------------------------------------------
+
 
 def test_resolve_device_prefers_mps_without_cuda():
     from stable_audio_3.utils.device import resolve_device
@@ -119,6 +127,7 @@ def test_fp32_islands_hold_under_mps_autocast():
 # ---------------------------------------------------------------------------
 # End-to-end: tiny DiT + LoRA, 3 training steps on MPS
 # ---------------------------------------------------------------------------
+
 
 def _build_tiny_dit_with_lora():
     from stable_audio_3.models.dit import DiffusionTransformer
@@ -206,7 +215,9 @@ def test_lora_training_steps_on_mps():
         scaler.update()
         losses.append(loss.item())
 
-    assert all(l == l and abs(l) != float("inf") for l in losses), f"non-finite loss: {losses}"
+    assert all(x == x and abs(x) != float("inf") for x in losses), (
+        f"non-finite loss: {losses}"
+    )
     assert losses[-1] != losses[0], f"loss did not change over 3 steps: {losses}"
     # On a fixed batch with lr=1e-2 the loss should trend down.
     assert losses[-1] < losses[0] * 1.05, f"loss did not decrease: {losses}"
@@ -228,7 +239,10 @@ def test_full_wrapper_training_step_on_mps():
     (underfit's pre_encoded path never calls pretransform.encode).
     """
     from stable_audio_3.models.conditioners import MultiConditioner, NumberConditioner
-    from stable_audio_3.models.diffusion import ConditionedDiffusionModelWrapper, DiTWrapper
+    from stable_audio_3.models.diffusion import (
+        ConditionedDiffusionModelWrapper,
+        DiTWrapper,
+    )
     from stable_audio_3.models.lora import LoRAParametrization, add_lora
     from stable_audio_3.utils.device import autocast_context, make_grad_scaler
 
@@ -310,7 +324,9 @@ def test_full_wrapper_training_step_on_mps():
         scaler.update()
         losses.append(loss.item())
 
-    assert all(l == l and abs(l) != float("inf") for l in losses), f"non-finite loss: {losses}"
+    assert all(x == x and abs(x) != float("inf") for x in losses), (
+        f"non-finite loss: {losses}"
+    )
     assert len(set(losses)) > 1, f"loss frozen across steps: {losses}"
 
 

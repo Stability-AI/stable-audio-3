@@ -28,9 +28,17 @@ All model files auto-download from HuggingFace (stabilityai/stable-audio-3-optim
 on first use and symlink into models/tflite/ from the HF cache. See scripts/weights.py.
 """
 from __future__ import annotations
-import argparse, math, os, random, re, subprocess, sys, termios, time, tty, wave
+import argparse, math, os, random, re, subprocess, sys, time, wave
 from pathlib import Path
 import numpy as np
+
+# The arrow-key picker below uses POSIX terminal APIs.  Keep the non-interactive
+# CLI usable on Windows, where those modules are not available.
+try:
+    import termios
+    import tty
+except ImportError:
+    termios = tty = None
 
 REPO = Path(__file__).resolve().parent.parent   # project root (scripts/ is one level down)
 sys.path.insert(0, str(REPO))                    # so `from models.defs.* import` resolves
@@ -104,7 +112,7 @@ def _arrow_pick(prompt: str, options: list[str], default: str | None = None) -> 
     Up/Down to move, Enter to select, Ctrl-C to abort. Falls back to a
     numeric prompt when stdin isn't a TTY (piped input, CI, etc.).
     """
-    if not sys.stdin.isatty():
+    if termios is None or tty is None or not sys.stdin.isatty():
         print(prompt)
         for i, o in enumerate(options):
             mark = "*" if o == default else " "

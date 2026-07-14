@@ -25,8 +25,15 @@ irm https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized
 Already cloned the repo? Run from inside `optimized/tflite/`:
 
 ```bash
+# macOS / Linux / Windows Git Bash
 ./install.sh                                              # one-time setup
 ./sa3 --prompt "Impending tribal, epic orchestral buildup" --play           # generates + plays
+```
+
+```bat
+:: Windows cmd / PowerShell
+install.bat
+sa3.bat --prompt "Impending tribal, epic orchestral buildup" --play
 ```
 
 ## Three models, four modes

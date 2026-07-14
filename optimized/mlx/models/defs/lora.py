@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import typing as tp
 from dataclasses import dataclass
@@ -38,6 +39,18 @@ _SUPPORTED_ADAPTER_TYPES = {
     *_XS_ADAPTER_TYPES,
 }
 _FULL_WEIGHT_ADAPTER_TYPES = _SUPPORTED_ADAPTER_TYPES - {"lora"}
+# bora/bora-xs stay on the full-weight-materializing path: their column norm
+# is taken over the row-rescaled intermediate m_r·V/rownorm(V), which has no
+# rank-r expansion without also storing W0**2 — and bora is rare. Every other
+# adapted type uses the reformulated low-rank forward (see
+# _reformulated_linear_forward), which never builds the [out, in] weight.
+_NAIVE_ONLY_ADAPTER_TYPES = {"bora", "bora-xs"}
+_DORA_ROW_ADAPTER_TYPES = {"dora-rows", "dora-rows-xs"}
+_DORA_COL_ADAPTER_TYPES = {"dora-cols", "dora-cols-xs"}
+
+# Ablation/fallback toggle (read once at import): SA3_LORA_NAIVE_DORA=1
+# restores the original full-weight forward for the reformulated types.
+_NAIVE_DORA = os.environ.get("SA3_LORA_NAIVE_DORA", "") == "1"
 
 
 @dataclass(frozen=True)
@@ -96,27 +109,50 @@ class LoRALinear(nn.Module):
             source_name=self.source_name,
         )
         _initialize_adapter(self, source_weight, fan_out=fan_out, fan_in=fan_in)
+        # Frozen-base row/column energy Σ W0² for the reformulated DoRA norm.
+        # The base never trains, so this is a constant computed once. The
+        # leading underscore keeps it out of MLX parameters()/checkpoints.
+        if self.adapter_type in _DORA_ROW_ADAPTER_TYPES:
+            self._w0_sq = mx.sum(source_weight * source_weight, axis=1)
+        elif self.adapter_type in _DORA_COL_ADAPTER_TYPES:
+            self._w0_sq = mx.sum(source_weight * source_weight, axis=0)
 
     def __call__(self, x):
         if self.adapter_type in _FULL_WEIGHT_ADAPTER_TYPES:
-            adapted_weight = _adapted_weight_2d(
-                _linear_source_weight_2d(self.base.weight),
-                adapter_type=self.adapter_type,
-                layer=self,
-            )
-            output = x.astype(mx.float32) @ adapted_weight.T
-            bias = getattr(self.base, "bias", None)
-            if bias is not None:
-                output = output + bias.astype(mx.float32)
-            return output.astype(x.dtype)
+            if _NAIVE_DORA or self.adapter_type in _NAIVE_ONLY_ADAPTER_TYPES:
+                return self._full_weight_forward(x)
+            return _reformulated_linear_forward(self, x)
 
         base_output = self.base(x)
         adapter_output = (x.astype(mx.float32) @ self.lora_A.T) @ self.lora_B.T
         return base_output + (adapter_output * self.scaling).astype(base_output.dtype)
 
+    def _full_weight_forward(self, x):
+        """Original forward: materialize the full adapted weight per call.
+
+        Kept verbatim as the bora/bora-xs path and as the
+        SA3_LORA_NAIVE_DORA=1 ablation fallback for the reformulated types.
+        """
+
+        adapted_weight = _adapted_weight_2d(
+            _linear_source_weight_2d(self.base.weight),
+            adapter_type=self.adapter_type,
+            layer=self,
+        )
+        output = x.astype(mx.float32) @ adapted_weight.T
+        bias = getattr(self.base, "bias", None)
+        if bias is not None:
+            output = output + bias.astype(mx.float32)
+        return output.astype(x.dtype)
+
 
 class LoRAConv1d(nn.Module):
-    """Trainable LoRA-family wrapper for an MLX Conv1d layer."""
+    """Trainable LoRA-family wrapper for an MLX Conv1d layer.
+
+    Stays on the original (full-weight for DoRA/BoRA) paths: the underfit
+    product exclude list removes all convs, so this wrapper is never on the
+    training hot path and does not need the reformulated forward.
+    """
 
     def __init__(
         self,
@@ -796,6 +832,95 @@ def _adapter_delta_2d(layer):
     if layer.adapter_type in _XS_ADAPTER_TYPES:
         return layer.U @ layer.M_xs.astype(mx.float32) @ layer.V.T
     return layer.lora_B @ layer.lora_A
+
+
+def _effective_low_rank_factors(layer):
+    """Return fp32 ``(A, B)`` with ``delta == B @ A``, folding -xs cores.
+
+    For the -xs variants the effective factors are ``B̃ = U @ M_xs`` [out, r]
+    and ``Ã = V.T`` [r, in] (U, V frozen); B̃ is recomputed per call — it is a
+    cheap [out, rank] product, and gradients flow to M_xs through it.
+    """
+
+    if layer.adapter_type in _XS_ADAPTER_TYPES:
+        return layer.V.T, layer.U @ layer.M_xs.astype(mx.float32)
+    return layer.lora_A, layer.lora_B
+
+
+def _reformulated_linear_forward(layer, x):
+    """Adapted-linear forward without materializing the [out, in] weight.
+
+    Mathematically identical to ``x @ _adapted_weight_2d(...).T + bias`` for
+    lora-xs / dora-rows(-xs) / dora-cols(-xs), with V = W0 + s·B@A:
+
+    * lora-xs:   y = x @ W0.T + s·((x @ Ã.T) @ B̃.T) + bias
+    * dora-rows: W' = diag(m / rownorm(V)) · V, a row scale of the output:
+      y = (x @ W0.T + s·((x @ A.T) @ B.T)) ⊙ c + bias,  c = m / rownorm(V)
+    * dora-cols: W' = V · diag(m / colnorm(V)), a scale of the input features
+      (x @ W'.T = (x ⊙ c) @ V.T):
+      y = ((x ⊙ c) @ W0.T + s·(((x ⊙ c) @ A.T) @ B.T)) + bias
+
+    The bias is NOT parametrized (torch applies the parametrization to the
+    weight only: y = x @ W'.T + bias), so it is added un-scaled after the
+    row/column scaling. The base matmul runs in the layer's native dtype;
+    the low-rank term, norms, and scaling are fp32; the result is cast back
+    to x.dtype like the original path.
+    """
+
+    a, b = _effective_low_rank_factors(layer)
+    scaling = float(layer.scaling)
+    weight = layer.base.weight
+    bias = getattr(layer.base, "bias", None)
+
+    x32 = x.astype(mx.float32)
+    if layer.adapter_type in _DORA_COL_ADAPTER_TYPES:
+        col_scale = _dora_scale_no_materialize(layer, a, b, weight, norm_dim=0)
+        x32 = x32 * col_scale
+        base_output = x32.astype(x.dtype) @ weight.T
+    else:
+        base_output = x @ weight.T
+    output = base_output.astype(mx.float32) + ((x32 @ a.T) @ b.T) * scaling
+    if layer.adapter_type in _DORA_ROW_ADAPTER_TYPES:
+        output = output * _dora_scale_no_materialize(
+            layer, a, b, weight, norm_dim=1
+        )
+    if bias is not None:
+        output = output + bias.astype(mx.float32)
+    return output.astype(x.dtype)
+
+
+def _dora_scale_no_materialize(layer, a, b, weight, *, norm_dim: int):
+    """``m / norm(V, axis=norm_dim)`` without materializing V = W0 + s·B@A.
+
+    Expands the squared norm so only rank-r matmuls touch W0 (read once, in
+    its native dtype), with the constant ΣW0² cached at init:
+
+      rownorm² = ΣW0²(rows) + 2s·rowsum((W0 @ A.T) ⊙ B) + s²·rowsum((B@G) ⊙ B)
+                 with G = A @ A.T  [r, r]
+      colnorm² = ΣW0²(cols) + 2s·rowsum((W0.T @ B) ⊙ A.T) + s²·colsum((M@A) ⊙ A)
+                 with M = B.T @ B  [r, r]
+    """
+
+    scaling = float(layer.scaling)
+    if norm_dim == 1:
+        cross_lhs = mx.matmul(weight, a.T.astype(weight.dtype)).astype(
+            mx.float32
+        )  # W0 @ A.T -> [out, r]
+        cross = mx.sum(cross_lhs * b, axis=1)
+        gram = a @ a.T
+        quad = mx.sum((b @ gram) * b, axis=1)
+    else:
+        cross_lhs = mx.matmul(weight.T, b.astype(weight.dtype)).astype(
+            mx.float32
+        )  # W0.T @ B -> [in, r]
+        cross = mx.sum(cross_lhs * a.T, axis=1)
+        gram = b.T @ b
+        quad = mx.sum((gram @ a) * a, axis=0)
+    norm_sq = layer._w0_sq + 2.0 * scaling * cross + scaling * scaling * quad
+    # Match _dora_weight_2d semantics: clamp the NORM (not norm²) at 1e-12;
+    # the max(·, 0) only guards tiny negative rounding in the expansion.
+    norm = mx.sqrt(mx.maximum(norm_sq, 0.0))
+    return layer.magnitude.astype(mx.float32) / mx.maximum(norm, 1e-12)
 
 
 def _linear_source_weight_2d(weight):

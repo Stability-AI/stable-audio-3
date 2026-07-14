@@ -1,3 +1,4 @@
+import time
 from functools import partial
 from pathlib import Path
 
@@ -13,6 +14,7 @@ import mlx.optimizers as optim
 from mlx.utils import tree_flatten
 
 from optimized.mlx.models.defs import dit_mlx, dit_mlx_medium
+from optimized.mlx.models.defs import lora as lora_module
 from optimized.mlx.models.defs.lora import (
     TrainableSecondsEmbedder,
     apply_lora_checkpoint,
@@ -601,6 +603,168 @@ def test_load_trainable_lora_state_round_trips_saved_adapters(tmp_path: Path):
     partial["model.missing.parametrizations.weight.0.lora_A"] = mx.zeros((2, 3))
 
     assert load_trainable_lora_state(build_model(), partial) == 1
+
+
+# ---------------------------------------------------------------------------
+# Reformulated (no-full-weight-materialization) DoRA forward
+# ---------------------------------------------------------------------------
+
+# lora-xs is included: it moved off the full-weight path onto the cheap
+# low-rank path (delta == (U @ M_xs) @ V.T needs no materialization either).
+REFORMULATED_ADAPTER_TYPES = (
+    "dora-rows",
+    "dora-cols",
+    "dora-rows-xs",
+    "dora-cols-xs",
+    "lora-xs",
+)
+
+
+def _build_reform_layer(
+    adapter_type: str,
+    *,
+    bias: bool,
+    dtype,
+    fan_in: int = 24,
+    fan_out: int = 18,
+    rank: int = 4,
+    alpha: float = 6.0,
+    seed: int = 3,
+):
+    mx.random.seed(seed)
+    base = nn.Linear(fan_in, fan_out, bias=bias)
+    base.weight = (mx.random.normal((fan_out, fan_in)) * 0.5).astype(dtype)
+    if bias:
+        base.bias = mx.random.normal((fan_out,)).astype(dtype)
+    layer = lora_module.LoRALinear(
+        base,
+        rank=rank,
+        alpha=alpha,
+        source_name="layer",
+        adapter_type=adapter_type,
+    )
+    # Non-trivial adapter state so both the delta and the norms move.
+    if adapter_type.endswith("-xs"):
+        layer.M_xs = mx.random.normal((rank, rank)) * 0.2
+    else:
+        layer.lora_A = mx.random.normal((rank, fan_in)) * 0.4
+        layer.lora_B = mx.random.normal((fan_out, rank)) * 0.4
+    if "dora" in adapter_type:
+        layer.magnitude = layer.magnitude * (
+            1.0 + 0.1 * mx.random.normal(layer.magnitude.shape)
+        )
+    return layer
+
+
+@pytest.mark.parametrize("adapter_type", REFORMULATED_ADAPTER_TYPES)
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16])
+def test_reformulated_dora_forward_matches_naive(
+    monkeypatch, adapter_type, bias, dtype
+):
+    layer = _build_reform_layer(adapter_type, bias=bias, dtype=dtype)
+    x = mx.random.normal((5, 24)).astype(dtype)
+
+    assert not lora_module._NAIVE_DORA  # reformulation is the default
+    reformed_output = layer(x)
+    assert reformed_output.dtype == dtype
+    reformed = np.asarray(reformed_output, dtype=np.float32)
+
+    monkeypatch.setattr(lora_module, "_NAIVE_DORA", True)
+    naive = np.asarray(layer(x), dtype=np.float32)
+
+    tol = 1e-4 if dtype == mx.float32 else 2e-2
+    np.testing.assert_allclose(reformed, naive, rtol=tol, atol=tol)
+
+
+@pytest.mark.parametrize("adapter_type", REFORMULATED_ADAPTER_TYPES)
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16])
+def test_reformulated_dora_gradients_match_naive(monkeypatch, adapter_type, dtype):
+    layer = _build_reform_layer(adapter_type, bias=True, dtype=dtype)
+    x = mx.random.normal((5, 24)).astype(dtype)
+
+    def loss_fn(model, values):
+        return mx.mean(model(values).astype(mx.float32) ** 2)
+
+    loss_and_grad = nn.value_and_grad(layer, loss_fn)
+    loss_new, grads_new = loss_and_grad(layer, x)
+    mx.eval(loss_new, grads_new)
+
+    monkeypatch.setattr(lora_module, "_NAIVE_DORA", True)
+    loss_old, grads_old = loss_and_grad(layer, x)
+    mx.eval(loss_old, grads_old)
+
+    new_flat = dict(tree_flatten(grads_new))
+    old_flat = dict(tree_flatten(grads_old))
+    expected_params = (
+        {"M_xs"} if adapter_type.endswith("-xs") else {"lora_A", "lora_B"}
+    )
+    if "dora" in adapter_type:
+        expected_params = expected_params | {"magnitude"}
+    assert expected_params.issubset(new_flat)
+    assert set(new_flat) == set(old_flat)
+
+    tol = 1e-3 if dtype == mx.float32 else 3e-2
+    np.testing.assert_allclose(
+        float(loss_new), float(loss_old), rtol=tol, atol=tol
+    )
+    for name in sorted(new_flat):
+        np.testing.assert_allclose(
+            np.asarray(new_flat[name], dtype=np.float32),
+            np.asarray(old_flat[name], dtype=np.float32),
+            rtol=tol,
+            atol=tol,
+            err_msg=f"gradient mismatch for {name}",
+        )
+
+
+def test_reformulated_dora_forward_backward_is_faster(monkeypatch):
+    """Micro-timing: one medium-sized dora-rows layer, fwd+bwd, 20 iters.
+
+    Direction-only check (the dedicated ablation benchmarks live elsewhere):
+    the reformulated path must beat materializing the full 12288x1536 weight.
+    """
+
+    fan_in, fan_out = 1536, 12288
+    mx.random.seed(0)
+    base = nn.Linear(fan_in, fan_out, bias=True)
+    layer = lora_module.LoRALinear(
+        base,
+        rank=16,
+        alpha=16.0,
+        source_name="layer",
+        adapter_type="dora-rows",
+    )
+    layer.lora_B = mx.random.normal((fan_out, 16)) * 0.02
+    x = mx.random.normal((64, fan_in))
+
+    def loss_fn(model, values):
+        return mx.mean(model(values) ** 2)
+
+    loss_and_grad = nn.value_and_grad(layer, loss_fn)
+
+    def average_step_seconds(iterations: int = 20) -> float:
+        for _ in range(3):  # warmup
+            loss, grads = loss_and_grad(layer, x)
+            mx.eval(loss, grads)
+        start = time.perf_counter()
+        for _ in range(iterations):
+            loss, grads = loss_and_grad(layer, x)
+            mx.eval(loss, grads)
+        return (time.perf_counter() - start) / iterations
+
+    reformed = average_step_seconds()
+    monkeypatch.setattr(lora_module, "_NAIVE_DORA", True)
+    naive = average_step_seconds()
+
+    print(
+        f"\ndora-rows 12288x1536 fwd+bwd: reformed {reformed * 1e3:.2f} ms/iter"
+        f" vs naive {naive * 1e3:.2f} ms/iter ({naive / reformed:.1f}x)"
+    )
+    assert reformed < naive, (
+        f"reformed {reformed * 1e3:.2f} ms/iter is not faster than naive "
+        f"{naive * 1e3:.2f} ms/iter"
+    )
 
 
 @needs_underfit_reference

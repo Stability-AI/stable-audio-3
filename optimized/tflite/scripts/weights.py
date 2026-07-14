@@ -119,6 +119,39 @@ def _hf_token_configured() -> bool:
 
 
 _LOGIN_TIP_SHOWN = False
+_LINK_FALLBACK_SHOWN = False
+
+
+def _link_or_copy(cached: Path, target: Path) -> None:
+    """Expose the HF-cached file at `target`: symlink → hardlink → copy.
+
+    A symlink keeps the HF cache canonical (one copy on disk) and is used
+    wherever possible. On Windows, creating symlinks requires Developer Mode
+    or admin rights (WinError 1314), so fall back to a hardlink (privilege-
+    free and zero-copy, but same-volume only), then to a plain copy (works
+    everywhere, at the cost of a second copy on disk). Unlike a symlink, a
+    hardlink/copy won't track future HF-cache updates — acceptable, because
+    downloads are content-addressed: a changed file resolves to a new cache
+    path, and `ensure_local` only ever links each target once.
+    """
+    global _LINK_FALLBACK_SHOWN
+    try:
+        target.symlink_to(cached)
+        return
+    except OSError:
+        pass
+    import os
+    import shutil
+    try:
+        os.link(cached, target)   # hardlink: no privilege needed, same volume only
+        mode = "hardlink"
+    except OSError:
+        shutil.copy2(cached, target)
+        mode = "copy"
+    if not _LINK_FALLBACK_SHOWN:
+        _LINK_FALLBACK_SHOWN = True
+        print(f"  (symlinks unavailable on this system — materialized as a {mode} instead)")
+
 
 def _show_hf_login_tip_once() -> None:
     """Print a one-time login suggestion if no HF token is configured.
@@ -188,11 +221,14 @@ def ensure_local(local_rel_path: str, verbose: bool = True) -> Path:
 
     cached = hf_hub_download(repo_id=REPO_ID, filename=hf_filename)
     target.parent.mkdir(parents=True, exist_ok=True)
-    # Symlink keeps the HF cache canonical (one copy on disk) while exposing
-    # the file at the project-relative path the runtime expects.
+    # Expose the file at the project-relative path the runtime expects.
+    # Symlink when possible (keeps the HF cache canonical — one copy on disk);
+    # falls back to hardlink → copy on systems without symlink privileges
+    # (Windows without Developer Mode). The `exists() or is_symlink()`
+    # early-exits above and in is_present() are satisfied by every mode.
     if target.is_symlink():
         target.unlink()
-    target.symlink_to(cached)
+    _link_or_copy(Path(cached), target)
     return target
 
 

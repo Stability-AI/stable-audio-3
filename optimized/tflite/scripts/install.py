@@ -18,6 +18,19 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Windows consoles default to a legacy code page (cp1252/cp437) that can't encode
+# the ✓/→ status glyphs. Force UTF-8 with replacement; no-op on macOS/Linux.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass   # exotic stream without reconfigure() — leave as-is
+
+# Enable ANSI/VT escape processing in legacy Windows consoles (cmd.exe);
+# harmless elsewhere and on modern Windows Terminal.
+if os.name == "nt":
+    os.system("")
+
 # This file lives in <project>/scripts/. SCRIPT_DIR points at the project
 # root (where models/, requirements.txt, .venv/, sa3 wrapper live).
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
@@ -42,7 +55,9 @@ def check_environment() -> None:
             f"Re-run install.py with a Python {MIN_PY[0]}.{MIN_PY[1]}+ interpreter, e.g.:\n"
             f"    /path/to/python3.11 install.py\n\n"
             f"On macOS:  brew install python@3.11\n"
-            f"On Debian/Ubuntu:  apt install python3.11\n",
+            f"On Debian/Ubuntu:  apt install python3.11\n"
+            f"On Windows:  install from https://www.python.org/downloads/ "
+            f"(check 'Add python.exe to PATH')\n",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -136,7 +151,7 @@ def main() -> None:
                 ensure_local(rel)
     else:
         step("No --download set — weights will auto-download on first ./sa3 use")
-        print(f"  To pre-download instead, pass:  {sys.executable.split('/')[-1]} install.py --download sm-music")
+        print(f"  To pre-download instead, pass:  {Path(sys.executable).name} install.py --download sm-music")
         print(f"                              or:  ./install.sh --download sm-music,medium")
 
     from examples import print_example_commands, BOLD, GREEN, RESET

@@ -31,6 +31,19 @@ overfitting workflow. Prompts are built per-sample with underfit's tag
 augmentation. seconds_total stays the FULL source duration after cropping
 (deliberate underfit convention).
 
+Performance:
+  - the train step (loss + grad + optimizer update) is mx.compile'd by
+    default (MLX docs "Compile > Training graphs" pattern; --no-compile for
+    the eager path). Batch shapes are constant, so it compiles once.
+  - T5Gemma prompt conditioning is cached per exact prompt string (per-run,
+    in-memory; --no-t5-cache to disable) — the tiny-dataset workflow repeats
+    a handful of prompts, so the hit rate is ≈100% after the first epoch.
+  - --grad-checkpoint recomputes each transformer block's activations in the
+    backward pass (mlx-lm style mx.checkpoint) — memory for big crops on
+    small Macs, at the cost of roughly one extra forward.
+  - wired memory limit is raised to the device's recommended working-set
+    size at startup (mx.set_wired_limit).
+
 Usage:
     python scripts/lora_train_mlx.py --dit sm-music \
         --latents-dir output/latents/my-set --lr 1e-4 \
@@ -46,6 +59,7 @@ import struct
 import sys
 import time
 import uuid
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -83,6 +97,28 @@ BASE_MODEL_NAMES = {"sm-music": "sa3-sm-music", "sm-sfx": "sa3-sm-sfx",
 LATENT_CROP_DEFAULTS = {"sm-music": 1300, "sm-sfx": 1300, "medium": 4096}
 DIST_SHIFT_DEFAULT = {"shift_type": "full",
                       "options": {"min_length": 256, "max_length": 4096}}
+T5_CACHE_CAP = 512  # prompt-conditioning cache entries (oldest evicted first)
+
+
+def grad_checkpoint(layer):
+    """
+    Update all instances of type(layer) to use gradient checkpointing.
+
+    Verbatim port of mlx-lm's mlx_lm/tuner/trainer.py:grad_checkpoint —
+    activations of every instance of the layer's class are recomputed during
+    the backward pass instead of being kept alive, trading ~one extra forward
+    for a much smaller peak working set.
+    """
+    fn = type(layer).__call__
+
+    def checkpointed_fn(model, *args, **kwargs):
+        def inner_fn(params, *args, **kwargs):
+            model.update(params)
+            return fn(model, *args, **kwargs)
+
+        return mx.checkpoint(inner_fn)(model.trainable_parameters(), *args, **kwargs)
+
+    type(layer).__call__ = checkpointed_fn
 
 
 class TrainBundle(nn.Module):
@@ -142,6 +178,20 @@ def parse_args():
     ap.add_argument("--dist-shift", default="full",
                     choices=["none", "full", "flux", "logsnr"])
     ap.add_argument("--cfg-dropout-prob", type=float, default=0.1)
+    # performance
+    ap.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
+                    help="mx.compile the train step (loss+grad+optimizer update; "
+                         "MLX 'Compile > Training graphs' pattern). "
+                         "--no-compile restores the eager path.")
+    ap.add_argument("--grad-checkpoint", action="store_true",
+                    help="Gradient-checkpoint every transformer block (mlx-lm "
+                         "style mx.checkpoint): activations are recomputed in "
+                         "the backward pass — much lower peak memory for big "
+                         "crops, ~one extra forward of compute")
+    ap.add_argument("--t5-cache", action=argparse.BooleanOptionalAction, default=True,
+                    help="Cache the padded T5Gemma prompt conditioning per exact "
+                         f"prompt string (per-run, in-memory, max {T5_CACHE_CAP} "
+                         "entries)")
     # resume
     ap.add_argument("--lora-ckpt-path", default=None)
     ap.add_argument("--step-offset", type=int, default=None)
@@ -168,21 +218,59 @@ def resolve_offsets(args, ckpt_config) -> tuple[int, int]:
     return 0, 0
 
 
-def build_conditioning(t5, padding_emb, prompts, max_len=256):
+def build_conditioning(t5, padding_emb, prompts, max_len=256,
+                       cache=None, cache_stats=None):
     """Frozen prompt-side conditioning: T5Gemma embeddings with the learned
     padding embedding applied. Returns [B, 256, 768] fp32 (the trainable
-    seconds token is concatenated later, inside the grad scope)."""
-    embeds, mask = t5.encode(list(prompts), max_len=max_len)
-    mx.eval(embeds, mask)
-    padded = apply_prompt_padding(embeds.astype(mx.float32), mask,
-                                  padding_emb.astype(mx.float32))
-    return mx.stop_gradient(padded)
+    seconds token is concatenated later, inside the grad scope).
+
+    When ``cache`` (a dict) is given, the padded embedding is cached per
+    EXACT prompt string. The cache is per-run only (in-memory, never
+    persisted) and stores evaluated [1, max_len, 768] fp32 mx arrays; it is
+    capped at T5_CACHE_CAP entries, evicting oldest-inserted first. The
+    tiny-dataset underfit workflow repeats a handful of prompts, so after
+    the first epoch the T5Gemma forward is skipped entirely (~100% hits)."""
+    prompts = list(prompts)
+    if cache is None:
+        embeds, mask = t5.encode(prompts, max_len=max_len)
+        mx.eval(embeds, mask)
+        padded = apply_prompt_padding(embeds.astype(mx.float32), mask,
+                                      padding_emb.astype(mx.float32))
+        return mx.stop_gradient(padded)
+
+    missing = [p for p in dict.fromkeys(prompts) if p not in cache]
+    if cache_stats is not None:
+        n_miss = sum(1 for p in prompts if p in set(missing))
+        cache_stats["misses"] += n_miss
+        cache_stats["hits"] += len(prompts) - n_miss
+    if missing:
+        embeds, mask = t5.encode(missing, max_len=max_len)
+        padded = apply_prompt_padding(embeds.astype(mx.float32), mask,
+                                      padding_emb.astype(mx.float32))
+        mx.eval(padded)
+        for i, p in enumerate(missing):
+            while len(cache) >= T5_CACHE_CAP:
+                cache.pop(next(iter(cache)))  # evict oldest
+            row = padded[i:i + 1]
+            mx.eval(row)
+            cache[p] = row
+        print(f"  t5-cache: encoded {len(missing)} new prompt(s) "
+              f"({len(cache)} cached)")
+    return mx.stop_gradient(mx.concatenate([cache[p] for p in prompts],
+                                           axis=0))
 
 
 def main():
     args = parse_args()
     np_rng = np.random.default_rng(args.seed)
     mx.random.seed(args.seed)
+
+    # Let Metal wire (pin) up to the recommended working set — avoids paging
+    # stalls when the training working set approaches physical memory.
+    if hasattr(mx, "set_wired_limit") and hasattr(mx, "device_info"):
+        wired = mx.device_info().get("max_recommended_working_set_size")
+        if wired:
+            mx.set_wired_limit(int(wired))
 
     alpha = float(args.alpha) if args.alpha is not None else float(args.rank)
     lora_config = underfit_lora_config()
@@ -240,6 +328,13 @@ def main():
           f"rank {args.rank}, alpha {alpha:g} "
           f"({report.trainable_parameters/1e6:.2f}M trainable)")
 
+    if args.grad_checkpoint:
+        # Patch the TransformerBlock class (both DiT defs expose the blocks at
+        # dit.transformer.layers) so every block recomputes in backward.
+        grad_checkpoint(dit_model.transformer.layers[0])
+        print(f"grad-checkpoint: on "
+              f"({len(dit_model.transformer.layers)} transformer blocks)")
+
     secs_module = None
     if not args.no_conditioner_lora:
         secs_module = TrainableSecondsEmbedder(secs_embedder.W, secs_embedder.b)
@@ -283,13 +378,16 @@ def main():
                        axis=1).transpose(0, 2, 1)).astype(mx.float16)
 
     # ── loss (adapters in the bundle are the only trainable params) ──────────
+    # `seconds_in` is the raw seconds batch [B] fp32 when the trainable
+    # seconds conditioner is active; with --no-conditioner-lora it is the
+    # PRE-computed frozen seconds token [B, 1, 768] (built outside the step so
+    # the compiled step stays pure mx — no numpy inside the traced graph).
     def loss_fn(bundle, latents, timesteps, loss_mask, prompt_cond,
-                seconds_totals, drop_mask):
+                seconds_in, drop_mask):
         if bundle.secs is not None:
-            sec_tok = bundle.secs(seconds_totals)             # [B, 1, 768] fp32
+            sec_tok = bundle.secs(seconds_in)                 # [B, 1, 768] fp32
         else:
-            sec_tok = mx.stop_gradient(
-                secs_embedder(list(np.asarray(seconds_totals))))
+            sec_tok = seconds_in                              # frozen, precomputed
         cross = mx.concatenate([prompt_cond, sec_tok.astype(mx.float32)], axis=1)
         # CFG dropout (dit.py:441): whole cross_attn → zeros per sample;
         # global_cond (the seconds token) is kept.
@@ -306,6 +404,27 @@ def main():
                                    loss_mask=loss_mask)
 
     value_and_grad = nn.value_and_grad(bundle, loss_fn)
+
+    # ── train step (compiled by default — MLX "Compile > Training graphs") ──
+    # Captured state: model params (the LoRA adapters the optimizer mutates),
+    # optimizer moments, and the global PRNG key — rectified_flow_loss draws
+    # its noise INSIDE the step. Everything np/python (timestep sampling, CFG
+    # dropout draw, T5 encode, telemetry) stays OUTSIDE the step; batch
+    # shapes/dtypes are constant (fixed crop + batch), so this traces once.
+    # optimizer.init() materializes the moment arrays up front so the captured
+    # state structure never changes (no recompile on step 2).
+    optimizer.init(bundle.trainable_parameters())
+    state = [bundle.state, optimizer.state, mx.random.state]
+
+    def train_step(latents, timesteps, loss_mask, prompt_cond, seconds_in,
+                   drop):
+        loss, grads = value_and_grad(bundle, latents, timesteps, loss_mask,
+                                     prompt_cond, seconds_in, drop)
+        optimizer.update(bundle, grads)
+        return loss
+
+    if args.compile:
+        train_step = partial(mx.compile, inputs=state, outputs=state)(train_step)
 
     # ── telemetry (underfit's loss_by_timestep.bin, struct "Iff") ────────────
     tele = open("loss_by_timestep.bin", "ab")
@@ -327,10 +446,15 @@ def main():
     raw_step = 0
     epoch = epoch_offset
     last_saved_step = None
+    t5_cache = {} if args.t5_cache else None
+    t5_stats = {"hits": 0, "misses": 0}
+    if hasattr(mx, "reset_peak_memory"):
+        mx.reset_peak_memory()  # measure the training loop, not weight loading
     t_start = time.time()
     print(f"training: max {max_new_steps} new step(s) "
           f"(global target {args.max_steps}), lr {args.lr:g}, "
-          f"batch {args.batch_size}, cfg-dropout {args.cfg_dropout_prob}")
+          f"batch {args.batch_size}, cfg-dropout {args.cfg_dropout_prob}, "
+          f"compile {'on' if args.compile else 'off'}")
     try:
         while raw_step < max_new_steps:
             for batch in iterate_batches(dataset, args.batch_size,
@@ -356,15 +480,24 @@ def main():
                 timesteps = mx.array(t_np)
 
                 prompt_cond = build_conditioning(t5, padding_emb,
-                                                 batch["prompt"])
+                                                 batch["prompt"],
+                                                 cache=t5_cache,
+                                                 cache_stats=t5_stats)
                 drop = mx.array((np_rng.random(latents.shape[0])
                                  < args.cfg_dropout_prob))
+                if bundle.secs is not None:
+                    seconds_in = seconds
+                else:
+                    # frozen conditioner: build the seconds token OUTSIDE the
+                    # (possibly compiled) step — see loss_fn
+                    seconds_in = mx.stop_gradient(secs_embedder(
+                        [float(s) for s in batch["seconds_total"]]))
 
-                loss, grads = value_and_grad(bundle, latents, timesteps,
-                                             loss_mask, prompt_cond, seconds,
-                                             drop)
-                optimizer.update(bundle, grads)
-                mx.eval(loss, bundle.trainable_parameters(), optimizer.state)
+                t_step = time.time()
+                loss = train_step(latents, timesteps, loss_mask, prompt_cond,
+                                  seconds_in, drop)
+                mx.eval(state, loss)
+                step_ms = (time.time() - t_step) * 1000.0
 
                 raw_step += 1
                 loss_v = float(loss)
@@ -375,7 +508,7 @@ def main():
                 rate = raw_step / max(time.time() - t_start, 1e-9)
                 print(f"step {global_step}  train/loss {loss_v:.6f}  "
                       f"train/lr {args.lr:.3e}  epoch {epoch}  "
-                      f"({rate:.2f} it/s)", flush=True)
+                      f"({rate:.2f} it/s, {step_ms:.0f} ms)", flush=True)
 
                 if args.checkpoint_every > 0 and \
                         global_step % args.checkpoint_every == 0:
@@ -389,6 +522,11 @@ def main():
     if raw_step > 0 and global_step != last_saved_step:
         checkpoint(global_step, epoch)
     tele.close()
+    if t5_cache is not None:
+        print(f"t5 cache: {t5_stats['hits']} hit(s) / "
+              f"{t5_stats['misses']} miss(es), {len(t5_cache)} cached")
+    print(f"peak memory: {mx.get_peak_memory()/2**30:.2f} GB"
+          + ("  (grad-checkpoint on)" if args.grad_checkpoint else ""))
     print(f"done: {raw_step} step(s) in {time.time()-t_start:.0f}s")
 
 

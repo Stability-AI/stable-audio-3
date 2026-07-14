@@ -16,7 +16,7 @@ One line on a fresh machine — installs everything and plays back ~30 seconds o
 curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/tflite/bootstrap.sh | bash
 ```
 
-Windows (PowerShell):
+Windows — stock PowerShell (no bash/git needed; the curl|bash line above requires Git Bash or WSL on Windows):
 
 ```powershell
 irm https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/tflite/bootstrap.ps1 | iex

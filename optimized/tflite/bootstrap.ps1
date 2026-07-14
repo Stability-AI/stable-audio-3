@@ -19,6 +19,10 @@
 
 $ErrorActionPreference = "Stop"
 
+# Older Windows PowerShell 5.1 hosts may default to TLS < 1.2, which GitHub
+# rejects. Harmless no-op on PowerShell 7+ / current Win10+.
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+
 $RepoOwner = "Stability-AI"
 $RepoName  = "stable-audio-3"
 $Branch    = "main"

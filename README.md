@@ -243,7 +243,7 @@ Optimized inference runtimes are available under [optimized/](optimized) — pic
 
 | Route | Platforms | Backend | One-liner |
 |---|---|---|---|
-| [optimized/tflite](optimized/tflite) | **macOS / Linux / Windows**, x86 & ARM | CPU (LiteRT/XNNPACK) | `curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/tflite/bootstrap.sh \| bash`<br>Windows: `irm https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/tflite/bootstrap.ps1 \| iex` |
+| [optimized/tflite](optimized/tflite) | **macOS / Linux / Windows**, x86 & ARM | CPU (LiteRT/XNNPACK) | `curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/tflite/bootstrap.sh \| bash`<br>Windows: `irm https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/tflite/bootstrap.ps1 \| iex` <br>*(the curl\|bash line needs Git Bash or WSL on Windows — stock Windows has no bash)* |
 | [optimized/mlx](optimized/mlx) | Apple Silicon Macs | Metal GPU (MLX) | `curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/mlx/bootstrap.sh \| bash` |
 | [optimized/tensorRT](optimized/tensorRT) | Linux + NVIDIA GPU | CUDA/TensorRT | `curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/tensorRT/bootstrap.sh \| bash` |
 

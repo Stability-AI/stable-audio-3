@@ -34,6 +34,8 @@ Already cloned the repo? Run from inside `optimized/tflite/`:
 :: Windows cmd / PowerShell
 install.bat
 sa3.bat --prompt "Impending tribal, epic orchestral buildup" --play
+:: PowerShell users can use .\sa3.ps1 instead of sa3.bat — same flags, and
+:: Ctrl-C exits cleanly (cmd's "Terminate batch job (Y/N)?" prompt is a .bat quirk)
 ```
 
 ## Three models, four modes

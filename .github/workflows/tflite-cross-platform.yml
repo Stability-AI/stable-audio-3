@@ -63,6 +63,9 @@ jobs:
           [void][System.Management.Automation.Language.Parser]::ParseFile(
             "optimized/tflite/bootstrap.ps1", [ref]$null, [ref]$errs)
           if ($errs) { $errs | ForEach-Object { Write-Error $_.Message }; exit 1 }
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            "optimized/tflite/sa3.ps1", [ref]$null, [ref]$errs)
+          if ($errs) { $errs | ForEach-Object { Write-Error $_.Message }; exit 1 }
 
       - name: bootstrap.sh parses (bash syntax check)
         if: runner.os != 'Windows'

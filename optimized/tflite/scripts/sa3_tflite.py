@@ -840,7 +840,19 @@ def main():
             if kind == "winsound":
                 print(f"  {bold('▶ playing')}   {args.out}   {dim('(Ctrl-C to stop)')}")
                 import winsound
-                winsound.PlaySound(args.out, winsound.SND_FILENAME)   # blocking, like afplay
+                # SND_ASYNC + an interruptible sleep instead of the synchronous
+                # call: PlaySound(..., SND_FILENAME) blocks inside native code,
+                # so Python can't deliver Ctrl-C until playback finishes. This
+                # way Ctrl-C lands in time.sleep and SND_PURGE stops the audio.
+                with wave.open(args.out) as _w:
+                    _dur = _w.getnframes() / _w.getframerate()
+                winsound.PlaySound(args.out,
+                                   winsound.SND_FILENAME | winsound.SND_ASYNC)
+                try:
+                    time.sleep(_dur + 0.25)
+                except KeyboardInterrupt:
+                    winsound.PlaySound(None, winsound.SND_PURGE)
+                    raise
             elif kind == "subprocess":
                 print(f"  {bold('▶ playing')}   {args.out}   {dim('(Ctrl-C to stop)')}")
                 subprocess.run(argv + [args.out], check=False)

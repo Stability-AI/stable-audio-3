@@ -16,6 +16,12 @@ One line on a fresh machine — installs everything and plays back ~30 seconds o
 curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/tflite/bootstrap.sh | bash
 ```
 
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/tflite/bootstrap.ps1 | iex
+```
+
 Already cloned the repo? Run from inside `optimized/tflite/`:
 
 ```bash

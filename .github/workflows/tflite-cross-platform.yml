@@ -55,3 +55,15 @@ jobs:
 
       - name: Windows-compat test suite
         run: python optimized/tflite/scripts/test_windows_compat.py
+
+      - name: bootstrap.ps1 parses (PowerShell syntax check)
+        shell: pwsh
+        run: |
+          $errs = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            "optimized/tflite/bootstrap.ps1", [ref]$null, [ref]$errs)
+          if ($errs) { $errs | ForEach-Object { Write-Error $_.Message }; exit 1 }
+
+      - name: bootstrap.sh parses (bash syntax check)
+        if: runner.os != 'Windows'
+        run: bash -n optimized/tflite/bootstrap.sh

@@ -482,6 +482,20 @@ def run_generation(dit_name: str, decoder_name: str, prompt: str,
 # AND paused drop from the registry so ghosts can be garbage-collected.
 # A DETACHED element's play event must never silence the living player (the
 # swap can briefly leave a superseded copy whose pending play() resolves late).
+# gradio's slider track fill lives in an inline CSS var (--range_progress) that
+# is only written on user input / first mount — a slider REmounted by a
+# visibility toggle (LoRA slots on model switch / add) comes back without it and
+# renders a blank track. Recompute it client-side after any remount batch;
+# idempotent for healthy sliders (same formula gradio uses).
+_JS_FIX_SLIDERS = (
+    "() => setTimeout(() => {"
+    "document.querySelectorAll('input[type=range]').forEach(r => {"
+    "const min = +r.min || 0, max = +r.max || 100, v = +r.value;"
+    "if (max > min) r.style.setProperty('--range_progress',"
+    "((v - min) / (max - min) * 100) + '%');"
+    "});}, 150)"
+)
+
 _JS_PAUSE_OTHERS = (
     "if(this.isConnected){"
     "var t=this;var L=window._sa3All=(window._sa3All||[]);"
@@ -1180,7 +1194,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                               + lora_files
                               + [c for i in range(3)
                                  for c in lora_inputs[5 * i + 2: 5 * i + 5]]
-                      ).then(_sync_dd_vis, inputs=[dit_dd], outputs=lora_dds)
+                      ).then(_sync_dd_vis, inputs=[dit_dd], outputs=lora_dds
+                      ).then(None, js=_JS_FIX_SLIDERS)
 
         def on_seconds_change(sec):
             return gr.update(maximum=sec), gr.update(maximum=sec)
@@ -1222,7 +1237,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                               for c in lora_inputs[5 * i: 5 * i + 2]],
                            outputs=lora_rows + lora_srows
                            + [lora_add_btn, lora_vis]
-                           ).then(_sync_dd_vis, inputs=[dit_dd], outputs=lora_dds)
+                           ).then(_sync_dd_vis, inputs=[dit_dd], outputs=lora_dds
+                           ).then(None, js=_JS_FIX_SLIDERS)
 
         def _lora_remove(idx):
             def _rm(vis, cur_steps):
@@ -1252,7 +1268,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
             def _up(f):
                 return gr.update(visible=bool(f)), gr.update(value=_DD_NONE)
             _up.__name__ = f"lora_file_{idx + 1}"
-            lf.upload(_up, inputs=[lf], outputs=[srow, ld])
+            lf.upload(_up, inputs=[lf], outputs=[srow, ld]
+                      ).then(None, js=_JS_FIX_SLIDERS)
 
             def _cl(dd):
                 return gr.update(visible=bool(dd and dd != _DD_NONE))
@@ -1264,7 +1281,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 return (gr.update(visible=loaded or bool(f)),
                         gr.update(value=None) if loaded else gr.update())
             _pick.__name__ = f"lora_pick_{idx + 1}"
-            ld.input(_pick, inputs=[ld, lf], outputs=[srow, lf])
+            ld.input(_pick, inputs=[ld, lf], outputs=[srow, lf]
+                     ).then(None, js=_JS_FIX_SLIDERS)
         for _idx in range(3):
             _lora_wire_slot(_idx)
 

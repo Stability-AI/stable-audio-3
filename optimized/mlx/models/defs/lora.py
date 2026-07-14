@@ -72,6 +72,7 @@ class LoRALinear(nn.Module):
         alpha: float,
         source_name: str,
         adapter_type: str = "lora",
+        checkpoint_prefix: str = "model.",
     ):
         super().__init__()
         if rank <= 0:
@@ -83,7 +84,7 @@ class LoRALinear(nn.Module):
         self.alpha = float(alpha)
         self.scaling = self.alpha / self.rank
         self.source_name = str(source_name)
-        self.checkpoint_name = _checkpoint_layer_name(self.source_name)
+        self.checkpoint_name = _checkpoint_name(source_name, checkpoint_prefix)
         self.adapter_type = canonical_adapter_type(adapter_type)
 
         fan_out, fan_in = (int(value) for value in base.weight.shape)
@@ -125,6 +126,7 @@ class LoRAConv1d(nn.Module):
         alpha: float,
         source_name: str,
         adapter_type: str = "lora",
+        checkpoint_prefix: str = "model.",
     ):
         super().__init__()
         if rank <= 0:
@@ -136,7 +138,7 @@ class LoRAConv1d(nn.Module):
         self.alpha = float(alpha)
         self.scaling = self.alpha / self.rank
         self.source_name = str(source_name)
-        self.checkpoint_name = _checkpoint_layer_name(self.source_name)
+        self.checkpoint_name = _checkpoint_name(source_name, checkpoint_prefix)
         self.adapter_type = canonical_adapter_type(adapter_type)
 
         fan_out, kernel_size, fan_in_per_group = (
@@ -203,6 +205,95 @@ class LoRAConv1d(nn.Module):
 TrainableLoRALayer = LoRALinear | LoRAConv1d
 
 
+class _ExpoFourierFeatures(nn.Module):
+    """MLX port of stable_audio_tools ExpoFourierFeatures (fp32, no params).
+
+    Occupies ``embedder.embedding.0`` in TrainableSecondsEmbedder so the
+    trainable Linear lands at ``embedder.embedding.1``, matching underfit's
+    torch Sequential(ExpoFourierFeatures, Linear) checkpoint layout. The math
+    mirrors sa3_pipeline.expo_fourier_features exactly.
+    """
+
+    def __init__(
+        self,
+        dim: int = 256,
+        min_freq: float = 0.5,
+        max_freq: float = 10000.0,
+    ):
+        super().__init__()
+        self.dim = int(dim)
+        self.min_freq = float(min_freq)
+        self.max_freq = float(max_freq)
+
+    def __call__(self, t: mx.array) -> mx.array:
+        t = t.astype(mx.float32).reshape(-1, 1)
+        half = self.dim // 2
+        ramp = mx.arange(half, dtype=mx.float32) / max(half - 1, 1)
+        freqs = mx.exp(
+            ramp * (math.log(self.max_freq) - math.log(self.min_freq))
+            + math.log(self.min_freq)
+        )
+        args = t * freqs * 2 * math.pi
+        return mx.concatenate([mx.cos(args), mx.sin(args)], axis=-1)
+
+
+class TrainableSecondsEmbedder(nn.Module):
+    """Trainable seconds_total conditioner (underfit checkpoint-compatible).
+
+    Built from the baked conditioner weights as loaded by
+    sa3_pipeline.load_conditioner_from_npz: ``weight`` [768, 256] fp32 and
+    ``bias`` [768] fp32. Replicates SecondsTotalEmbedder's exact math (clip to
+    [min_val, max_val], normalize, expo Fourier features, Linear) and returns
+    the [B, 1, 768] seconds token.
+
+    The module tree places the Linear at the runtime name
+    ``embedder.embedding.1`` so injecting with
+    ``checkpoint_prefix="conditioners.seconds_total."`` reproduces underfit's
+    checkpoint key root ``conditioners.seconds_total.embedder.embedding.1``.
+    When injected, the base Linear is frozen and only the adapter trains.
+    """
+
+    def __init__(
+        self,
+        weight: mx.array,
+        bias: mx.array,
+        *,
+        min_val: float = 0.0,
+        max_val: float = 384.0,
+        fourier_dim: int = 256,
+    ):
+        super().__init__()
+        weight = mx.array(weight).astype(mx.float32)
+        bias = mx.array(bias).astype(mx.float32)
+        fan_out, fan_in = (int(value) for value in weight.shape)
+        if fan_in != int(fourier_dim):
+            raise ValueError(
+                f"Conditioner weight fan-in {fan_in} does not match "
+                f"fourier_dim {fourier_dim}."
+            )
+        linear = nn.Linear(fan_in, fan_out)
+        linear.weight = weight
+        linear.bias = bias
+        embedder = nn.Module()
+        embedder.embedding = [_ExpoFourierFeatures(dim=int(fourier_dim)), linear]
+        self.embedder = embedder
+        self.min_val = float(min_val)
+        self.max_val = float(max_val)
+        self.fourier_dim = int(fourier_dim)
+
+    def __call__(self, seconds: float | tp.Sequence[float] | mx.array) -> mx.array:
+        if isinstance(seconds, (int, float)):
+            seconds = [float(seconds)]
+        if not isinstance(seconds, mx.array):
+            seconds = mx.array([float(value) for value in seconds], dtype=mx.float32)
+        values = seconds.astype(mx.float32).reshape(-1)
+        values = mx.clip(values, self.min_val, self.max_val)
+        norm = (values - self.min_val) / (self.max_val - self.min_val)
+        features = self.embedder.embedding[0](norm)  # (B, fourier_dim)
+        token = self.embedder.embedding[1](features)  # (B, 768)
+        return token[:, None, :]  # (B, 1, 768)
+
+
 def inject_trainable_lora(
     model: nn.Module,
     *,
@@ -211,8 +302,17 @@ def inject_trainable_lora(
     include: tp.Sequence[str] | None = None,
     exclude: tp.Sequence[str] | None = None,
     adapter_type: str = "lora",
+    checkpoint_prefix: str = "model.",
 ) -> LoRAInjectionReport:
-    """Freeze an MLX model and replace selected Linear/Conv1d layers."""
+    """Freeze an MLX model and replace selected Linear/Conv1d layers.
+
+    ``checkpoint_prefix`` is prepended to each layer's remapped runtime name
+    to form its checkpoint key root (underfit convention: DiT layers save as
+    ``model.<name>``, the seconds conditioner as
+    ``conditioners.seconds_total.<name>``). Include/exclude patterns match
+    against both the bare runtime name and the full checkpoint name, so
+    underfit dashboard filter strings work verbatim.
+    """
 
     alpha = float(rank if alpha is None else alpha)
     adapter_type = canonical_adapter_type(adapter_type)
@@ -220,7 +320,12 @@ def inject_trainable_lora(
 
     replacements: list[tuple[str, TrainableLoRALayer]] = []
     for name, layer in model.named_modules():
-        if not name or not _name_is_selected(name, include=include, exclude=exclude):
+        if not name or not _name_is_selected(
+            name,
+            _checkpoint_name(name, checkpoint_prefix),
+            include=include,
+            exclude=exclude,
+        ):
             continue
         if isinstance(layer, nn.Linear):
             replacement = LoRALinear(
@@ -229,6 +334,7 @@ def inject_trainable_lora(
                 alpha=alpha,
                 source_name=name,
                 adapter_type=adapter_type,
+                checkpoint_prefix=checkpoint_prefix,
             )
         elif isinstance(layer, nn.Conv1d):
             replacement = LoRAConv1d(
@@ -237,6 +343,7 @@ def inject_trainable_lora(
                 alpha=alpha,
                 source_name=name,
                 adapter_type=adapter_type,
+                checkpoint_prefix=checkpoint_prefix,
             )
         else:
             continue
@@ -254,6 +361,77 @@ def inject_trainable_lora(
         trainable_parameters=trainable_parameters,
         adapter_type=adapter_type,
     )
+
+
+def underfit_lora_config() -> dict[str, tp.Any]:
+    """Effective underfit product defaults (what the dashboard writes).
+
+    The exclude list is exactly what underfit's dashboard puts in the
+    ``lora_config`` metadata of trained checkpoints (confirmed against a real
+    underfit checkpoint): adapters go on every attention/FF linear, while the
+    embedders/projections/convs stay frozen.
+    """
+
+    return {
+        "adapter_type": "dora-rows",
+        "rank": 16,
+        "alpha": 16,
+        "include": None,
+        "exclude": [
+            "to_timestep_embed",
+            "to_cond_embed",
+            "to_global_embed",
+            "to_local_embed",
+            "global_cond_embedder",
+            "project_in",
+            "project_out",
+            "preprocess_conv",
+            "postprocess_conv",
+        ],
+    }
+
+
+def inject_from_lora_config(
+    model: nn.Module,
+    lora_config: dict[str, tp.Any] | None,
+    *,
+    checkpoint_prefix: str = "model.",
+) -> tuple[LoRAInjectionReport, dict[str, tp.Any]]:
+    """Inject adapters from an underfit ``lora_config`` dict.
+
+    Mirrors underfit's apply_lora_from_config config-layer fallbacks: rank
+    defaults to 8, alpha defaults to rank, adapter_type defaults to "lora"
+    (legacy "dora" resolves to "dora-rows"). Returns the injection report and
+    the saved-config dict ({rank, alpha, adapter_type, include, exclude})
+    ready to pass to save metadata.
+    """
+
+    lora_config = dict(lora_config or {})
+    rank = lora_config.get("rank")
+    rank = 8 if rank is None else int(rank)
+    alpha = lora_config.get("alpha")
+    alpha = rank if alpha is None else alpha
+    adapter_type = canonical_adapter_type(lora_config.get("adapter_type") or "lora")
+    include = lora_config.get("include")
+    exclude = lora_config.get("exclude")
+
+    report = inject_trainable_lora(
+        model,
+        rank=rank,
+        alpha=float(alpha),
+        include=include,
+        exclude=exclude,
+        adapter_type=adapter_type,
+        checkpoint_prefix=checkpoint_prefix,
+    )
+    saved_config = {
+        "rank": rank,
+        "alpha": alpha,
+        "adapter_type": adapter_type,
+        "include": include,
+        "exclude": exclude,
+    }
+    return report, saved_config
 
 
 def iter_trainable_lora_layers(
@@ -309,7 +487,8 @@ def save_lora_checkpoint(
 
     config: dict[str, tp.Any] = {
         "rank": rank,
-        "alpha": alpha,
+        # Underfit writes integral alphas as JSON ints — keep metadata parity.
+        "alpha": int(alpha) if float(alpha).is_integer() else alpha,
         "adapter_type": adapter_type,
         "include": list(include) if include else None,
         "exclude": list(exclude) if exclude else None,
@@ -332,6 +511,60 @@ def save_lora_checkpoint(
         metadata={"lora_config": json.dumps(config)},
     )
     return output_path
+
+
+def load_trainable_lora_state(
+    model: nn.Module,
+    state_dict: dict[str, tp.Any],
+) -> int:
+    """Restore trainable adapter parameters from an underfit checkpoint.
+
+    ``state_dict`` uses underfit checkpoint keys
+    (``<checkpoint_name>.parametrizations.weight.<N>.<param>``). Each group is
+    matched to the injected trainable layer with the same checkpoint_name;
+    unmatched groups and unknown params are tolerated (torch strict=False
+    semantics). 2-D DoRA magnitudes are squeezed to 1-D like underfit's
+    prepare_dora_state_dict. Parameters are restored in fp32. Returns the
+    number of layers restored.
+    """
+
+    grouped = _group_lora_state_dict(state_dict)
+    layers = {
+        layer.checkpoint_name: layer for layer in iter_trainable_lora_layers(model)
+    }
+    restored = 0
+    for checkpoint_name, params in grouped.items():
+        layer = layers.get(checkpoint_name)
+        if layer is None:
+            continue
+        applied = False
+        for param_name in (
+            "lora_A",
+            "lora_B",
+            "magnitude",
+            "magnitude_r",
+            "magnitude_c",
+            "M_xs",
+        ):
+            value = params.get(param_name)
+            if value is None:
+                continue
+            current = getattr(layer, param_name, None)
+            if current is None:
+                continue
+            array = np.asarray(value, dtype=np.float32)
+            if param_name == "magnitude" and array.ndim == 2:
+                array = array.squeeze()
+            if tuple(array.shape) != tuple(current.shape):
+                raise ValueError(
+                    f"Checkpoint tensor {checkpoint_name}.{param_name} has "
+                    f"shape {tuple(array.shape)}, expected "
+                    f"{tuple(current.shape)}."
+                )
+            setattr(layer, param_name, mx.array(array, dtype=mx.float32))
+            applied = True
+        restored += int(applied)
+    return restored
 
 
 def load_lora_checkpoint(
@@ -805,6 +1038,10 @@ def _checkpoint_layer_name(name: str) -> str:
     )
 
 
+def _checkpoint_name(source_name: str, checkpoint_prefix: str) -> str:
+    return str(checkpoint_prefix or "") + _checkpoint_layer_name(str(source_name))
+
+
 def _source_shape_for_delta(
     target_shape: tuple[int, ...],
     delta_shape: tuple[int, int],
@@ -926,14 +1163,22 @@ def _canonicalize_svd_signs(
 
 
 def _name_is_selected(
-    name: str,
-    *,
+    *names: str,
     include: tp.Sequence[str] | None,
     exclude: tp.Sequence[str] | None,
 ) -> bool:
-    if include and not _matches_any(name, include):
+    """Match include/exclude filters against any of the given aliases.
+
+    Callers pass both the bare runtime name and the full checkpoint name so
+    underfit dashboard filter strings (written in torch/checkpoint naming)
+    select the same layers verbatim.
+    """
+
+    if include and not any(_matches_any(name, include) for name in names):
         return False
-    return not (exclude and _matches_any(name, exclude))
+    return not (
+        exclude and any(_matches_any(name, exclude) for name in names)
+    )
 
 
 def _matches_any(name: str, patterns: tp.Sequence[str]) -> bool:

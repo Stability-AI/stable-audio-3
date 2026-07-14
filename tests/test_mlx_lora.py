@@ -14,18 +14,34 @@ from mlx.utils import tree_flatten
 
 from optimized.mlx.models.defs import dit_mlx, dit_mlx_medium
 from optimized.mlx.models.defs.lora import (
+    TrainableSecondsEmbedder,
     apply_lora_checkpoint,
     apply_lora_checkpoints,
+    inject_from_lora_config,
     inject_trainable_lora,
+    iter_trainable_lora_layers,
     load_lora_checkpoint,
+    load_trainable_lora_state,
     save_lora_checkpoint,
+    underfit_lora_config,
 )
+from optimized.mlx.models.defs.sa3_pipeline import SecondsTotalEmbedder
 from stable_audio_3.models.lora import (
     LoRAParametrization,
     add_lora,
     get_lora_state_dict,
     load_lora_checkpoint as load_torch_lora_checkpoint,
     save_lora_safetensors,
+)
+
+# Real underfit-trained checkpoint (medium DiT, dora-rows rank 16) used to
+# verify byte-convention key-naming parity with underfit's saver.
+UNDERFIT_REFERENCE_CHECKPOINT = Path(
+    "/Users/cj/clod/speed-metal/scripts/lora_bench/plini-sa3-380.safetensors"
+)
+needs_underfit_reference = pytest.mark.skipif(
+    not UNDERFIT_REFERENCE_CHECKPOINT.exists(),
+    reason="real underfit reference checkpoint not available",
 )
 
 
@@ -184,15 +200,25 @@ def test_mlx_checkpoint_round_trips_through_official_torch_loader(
     checkpoint = save_lora_checkpoint(
         model,
         tmp_path / "mlx-dora.safetensors",
-        extra_config={"step": 20},
+        extra_config={"step": 20, "epoch": 3, "base_model": "sa3-medium"},
     )
     mlx_state, mlx_config = load_lora_checkpoint(checkpoint)
     torch_state, torch_config = load_torch_lora_checkpoint(checkpoint)
 
+    # Underfit key convention: "model." + the bare runtime name. Underfit
+    # loads with strict=False into model.model/model.conditioner, so the
+    # model.-prefixed keys are what the official stack expects.
+    assert sorted(mlx_state) == [
+        "model.layer.parametrizations.weight.0.lora_A",
+        "model.layer.parametrizations.weight.0.lora_B",
+        "model.layer.parametrizations.weight.0.magnitude",
+    ]
     assert sorted(mlx_state) == sorted(torch_state)
     assert mlx_config == torch_config
     assert mlx_config["adapter_type"] == "dora-rows"
     assert mlx_config["step"] == 20
+    assert mlx_config["epoch"] == 3
+    assert mlx_config["base_model"] == "sa3-medium"
 
 
 @pytest.mark.parametrize(
@@ -368,8 +394,8 @@ def test_saved_local_embed_name_maps_back_to_pytorch_layout(tmp_path: Path):
     state_dict, _ = load_torch_lora_checkpoint(checkpoint)
 
     assert sorted(state_dict) == [
-        "to_local_embed.0.parametrizations.weight.0.lora_A",
-        "to_local_embed.0.parametrizations.weight.0.lora_B",
+        "model.to_local_embed.0.parametrizations.weight.0.lora_A",
+        "model.to_local_embed.0.parametrizations.weight.0.lora_B",
     ]
 
 
@@ -405,3 +431,247 @@ def test_conv1d_checkpoint_maps_pytorch_weight_layout_to_mlx(tmp_path: Path):
 
     assert report.applied_layers == 1
     assert np.allclose(np.asarray(mlx_model.layer.weight), expected, atol=2e-3)
+
+
+def test_underfit_lora_config_matches_dashboard_defaults():
+    assert underfit_lora_config() == {
+        "adapter_type": "dora-rows",
+        "rank": 16,
+        "alpha": 16,
+        "include": None,
+        "exclude": [
+            "to_timestep_embed",
+            "to_cond_embed",
+            "to_global_embed",
+            "to_local_embed",
+            "global_cond_embedder",
+            "project_in",
+            "project_out",
+            "preprocess_conv",
+            "postprocess_conv",
+        ],
+    }
+
+
+class WideMLXRegressor(nn.Module):
+    """Layers wide enough for underfit's config-layer default rank (8)."""
+
+    def __init__(self):
+        super().__init__()
+        self.input = nn.Linear(16, 12, bias=False)
+        self.output = nn.Linear(12, 8, bias=False)
+
+    def __call__(self, x):
+        return self.output(nn.silu(self.input(x)))
+
+
+def test_inject_from_lora_config_applies_underfit_config_layer_fallbacks():
+    model = WideMLXRegressor()
+    report, saved_config = inject_from_lora_config(model, {})
+
+    assert report.adapter_type == "lora"
+    assert saved_config == {
+        "rank": 8,
+        "alpha": 8,
+        "adapter_type": "lora",
+        "include": None,
+        "exclude": None,
+    }
+    for layer in iter_trainable_lora_layers(model):
+        assert layer.rank == 8
+        assert layer.alpha == 8.0
+        assert layer.checkpoint_name == f"model.{layer.source_name}"
+
+    legacy = WideMLXRegressor()
+    report, saved_config = inject_from_lora_config(
+        legacy,
+        {"adapter_type": "dora", "rank": 4, "include": ["output"]},
+    )
+
+    assert report.adapter_type == "dora-rows"
+    assert report.layer_names == ("output",)
+    assert saved_config == {
+        "rank": 4,
+        "alpha": 4,
+        "adapter_type": "dora-rows",
+        "include": ["output"],
+        "exclude": None,
+    }
+
+
+def test_include_filters_match_checkpoint_convention_names():
+    model = dit_mlx.DiT(T_lat=8)
+    # Underfit dashboard filter strings are written in torch/checkpoint
+    # naming: "model." prefix and "to_local_embed.0" (no ".seq").
+    report = inject_trainable_lora(
+        model,
+        rank=1,
+        include=[
+            "model.transformer.layers.[0-1].self_attn.to_qkv",
+            "model.transformer.layers.0.to_local_embed.0",
+        ],
+        exclude=["model.transformer.layers.1."],
+    )
+
+    assert set(report.layer_names) == {
+        "transformer.layers.0.self_attn.to_qkv",
+        "transformer.layers.0.to_local_embed.seq.0",
+    }
+
+
+def test_trainable_seconds_embedder_matches_pipeline_conditioner():
+    rng = np.random.default_rng(2)
+    weight = mx.array(rng.standard_normal((768, 256)).astype(np.float32))
+    bias = mx.array(rng.standard_normal(768).astype(np.float32))
+    reference = SecondsTotalEmbedder(weight, bias)
+    trainable = TrainableSecondsEmbedder(weight, bias)
+
+    for seconds in ([30.0], [0.0, 1.5, 47.25, 285.0, 384.0, 500.0]):
+        expected = reference(seconds)
+        actual = trainable(seconds)
+        assert actual.shape == (len(seconds), 1, 768)
+        assert bool(mx.all(actual == expected))
+    # mx.array input path (what the trainer passes) is bit-identical too.
+    assert bool(
+        mx.all(trainable(mx.array([12.5, 380.0])) == reference([12.5, 380.0]))
+    )
+
+    report, _ = inject_from_lora_config(
+        trainable,
+        underfit_lora_config(),
+        checkpoint_prefix="conditioners.seconds_total.",
+    )
+    layer = next(iter(iter_trainable_lora_layers(trainable)))
+
+    assert report.layer_names == ("embedder.embedding.1",)
+    assert layer.checkpoint_name == (
+        "conditioners.seconds_total.embedder.embedding.1"
+    )
+    # Base Linear is frozen — only the adapter trains.
+    assert sorted(
+        name for name, _ in tree_flatten(trainable.trainable_parameters())
+    ) == [
+        "embedder.embedding.1.lora_A",
+        "embedder.embedding.1.lora_B",
+        "embedder.embedding.1.magnitude",
+    ]
+    assert trainable([30.0]).shape == (1, 1, 768)
+
+
+def test_load_trainable_lora_state_round_trips_saved_adapters(tmp_path: Path):
+    def build_model():
+        mx.random.seed(11)
+        model = TinyMLXRegressor()
+        inject_trainable_lora(model, rank=2, alpha=2, adapter_type="dora-rows")
+        return model
+
+    trained = build_model()
+    rng = np.random.default_rng(5)
+    for layer in iter_trainable_lora_layers(trained):
+        for name in ("lora_A", "lora_B", "magnitude"):
+            shape = tuple(getattr(layer, name).shape)
+            # fp16-representable values so the fp16 checkpoint is lossless.
+            values = rng.standard_normal(shape).astype(np.float16)
+            setattr(layer, name, mx.array(values.astype(np.float32)))
+
+    checkpoint = save_lora_checkpoint(trained, tmp_path / "resume.safetensors")
+    state_dict, _ = load_lora_checkpoint(checkpoint)
+    inputs = mx.array([[1.0, -2.0, 0.5], [0.25, 0.75, -1.5]], dtype=mx.float32)
+
+    fresh = build_model()
+    assert not np.array_equal(np.asarray(trained(inputs)), np.asarray(fresh(inputs)))
+
+    restored = load_trainable_lora_state(fresh, state_dict)
+
+    assert restored == 2
+    assert np.array_equal(np.asarray(trained(inputs)), np.asarray(fresh(inputs)))
+    for layer in iter_trainable_lora_layers(fresh):
+        assert layer.lora_A.dtype == mx.float32
+        assert layer.magnitude.dtype == mx.float32
+
+    # strict=False semantics: unmatched checkpoint layers are tolerated, and
+    # 2-D DoRA magnitudes are squeezed like prepare_dora_state_dict.
+    partial = {
+        key: value
+        for key, value in state_dict.items()
+        if key.startswith("model.output.")
+    }
+    magnitude_key = "model.output.parametrizations.weight.0.magnitude"
+    partial[magnitude_key] = partial[magnitude_key].reshape(-1, 1)
+    partial["model.missing.parametrizations.weight.0.lora_A"] = mx.zeros((2, 3))
+
+    assert load_trainable_lora_state(build_model(), partial) == 1
+
+
+@needs_underfit_reference
+def test_checkpoint_key_naming_matches_real_underfit_checkpoint(tmp_path: Path):
+    reference_state, reference_config = load_lora_checkpoint(
+        UNDERFIT_REFERENCE_CHECKPOINT
+    )
+    config = underfit_lora_config()
+
+    # The reference checkpoint's lora_config metadata is exactly the product
+    # defaults (plus the injected step/epoch fields).
+    assert {key: reference_config[key] for key in config} == config
+
+    # Injecting the medium DiT with the product config selects exactly the
+    # layer set underfit trained, with byte-identical checkpoint keys.
+    model = dit_mlx_medium.DiT(T_lat=8)
+    report, _ = inject_from_lora_config(model, config)
+    produced_keys = set()
+    for layer in iter_trainable_lora_layers(model):
+        root = f"{layer.checkpoint_name}.parametrizations.weight.0"
+        produced_keys.update(
+            f"{root}.{param}" for param in ("lora_A", "lora_B", "magnitude")
+        )
+    reference_dit_keys = {
+        key for key in reference_state if key.startswith("model.")
+    }
+
+    assert produced_keys == reference_dit_keys
+    assert report.layer_count == len(reference_dit_keys) // 3
+
+    # Resume: the real underfit checkpoint loads into the injected model.
+    assert load_trainable_lora_state(model, reference_state) == report.layer_count
+
+    # The saver reproduces a real medium DiT layer's keys AND shapes exactly.
+    single = dit_mlx_medium.DiT(T_lat=8)
+    inject_from_lora_config(
+        single, dict(config, include=["layers.0.self_attn.to_qkv"])
+    )
+    saved_state, _ = load_lora_checkpoint(
+        save_lora_checkpoint(single, tmp_path / "single-layer.safetensors")
+    )
+    layer_root = "model.transformer.layers.0.self_attn.to_qkv"
+    expected = {
+        key: tuple(value.shape)
+        for key, value in reference_state.items()
+        if key.startswith(f"{layer_root}.")
+    }
+
+    assert len(expected) == 3
+    assert {key: tuple(value.shape) for key, value in saved_state.items()} == expected
+
+    # The conditioner layer comes out at underfit's exact key root too.
+    rng = np.random.default_rng(3)
+    seconds_module = TrainableSecondsEmbedder(
+        mx.array(rng.standard_normal((768, 256)).astype(np.float32)),
+        mx.array(rng.standard_normal(768).astype(np.float32)),
+    )
+    inject_from_lora_config(
+        seconds_module, config, checkpoint_prefix="conditioners.seconds_total."
+    )
+    saved_cond, _ = load_lora_checkpoint(
+        save_lora_checkpoint(seconds_module, tmp_path / "conditioner.safetensors")
+    )
+    expected_cond = {
+        key: tuple(value.shape)
+        for key, value in reference_state.items()
+        if key.startswith("conditioners.")
+    }
+
+    assert len(expected_cond) == 3
+    assert {
+        key: tuple(value.shape) for key, value in saved_cond.items()
+    } == expected_cond
+    assert load_trainable_lora_state(seconds_module, reference_state) == 1

@@ -14,7 +14,7 @@
 #   ./install.sh --python VER     # pin a specific Python (default: 3.11)
 #
 # After install:
-#   source .venv/bin/activate
+#   source .venv/bin/activate          # (.venv/Scripts/activate on Windows Git Bash)
 #   python scripts/sa3_tflite.py --prompt "lofi house" --dit sm-music --decoder same-s
 #   # or, without activating:
 #   .venv/bin/python scripts/sa3_tflite.py --prompt "lofi house" --dit sm-music
@@ -23,6 +23,18 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/.venv"
+
+# venv layout differs by OS: POSIX puts python at .venv/bin/python, Windows
+# (incl. Git Bash / MSYS) at .venv/Scripts/python.exe. Resolve whichever exists.
+venv_py() {
+    if [[ -x "$VENV_DIR/bin/python" ]]; then
+        echo "$VENV_DIR/bin/python"
+    elif [[ -x "$VENV_DIR/Scripts/python.exe" ]]; then
+        echo "$VENV_DIR/Scripts/python.exe"
+    else
+        echo "$VENV_DIR/bin/python"   # default (error messages)
+    fi
+}
 PY_VERSION_DEFAULT="3.11"
 
 # ── colours ─────────────────────────────────────────────────────────────────
@@ -98,7 +110,7 @@ ensure_uv
 # ── create venv (uv auto-installs the requested Python if missing) ──────────
 step "Creating virtual environment at .venv/ with Python $PY_VERSION"
 if [[ -d "$VENV_DIR" ]]; then
-    EXISTING_PY=$("$VENV_DIR/bin/python" -c 'import sys; print(".".join(map(str, sys.version_info[:2])))' 2>/dev/null || echo "unknown")
+    EXISTING_PY=$("$(venv_py)" -c 'import sys; print(".".join(map(str, sys.version_info[:2])))' 2>/dev/null || echo "unknown")
     if [[ "$EXISTING_PY" == "$PY_VERSION"* ]]; then
         ok "reusing existing .venv (Python $EXISTING_PY)"
     else
@@ -118,5 +130,5 @@ VIRTUAL_ENV="$VENV_DIR" uv pip install -r "$SCRIPT_DIR/requirements.txt"
 # Any unrecognized args we collected (e.g. --download medium,sm-music) get
 # forwarded to install.py via EXTRA_ARGS.
 step "Bundle picker"
-INSTALL_SKIP_PIP=1 exec "$VENV_DIR/bin/python" "$SCRIPT_DIR/scripts/install.py" \
+INSTALL_SKIP_PIP=1 exec "$(venv_py)" "$SCRIPT_DIR/scripts/install.py" \
     "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"

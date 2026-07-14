@@ -67,3 +67,12 @@ jobs:
       - name: bootstrap.sh parses (bash syntax check)
         if: runner.os != 'Windows'
         run: bash -n optimized/tflite/bootstrap.sh
+
+      # Real install flow under the OS's bash (Git Bash on Windows — the
+      # environment a Windows user following the Unix instructions lands in;
+      # this exact path shipped broken once: .venv/Scripts vs .venv/bin).
+      - name: install.sh end-to-end + sa3 wrapper (bash on every OS)
+        run: |
+          cd optimized/tflite
+          ./install.sh -y < /dev/null
+          ./sa3 --help

@@ -77,4 +77,6 @@ fi
 # creates an ephemeral env with no deps, ignoring our .venv. Direct invocation
 # is shorter, faster, and side-steps both bugs.
 cd "$SCRIPT_DIR"
-exec "$SCRIPT_DIR/.venv/bin/python" scripts/sa3_tflite.py "$@"
+PY="$SCRIPT_DIR/.venv/bin/python"
+[[ -x "$PY" ]] || PY="$SCRIPT_DIR/.venv/Scripts/python.exe"
+exec "$PY" scripts/sa3_tflite.py "$@"

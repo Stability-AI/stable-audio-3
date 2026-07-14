@@ -11,3 +11,6 @@
 __pycache__/
 *.pyc
 output/gradio/
+
+# Local LoRA library scanned by the gradio UI (user adapters, never committed)
+loras/

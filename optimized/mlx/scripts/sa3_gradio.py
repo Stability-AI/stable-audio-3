@@ -68,6 +68,21 @@ from spec import render_spectrogram_png  # noqa: E402
 
 OUTPUT_DIR = REPO / "output" / "gradio"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# Local LoRA library: drop .safetensors under loras/<model>/ and they appear in
+# the per-slot dropdown (scanned per selected DiT; hidden when empty).
+LORAS_DIR = REPO / "loras"
+LORA_DIR_NAMES = {"medium": "sa3-medium", "sm-sfx": "sa3-sm-sfx",
+                  "sm-music": "sa3-sm-music"}
+for _d in LORA_DIR_NAMES.values():
+    (LORAS_DIR / _d).mkdir(parents=True, exist_ok=True)
+_DD_NONE = ""   # dropdown placeholder value ("--- Choose a LoRA ---")
+
+
+def _lora_dd_choices(dit_name: str) -> list:
+    """Dropdown choices for ./loras/<model>/: placeholder + (name, abspath)."""
+    d = LORAS_DIR / LORA_DIR_NAMES.get(dit_name, dit_name)
+    hits = sorted(d.glob("*.safetensors")) if d.is_dir() else []
+    return [("--- Choose a LoRA ---", _DD_NONE)] + [(p.name, str(p)) for p in hits]
 MIN_SIGMA = 0.01
 # MP3 (V0) saving needs ffmpeg; without it we save WAV and hide the choice.
 FFMPEG = shutil.which("ffmpeg") is not None
@@ -559,15 +574,19 @@ def _ago(ts) -> str:
 
 
 def _lora_specs_from_ui(vals, notes, num_steps):
-    """Turn the 3 LoRA rows' flat values (file, strength, min, max)×3 into
-    lora_merge specs. Empty rows are skipped; a min slider at 1 / max slider at
-    (or beyond) the schedule length mean 'from the start' / 'to the last step',
-    so a maxed-out range slider keeps meaning 'all steps' when Steps changes.
-    Half-sane inputs get a note and the most permissive interpretation (never
-    an error — matches the app's permissive-by-design generation policy)."""
+    """Turn the 3 LoRA slots' flat values (file, dropdown, strength, min, max)×3
+    into lora_merge specs. A slot's adapter is the dropped file or, failing
+    that, the dropdown pick from ./loras/<model>/; empty slots are skipped. A
+    min slider at 1 / max slider at (or beyond) the schedule length mean 'from
+    the start' / 'to the last step', so a maxed-out range slider keeps meaning
+    'all steps' when Steps changes. Half-sane inputs get a note and the most
+    permissive interpretation (never an error — matches the app's
+    permissive-by-design generation policy)."""
     specs = []
     for i in range(3):
-        path, strength, mn, mxx = vals[4 * i: 4 * i + 4]
+        path, picked, strength, mn, mxx = vals[5 * i: 5 * i + 5]
+        if not path:
+            path = picked if picked and picked != _DD_NONE else None
         if not path:
             continue
         mn = int(mn) if mn and int(mn) > 1 else None
@@ -760,10 +779,20 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         get_dit(initial_dit, warm_T, mx.float16); get_decoder(initial_decoder)
     mlx_call(_warm)
 
-    def on_dit_change(dit_name, cur_seconds):
+    def on_dit_change(dit_name, cur_seconds, f1, f2, f3):
+        """Model switch: pair the decoder, clamp seconds, rescan the local LoRA
+        library for the new model (dropdowns reset to the placeholder and hide
+        when loras/<model>/ is empty; slider rows stay only for slots with a
+        dropped file)."""
         max_s = MAX_SECONDS.get(dit_name, 120)
+        ch = _lora_dd_choices(dit_name)
+        lbl = f"…or pick from loras/{LORA_DIR_NAMES.get(dit_name, dit_name)}/"
+        dd_ups = [gr.update(choices=ch, value=_DD_NONE, visible=len(ch) > 1,
+                            label=lbl) for _ in range(3)]
+        srow_ups = [gr.update(visible=bool(f)) for f in (f1, f2, f3)]
         return (gr.update(value=DEFAULT_DECODERS.get(dit_name, "same-s")),
-                gr.update(maximum=max_s, value=min(cur_seconds, max_s)))
+                gr.update(maximum=max_s, value=min(cur_seconds, max_s)),
+                *dd_ups, *srow_ups)
 
     def _generate_entry(dit_name, decoder_name, prompt, negative_prompt,
                         seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
@@ -1030,16 +1059,22 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                     negative_prompt = gr.Textbox(label="Negative prompt", lines=1)
 
                 with gr.Accordion("LoRA", open=False):
+                    _dd0 = _lora_dd_choices(initial_dit)
                     lora_inputs, lora_rows, lora_rm_btns = [], [], []
+                    lora_dds, lora_files, lora_srows = [], [], []
                     for _i in range(1, 4):
                         with gr.Group(visible=False) as _grp:
                             with gr.Row(equal_height=True):
                                 _lf = gr.File(label=f"LoRA {_i} (.safetensors)",
                                               file_types=[".safetensors"],
                                               type="filepath", scale=1, height=88)
+                                _ld = gr.Dropdown(
+                                    label=f"…or pick from loras/{LORA_DIR_NAMES[initial_dit]}/",
+                                    choices=_dd0, value=_DD_NONE, scale=1,
+                                    visible=len(_dd0) > 1)
                                 _rm = gr.Button("✕", size="sm", scale=0,
                                                 min_width=36)
-                            with gr.Row():
+                            with gr.Row(visible=False) as _srow:
                                 _ls = gr.Slider(label="strength", minimum=0.0,
                                                 maximum=10.0, value=1.0, step=0.1,
                                                 scale=2, min_width=110)
@@ -1052,7 +1087,10 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                                                 scale=1, min_width=80)
                         lora_rows.append(_grp)
                         lora_rm_btns.append(_rm)
-                        lora_inputs += [_lf, _ls, _ln, _lx]
+                        lora_dds.append(_ld)
+                        lora_files.append(_lf)
+                        lora_srows.append(_srow)
+                        lora_inputs += [_lf, _ld, _ls, _ln, _lx]
                     lora_add_btn = gr.Button("+ Add LoRA", size="sm")
                     lora_vis = gr.State([False, False, False])
 
@@ -1093,8 +1131,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 queued_html = gr.HTML()
                 history_html = gr.HTML()
 
-        dit_dd.change(on_dit_change, inputs=[dit_dd, seconds],
-                      outputs=[decoder_dd, seconds])
+        dit_dd.change(on_dit_change, inputs=[dit_dd, seconds] + lora_files,
+                      outputs=[decoder_dd, seconds] + lora_dds + lora_srows)
 
         def on_seconds_change(sec):
             return gr.update(maximum=sec), gr.update(maximum=sec)
@@ -1131,20 +1169,50 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 vis[idx] = False
                 return ([gr.update(visible=v) for v in vis]
                         + [gr.update(visible=True), vis,
-                           None, 1.0, 1, int(cur_steps)])  # reset the row
+                           # reset the slot: file, dropdown, sliders (hidden again)
+                           None, gr.update(value=_DD_NONE),
+                           1.0, 1, int(cur_steps),
+                           gr.update(visible=False)])
             _rm.__name__ = f"lora_remove_{idx + 1}"
             return _rm
         for _idx, _btn in enumerate(lora_rm_btns):
             _btn.click(_lora_remove(_idx), inputs=[lora_vis, steps],
                        outputs=lora_rows + [lora_add_btn, lora_vis]
-                       + lora_inputs[4 * _idx: 4 * _idx + 4])
+                       + lora_inputs[5 * _idx: 5 * _idx + 5]
+                       + [lora_srows[_idx]])
+
+        # A slot's strength/step sliders appear once an adapter is loaded —
+        # via file drop OR dropdown pick — and the two sources are exclusive
+        # (loading one resets the other). All three events are user-driven
+        # (upload/clear/input), so the programmatic resets here can't loop.
+        def _lora_wire_slot(idx):
+            lf, ld, srow = lora_files[idx], lora_dds[idx], lora_srows[idx]
+
+            def _up(f):
+                return gr.update(visible=bool(f)), gr.update(value=_DD_NONE)
+            _up.__name__ = f"lora_file_{idx + 1}"
+            lf.upload(_up, inputs=[lf], outputs=[srow, ld])
+
+            def _cl(dd):
+                return gr.update(visible=bool(dd and dd != _DD_NONE))
+            _cl.__name__ = f"lora_file_clear_{idx + 1}"
+            lf.clear(_cl, inputs=[ld], outputs=[srow])
+
+            def _pick(dd, f):
+                loaded = bool(dd and dd != _DD_NONE)
+                return (gr.update(visible=loaded or bool(f)),
+                        gr.update(value=None) if loaded else gr.update())
+            _pick.__name__ = f"lora_pick_{idx + 1}"
+            ld.input(_pick, inputs=[ld, lf], outputs=[srow, lf])
+        for _idx in range(3):
+            _lora_wire_slot(_idx)
 
         def on_steps_change(s):
             # keep the 6 step-range sliders bounded by the schedule length
             return [gr.update(maximum=int(s))] * 6
         steps.change(on_steps_change, inputs=[steps],
                      outputs=[c for i in range(3)
-                              for c in lora_inputs[4 * i + 2: 4 * i + 4]])
+                              for c in lora_inputs[5 * i + 3: 5 * i + 5]])
 
         ctrl_inputs = [dit_dd, decoder_dd, prompt, negative_prompt,
                        seconds, steps, seed, cfg, apg, sigma_global,

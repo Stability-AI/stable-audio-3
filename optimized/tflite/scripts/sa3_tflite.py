@@ -540,6 +540,22 @@ def main():
                          "inpainting only). Latent PSNR vs fp32 (same-s/same-l): "
                          "w16a32 ≈lossless (66/71 dB), w8a32 (GPTQ) 36/46 dB, "
                          "w8a8-dyn 24/30 dB.")
+    # LoRA (merged into the DiT weights at load; mirrors the MLX CLI's --lora)
+    ap.add_argument("--lora", action="append", nargs="+", default=None,
+                    metavar=("ADAPTER", "strength=S"),
+                    help="A LoRA adapter to merge into the DiT — repeat the flag to stack "
+                         "several. Each --lora takes the adapter path followed by an optional "
+                         "strength=S (default --lora-strength). Example: "
+                         "--lora plini.safetensors strength=0.8 . The adapter is a .safetensors "
+                         "file (SA3-native train_lora.py / underfit output) or a PEFT adapter "
+                         "directory; ONLY .safetensors is accepted. The merged weights are "
+                         "written into a cached copy of the DiT (models/tflite/lora_cache/) and "
+                         "reused on repeat runs. Requires --dit-precision fp32 or w16a32 "
+                         "(quantized-int8 DiTs can't be LoRA-merged). NOTE: per-step gating "
+                         "(steps=) is MLX-only — the frozen TFLite graph merges once at load.")
+    ap.add_argument("--lora-strength", type=float, default=1.0,
+                    help="Default strength for --lora adapters without their own strength= "
+                         "(default 1.0). 0 disables (bit-identical to no LoRA); >1 amplifies.")
     # Sampling
     ap.add_argument("--seconds", type=float, default=30.0,
                     help="Output length. T_lat = ceil(seconds*44100/4096) (natural ceil, decoder-"
@@ -583,6 +599,15 @@ def main():
     args.decoder_precision = args.decoder_precision or args.precision
     args.encoder_precision = args.encoder_precision or args.precision
 
+    # Parse --lora specs up front (fail fast, before any model work).
+    args.lora_specs = None
+    if args.lora:
+        from lora_core import parse_lora_spec, LoraError
+        try:
+            args.lora_specs = [parse_lora_spec(toks, args.lora_strength) for toks in args.lora]
+        except LoraError as e:
+            ap.error(str(e))
+
     # Interactive fills (match MLX/TRT).
     args = prompt_user_if_missing(args)
     if args.prompt is None:
@@ -606,7 +631,12 @@ def main():
             prec_tag = "" if args.precision == "fp32" else f"_{args.precision}"
         else:
             prec_tag = f"_dit-{args.dit_precision}_dec-{args.decoder_precision}"
-        args.out = f"{slug}{prec_tag}_{args.seed}.wav"
+        lora_tag = ""
+        if args.lora_specs:
+            names = "-".join(re.sub(r'[^a-z0-9]+', '', Path(s["path"]).stem.lower())[:12]
+                             for s in args.lora_specs)
+            lora_tag = f"_lora-{names}"
+        args.out = f"{slug}{prec_tag}{lora_tag}_{args.seed}.wav"
     out_path = Path(args.out)
     if not out_path.is_absolute() and out_path.parts[:1] != ("output",):
         out_path = REPO / "output" / out_path
@@ -666,6 +696,12 @@ def main():
     if args.cfg != 1.0:
         cfg_line += dim(f"  (apg={args.apg}, {'batched' if args.cfg_batched else 'sequential'} CFG)")
     print(cfg_line)
+    if args.lora_specs:
+        lora_disp = ", ".join(
+            os.path.basename(s["path"].rstrip("/"))
+            + (f"×{s['strength']:g}" if s["strength"] != 1.0 else "")
+            for s in args.lora_specs)
+        print(f"  {k('lora')}  {magenta(lora_disp)}")
     print(f"  {k('seconds')}  {args.seconds}s   {k('steps')}  {args.steps}   {k('seed')}  {args.seed}")
     print(f"  {k('T_lat')}  {T_lat} {dim(f'({target_dur:.2f}s → trimmed to {args.seconds:.2f}s)')}")
     print()
@@ -751,7 +787,16 @@ def main():
     cfg_note = (("CFG batched (1× batch=2 invoke/step)" if args.cfg_batched
                  else "CFG sequential (2× batch=1 invokes/step)") if args.cfg != 1.0 else "")
     print(f"        {dim('loading baked DiT ' + args.dit + ' ...')}", flush=True)
-    backend = BakedDiT(ensure_local(dit_rel(args.dit, args.dit_precision)), T_lat, t5_hidden, mask.astype(np.float32),
+    dit_path = ensure_local(dit_rel(args.dit, args.dit_precision))
+    if args.lora_specs:
+        from lora_patch import get_patched_dit
+        from lora_core import LoraError
+        try:
+            dit_path = get_patched_dit(dit_path, args.lora_specs, family=args.dit,
+                                       precision=args.dit_precision, log=sub)
+        except LoraError as e:
+            sys.exit(f"error: {e}")
+    backend = BakedDiT(dit_path, T_lat, t5_hidden, mask.astype(np.float32),
                        args.seconds, args.threads, cfg=args.cfg, apg=args.apg,
                        null_hidden=null_h, null_mask=null_m, local_add_cond=local_add_cond,
                        batched=args.cfg_batched)

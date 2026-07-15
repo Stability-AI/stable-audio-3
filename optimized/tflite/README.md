@@ -219,6 +219,35 @@ printed prominently as a `▸ saved` line at the end of each run.
 
 Use `--threads` to control the XNNPACK CPU thread count (default 8).
 
+## Web UI (gradio)
+
+A browser UI over the same TFLite backend — every generation mode plus a
+spectrogram player, a history panel, and playback options (auto-play, infinite
+radio with pre-generation, loop, hotswap, MP3/WAV save).
+
+```bash
+./sa3-gradio                       # sm-music, opens a public share link
+./sa3-gradio --dit medium          # start on the medium DiT
+./sa3-gradio --no-share            # local-only (http://localhost:7860)
+./sa3-gradio --port 7871           # pick the port
+```
+
+`./sa3-gradio` is a wrapper around `.venv/bin/python scripts/sa3_gradio.py`; on
+first run it offers to install the UI-only extras (`gradio`, `pillow`,
+`soundfile`) into `.venv`. In the browser:
+
+- **Precision** dropdown next to the model picker — `fp32` (default) / `w16a32`
+  / `w8a32` / `w8a8-dyn`, applied to the DiT + codec.
+- **LoRA** panel — upload a `.safetensors` adapter or pick one from
+  `loras/<model>/` (e.g. `loras/sa3-medium/`), set its strength, stack several;
+  settings are remembered per model. The panel is disabled under a quantized
+  precision (see the LoRA note above) and has no per-step range (frozen graph).
+- **Audio-to-audio / inpainting** — upload a reference clip; inpainting adds a
+  start/end range. Both are combinable.
+
+Generated WAV/MP3s land in `output/gradio/`. First use of a model/precision
+loads its weights (cached after).
+
 ### Without the wrapper
 
 ```bash
@@ -291,10 +320,16 @@ must match `--dit`. The merge is written into a cached copy of the DiT under
 on repeat runs, so the ~5–15 s patch cost is paid once. A medium fp32 cache entry
 is ~5.4 GB — delete `lora_cache/` to reclaim.
 
-Requires `--dit-precision fp32` (default) or `w16a32`. Quantized-int8 DiTs
-(`w8a32` / `w8a8-dyn` / `w4a32`) can't be LoRA-merged (it would destroy the GPTQ
-grid). **Per-step gating (`steps=`) is MLX-only** — a frozen TFLite graph merges
-weights once at load; use `optimized/mlx` for step-gated LoRA.
+Requires `--dit-precision fp32` (default) or `w16a32`. **LoRA on the quantized
+DiTs (`w8a32` / `w8a8-dyn` / `w4a32`) isn't figured out yet** — those store
+weights as GPTQ-calibrated int8, so merging would mean dequantize → add the LoRA
+delta → re-quantize, and a naive re-quant throws away the GPTQ error-feedback
+grid (you'd get a model that's both LoRA-adapted *and* degraded). Doing it well
+needs a GPTQ pass over the merged weights; until then `--lora` refuses quantized
+precisions (the CLI errors, the web UI disables the LoRA panel). Use fp32/w16a32
+for LoRA — on CPU fp32 is the fast-and-accurate choice anyway, so this is rarely
+a real constraint. **Per-step gating (`steps=`) is also MLX-only** — a frozen
+TFLite graph merges weights once at load; use `optimized/mlx` for step-gated LoRA.
 
 ## Files
 

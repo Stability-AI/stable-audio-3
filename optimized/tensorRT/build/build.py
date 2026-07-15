@@ -67,7 +67,13 @@ TARGETS = [
      "outputs": ["same-l/dec_dynamic_triton_swa.trt"]},
     # DiT engines now build from pre-processed FP16-mixed ONNX on HF;
     # build_from_onnx.py does the simple STRONGLY_TYPED compile.
-    {"label": "DiT medium  (SA3-M, FP16-mixed)",
+    # Medium ships TWO engines: bf16 (FMHA-fused, the speed DEFAULT) built from
+    # the raw fp32 dit.onnx with BuilderFlag.BF16, and fp16-mixed (canonical,
+    # bit-reproducible, kept selectable). sm-music/sm-sfx are fp16-mixed only.
+    {"label": "DiT medium  (SA3-M, bf16 — FMHA-fused, medium DEFAULT)",
+     "command": _from_onnx("sa3-m-bf16"),
+     "outputs": ["sa3-m/dit_bf16.trt"]},
+    {"label": "DiT medium  (SA3-M, FP16-mixed — selectable, bit-reproducible)",
      "command": _from_onnx("sa3-m"),
      "outputs": ["sa3-m/dit_fp16mixed.trt"]},
     {"label": "DiT sm-music (FP16-mixed)",

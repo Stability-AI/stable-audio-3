@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import struct
 import sys
@@ -84,9 +85,11 @@ from models.defs.training import (  # noqa: E402
     rectified_flow_loss, sample_training_timesteps, shift_training_timesteps,
 )
 from models.defs.lora import (  # noqa: E402
-    TrainableSecondsEmbedder, inject_from_lora_config, load_lora_checkpoint,
-    load_trainable_lora_state, save_lora_checkpoint, underfit_lora_config,
+    TrainableSecondsEmbedder, inject_from_lora_config, iter_trainable_lora_layers,
+    load_lora_checkpoint, load_trainable_lora_state, save_lora_checkpoint,
+    underfit_lora_config,
 )
+from models.defs import demo_mlx as demo  # noqa: E402
 from models.defs.latent_dataset import (  # noqa: E402
     PreEncodedLatentDataset, iterate_batches,
 )
@@ -202,6 +205,20 @@ def parse_args():
     ap.add_argument("--lora-ckpt-path", default=None)
     ap.add_argument("--step-offset", type=int, default=None)
     ap.add_argument("--epoch-offset", type=int, default=None)
+    # demos (underfit convention: RF Euler inference on the base model + trained
+    # LoRA, decode → mp3, baseline at step 0 then every --demo-every steps)
+    ap.add_argument("--demo-every", type=int, default=0,
+                    help="Generate demos every N steps (0 = off). A baseline "
+                         "set is also rendered at step 0.")
+    ap.add_argument("--demo-config", default=None,
+                    help="JSON list of demo entries. Each: {prompt, cfg=7, "
+                         "seed=0, steps=50, lora_strength?, lora_interval_max?}.")
+    ap.add_argument("--demo-decoder", default=None,
+                    choices=["same-s", "same-l"],
+                    help="Decoder for demos (default: the DiT's default_decoder).")
+    ap.add_argument("--demo-dir", default=None,
+                    help="Where to write demo_<i>_<step>.mp3 (default: cwd, "
+                         "which the dashboard sets to <run>/demos/).")
     return ap.parse_args()
 
 
@@ -456,6 +473,93 @@ def main():
     last_saved_step = None
     t5_cache = {} if args.t5_cache else None
     t5_stats = {"hits": 0, "misses": 0}
+
+    # ── demos (underfit RF path) ──────────────────────────────────────────────
+    # RF Euler inference on the base model + trained LoRA, decoded to mp3. Baseline
+    # at the start, then every --demo-every steps + a final render. Idempotent.
+    demo_entries = None
+    if args.demo_every > 0:
+        if args.demo_config:
+            demo_entries = json.loads(Path(args.demo_config).read_text())
+            print(f"demos: {len(demo_entries)} prompt(s) every {args.demo_every} "
+                  f"step(s) → {args.demo_dir or '.'}")
+        else:
+            print("WARNING: --demo-every set but no --demo-config — demos disabled")
+    demo_dir = args.demo_dir or "."
+    demo_decoder_name = args.demo_decoder or DIT_CHOICES[args.dit]["default_decoder"]
+    _demo_dec = {}  # lazy: (decoder, chunk_fn, chunk_cfg)
+
+    def run_demos(step):
+        if not demo_entries:
+            return
+        os.makedirs(demo_dir, exist_ok=True)
+        pending = [(i, e) for i, e in enumerate(demo_entries)
+                   if not os.path.exists(
+                       os.path.join(demo_dir, f"demo_{i}_{step:08d}.mp3"))]
+        if not pending:
+            return
+        if "dec" not in _demo_dec:
+            from sa3_mlx import load_decoder
+            t_d = time.time()
+            _demo_dec["dec"] = load_decoder(demo_decoder_name, dtype=mx.float32)
+            print(f"  demo decoder {demo_decoder_name} loaded ({time.time()-t_d:.1f}s)")
+        decoder, chunk_fn, chunk_cfg = _demo_dec["dec"]
+        adapters = list(iter_trainable_lora_layers(bundle))
+        T_lat = crop_len
+        seconds_val = T_lat * demo.SAMPLES_PER_LATENT / demo.SAMPLE_RATE
+        for i, entry in pending:
+            prompt = entry.get("prompt", "")
+            cfg = float(entry.get("cfg", 7))
+            seed = int(entry.get("seed", 0))
+            steps = int(entry.get("steps", 50))
+            strength = entry.get("lora_strength")
+            interval = entry.get("lora_interval_max")
+            prompt_cond = build_conditioning(t5, padding_emb, [prompt],
+                                             cache=t5_cache, cache_stats=t5_stats)
+            if bundle.secs is not None:
+                sec_tok = bundle.secs(mx.array([seconds_val], dtype=mx.float32))
+            else:
+                sec_tok = secs_embedder([seconds_val])
+            sec_tok = mx.stop_gradient(sec_tok.astype(mx.float32))
+            cross = mx.concatenate([prompt_cond, sec_tok], axis=1).astype(mx.float16)
+            gcond = sec_tok[:, 0, :].astype(mx.float16)
+            null = mx.zeros_like(cross) if cfg != 1.0 else None
+            model_fn = demo.make_rf_model_fn(bundle.dit, cross, gcond, cfg=cfg,
+                                             null_cross_attn=null)
+            sigmas = demo.build_sigmas(steps)
+            noise = mx.random.normal((1, 256, T_lat), dtype=mx.float16,
+                                     key=mx.random.key(seed))
+            snap = before = None
+            if interval is not None:
+                snap = demo.snapshot_adapters(adapters)
+                s_on = float(strength) if strength is not None else 1.0
+
+                def before(_i, sigma, s_on=s_on, interval=interval, snap=snap):
+                    demo.scale_adapters(snap, s_on if sigma <= interval else 0.0)
+            elif strength is not None and float(strength) != 1.0:
+                snap = demo.snapshot_adapters(adapters)
+                demo.scale_adapters(snap, float(strength))
+            try:
+                latent = demo.rf_euler_sample(model_fn, noise, sigmas,
+                                              before_step=before)
+                audio = demo.decode_latents(decoder, chunk_fn, chunk_cfg, latent, T_lat)
+                meta = {"prompt": prompt, "cfg": cfg, "seed": seed,
+                        "steps": steps, "step": int(step)}
+                if strength is not None:
+                    meta["lora_strength"] = strength
+                if interval is not None:
+                    meta["lora_interval_max"] = interval
+                demo.save_demo_mp3(audio, i, step, demo.SAMPLE_RATE, demo_dir, meta)
+                print(f"  ♪ demo {i} @ step {step}: {prompt[:48]!r} "
+                      f"→ demo_{i}_{step:08d}.mp3", flush=True)
+            except Exception as e:
+                print(f"  demo {i} failed: {e}", flush=True)
+            finally:
+                if snap is not None:
+                    demo.scale_adapters(snap, 1.0)  # restore trained factors
+        if hasattr(mx, "clear_cache"):
+            mx.clear_cache()
+
     if hasattr(mx, "reset_peak_memory"):
         mx.reset_peak_memory()  # measure the training loop, not weight loading
     t_start = time.time()
@@ -463,6 +567,7 @@ def main():
           f"(global target {args.max_steps}), lr {args.lr:g}, "
           f"batch {args.batch_size}, cfg-dropout {args.cfg_dropout_prob}, "
           f"compile {'on' if args.compile else 'off'}")
+    run_demos(step_offset)  # baseline (untrained / resumed state)
     try:
         while raw_step < max_new_steps:
             for batch in iterate_batches(dataset, args.batch_size,
@@ -520,8 +625,10 @@ def main():
 
                 if args.checkpoint_every > 0 and \
                         global_step % args.checkpoint_every == 0:
-                    checkpoint(global_step, epoch)
+                    checkpoint(global_step, epoch)  # save BEFORE demos
                     last_saved_step = global_step
+                if args.demo_every > 0 and global_step % args.demo_every == 0:
+                    run_demos(global_step)
             epoch += 1
     except KeyboardInterrupt:
         print("\ninterrupted — saving final checkpoint")
@@ -529,6 +636,8 @@ def main():
     global_step = raw_step + step_offset
     if raw_step > 0 and global_step != last_saved_step:
         checkpoint(global_step, epoch)
+    if raw_step > 0:
+        run_demos(global_step)  # final render
     tele.close()
     if t5_cache is not None:
         print(f"t5 cache: {t5_stats['hits']} hit(s) / "

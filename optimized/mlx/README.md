@@ -191,57 +191,69 @@ Sample run on **M4 Pro / 48 GB**:
 └───────────┴─────────┴─────────┴───────────┴───────────┴────────────┘
 ```
 
-## LoRA training primitives
+## LoRA training
 
-The optimized runtime includes MLX counterparts to the adapter family already
-supported by the official PyTorch implementation: standard LoRA, DoRA, BoRA,
-and LoRA-XS variants.
+Finetune SA3 on your own audio, entirely in MLX (no PyTorch) — a full training
+CLI that replicates [underfit](https://github.com/dada-bots/underfit)'s
+conventions, defaults, and checkpoint format (so it can run as underfit's
+Apple-Silicon backend). Three steps: **pre-encode → train → generate**. See
+`TRAINING_CONVENTIONS.md` for the complete convention inventory and the
+torch(MPS)-vs-MLX forward+backward parity results.
 
-```python
-from models.defs.lora import (
-    apply_lora_checkpoint,
-    inject_trainable_lora,
-    save_lora_checkpoint,
-)
-from models.defs.training import (
-    rectified_flow_loss,
-    sample_training_timesteps,
-    shift_training_timesteps,
-)
-from models.defs.audio_encoding import encode_audio
+**1. Pre-encode** your audio to SAME latents (once, offline — torch-free):
+
+```bash
+uv run python scripts/pre_encode_mlx.py \
+    --audio-dir ~/my-clips --output-dir ~/my-latents --codec same-s
 ```
 
-`inject_trainable_lora()` freezes the base model and leaves only adapter
-parameters trainable through `mlx.nn.value_and_grad`. `save_lora_checkpoint()`
-writes the same safetensors keys and `lora_config` metadata used by the
-PyTorch trainer. `apply_lora_checkpoint()` loads that format through MLX
-without adding PyTorch or safetensors as runtime dependencies. Application
-materializes a fixed strength into the loaded model's in-memory weights; it
-does not modify the base checkpoint on disk. Reload the base model before
-applying a different strength rather than applying repeatedly to the same
-instance.
+Each file becomes `<stem>.npy` latents `[D, T]` + a `<stem>.json` sidecar
+(duration, padding mask, tags) — the exact format underfit's dataset uses.
+Use `same-s` for sm-music/sm-sfx, `same-l` for medium.
 
-`encode_audio()` provides the waveform-to-latent bridge used by training. It
-accepts a batch of already-decoded 44.1 kHz stereo waveforms, applies SAME's
-patched pretransform, pads to the encoder's required alignment, optionally
-encodes long clips in overlapping chunks, and returns both latents and a
-ceiling-scaled padding mask:
+**2. Train.** Train on the **BASE** checkpoint (`stabilityai/stable-audio-3-*-base`),
+*not* the shipped ARC weights that inference uses — pass its MLX `.npz` via
+`--dit-weights` (base-ckpt→npz conversion recipe in `TRAINING_CONVENTIONS.md` §9;
+omitting it trains on ARC and prints a warning):
 
-```python
-encoded = encode_audio(
-    same_l_encoder,
-    audio,  # [batch, 2, samples]
-    valid_sample_lengths=[samples_a, samples_b],
-    pad_modulo=16,  # 32 for SAME-S
-    chunked=True,
-)
-latents = encoded.latents
-loss_mask = encoded.padding_mask
+```bash
+uv run python scripts/lora_train_mlx.py \
+    --dit sm-music --dit-weights models/mlx/dit_sm-music-base_f16.npz \
+    --latents-dir ~/my-latents --lr 1e-4 --name my-lora \
+    --adapter-type dora-rows --rank 16 --max-steps 2000
 ```
 
-These are model-level primitives rather than a dataset or training CLI.
-Callers remain responsible for file decoding and resampling, dataset
-discovery and persistence, conditioning, optimization, and checkpoint cadence.
+Defaults mirror underfit (dora-rows / rank 16, AdamW, uniform sampler + the
+"full" distribution shift, CFG-dropout 0.1, signal-only masked rectified-flow
+loss, checkpoint every 1000 steps). To match the full dashboard template config,
+add `--timestep-sampler trunc_logit_normal --use-effective-length --beta2 0.95
+--weight-decay 0.01 --lr-scheduler inverse --lr-warmup 0.995`. Checkpoints land at
+`output/runs/<name>/<uuid>/checkpoints/<name>-step=S-epoch=E.safetensors` with
+`lora_config` metadata; resume with `--lora-ckpt-path <ckpt>`.
+
+Optional training-time demos (RF-Euler inference → mp3, underfit's on-disk
+format): `--demo-every 1000 --demo-config demos.json`, where `demos.json` is a
+list of `{"prompt", "cfg", "seed", "steps", "lora_strength"?, "lora_interval_max"?}`.
+
+**3. Generate** with your adapter — the checkpoint applies to the shipped ARC
+model at inference via `--lora` (see "Apply a LoRA finetune" above; also
+`scripts/sa3_gradio.py --lora <ckpt>` to open the web UI with it preloaded):
+
+```bash
+./sa3 --dit sm-music --decoder same-s --prompt "..." --out finetuned.wav \
+      --lora "output/runs/my-lora/"*"/checkpoints/my-lora-step=2000-epoch="*.safetensors
+```
+
+### Building your own loop
+
+The CLI is assembled from reusable pieces: `inject_trainable_lora` /
+`save_lora_checkpoint` / `apply_lora_checkpoint` (`models/defs/lora.py` — all 9
+LoRA/DoRA/BoRA/-XS types with the no-weight-materialization forward), the RF
+loss + samplers + distribution shift (`models/defs/training.py`), the
+pre-encoded dataset + prompt templates (`models/defs/latent_dataset.py`), and
+`encode_audio` (`models/defs/audio_encoding.py`). Checkpoints use the same
+safetensors keys + `lora_config` metadata as the PyTorch trainer, so adapters
+are interchangeable in either direction.
 
 ## Flag reference
 
@@ -273,6 +285,7 @@ sa3_mlx/
 ├── sa3                            ← shell wrapper (use this)
 ├── install.sh                     ← uv bootstrap (run once)
 ├── README.md
+├── TRAINING_CONVENTIONS.md         ← LoRA-training conventions + MPS-vs-MLX parity
 ├── requirements.txt
 ├── output/                        ← default landing zone for generated WAVs
 ├── scripts/
@@ -281,7 +294,12 @@ sa3_mlx/
 │   ├── examples.py                ← shared examples block (--help + post-install)
 │   ├── install.py                 ← install.sh's Python half (bundle picker)
 │   ├── test_all_configs.py        ← npz + CLI config sanity tests
-│   └── benchmark.py               ← wall-time + peak-RAM matrix across model × duration
+│   ├── benchmark.py               ← wall-time + peak-RAM matrix across model × duration
+│   ├── lora_train_mlx.py          ← LoRA training CLI (underfit conventions)
+│   ├── pre_encode_mlx.py          ← audio → SAME-latent pre-encode (torch-free)
+│   ├── sa3_gradio.py              ← web UI (invoked by ./sa3-gradio; --lora preload)
+│   ├── test_lora_merge.py         ← adapter-math tests (weight-free; run in CI)
+│   └── parity_forward_{torch,mlx}.py  ← torch(MPS)-vs-MLX fwd+bwd parity harness
 └── models/
     ├── defs/
     │   ├── sa3_pipeline.py        ← sampler + conditioner + unpatch
@@ -289,7 +307,13 @@ sa3_mlx/
     │   ├── dit_mlx.py             ← small DiT (sm-music + sm-sfx)
     │   ├── dit_mlx_medium.py      ← medium DiT (differential attention)
     │   ├── same_s_{encoder,decoder}.py    ← small codec
-    │   └── same_l_{encoder,decoder}.py    ← large codec
+    │   ├── same_l_{encoder,decoder}.py    ← large codec
+    │   ├── lora.py                ← trainable LoRA/DoRA/BoRA adapters (9 types)
+    │   ├── lora_merge.py          ← inference-time LoRA merge + per-step gating
+    │   ├── training.py            ← RF loss + timestep samplers + distribution shift
+    │   ├── latent_dataset.py      ← pre-encoded dataset + underfit prompt templates
+    │   ├── audio_encoding.py      ← waveform → SAME latents (pre-encode bridge)
+    │   └── demo_mlx.py            ← training-time RF-Euler demos → mp3
     └── mlx/                       ← .npz weights (auto-downloaded; ~8.4 GB total)
         ├── t5gemma_f16.npz                541 MB    text encoder + tokenizer
         ├── dit_sm-music_f16.npz           877 MB    DiT + conditioner baked in

@@ -103,7 +103,7 @@ T5GEMMA_PATH = ARCH_DIR / "t5gemma" / "t5gemma_fp16mixed.trt"
 DIT_ENGINE_FILES = {
     "sm-music": ["sa3-sm-music/dit_fp16mixed.trt"],
     "sm-sfx":   ["sa3-sm-sfx/dit_fp16mixed.trt"],
-    "medium":   ["sa3-m/dit_fp16mixed.trt"],
+    "medium":   ["sa3-m/dit_bf16.trt"],   # bf16 (FMHA-fused) is the medium default
 }
 DECODER_FILES = {
     "same-s": [
@@ -129,7 +129,7 @@ DIT_CHOICES = {
                  "default_decoder": "same-s"},
     "sm-sfx":   {"engine": ARCH_DIR / "sa3-sm-sfx" / "dit_fp16mixed.trt",
                  "default_decoder": "same-s"},
-    "medium":   {"engine": ARCH_DIR / "sa3-m" / "dit_fp16mixed.trt",
+    "medium":   {"engine": ARCH_DIR / "sa3-m" / "dit_bf16.trt",   # bf16 = medium default
                  "default_decoder": "same-l"},
 }
 DECODER_PATHS = {
@@ -144,51 +144,94 @@ ENCODER_PATHS = {
 
 # ─── Precision-keyed engine maps ─────────────────────────────────────────
 #
-# The canonical engines are FP16-mixed (FP16 trunk + FP32 islands around
-# RMSNorm / Softmax / RoPE). Pure-FP32 variants are also published — same
-# numerical behavior as PyTorch eager FP32. Use `--precision fp32` on the
-# CLI to pick them; default is `fp16mixed`.
+# Three DiT precisions:
+#   bf16       — medium ONLY. Same dit.onnx as fp32, built with BuilderFlag.BF16
+#                (EXPLICIT_BATCH). bf16 carries fp32's range, so the FP32-softmax
+#                islands vanish and TRT 10.15's FMHA fuser fires (0 → 96 fused
+#                _gemm_mha_v2 nodes) → 1.76×@256 / 4.70×@4096 vs fp16-mixed,
+#                within the perceptual re-seed floor (FAD 0.59× floor, n=128).
+#                NOT seed-reproducible vs fp16-mixed (differential attention is
+#                cancellation-sensitive → a different-but-equal take per seed).
+#                THE MEDIUM DEFAULT. (sm-music/sm-sfx use standard attention and
+#                already fuse in fp16-mixed — no bf16 engine for them.)
+#   fp16mixed  — canonical (FP16 trunk + FP32 islands around RMSNorm/Softmax/
+#                RoPE). Kept selectable for bit-reproducibility / max per-step
+#                fidelity. The sm-music / sm-sfx default.
+#   fp32       — pure-FP32, bit-equivalent to PyTorch eager. ~2× size/latency.
 #
 # The lookup tables below resolve the engine filename per (dit/decoder,
-# precision). Encoders are FP16-mixed only.
+# precision). The bf16 DiT recipe is a build-time precision change only (no new
+# ONNX): reuse sa3-m/dit.onnx, build with BF16. Decoders/encoders are unchanged
+# by bf16 (it's a DiT-trunk fusion recipe), so decoder "bf16" reuses the
+# canonical decoder engine. Encoders are FP16-mixed only.
 DIT_ENGINE_FILENAME = {
+    "bf16":      "dit_bf16.trt",        # medium only (FMHA-fused; medium default)
     "fp16mixed": "dit_fp16mixed.trt",
     "fp32":      "dit_fp32.trt",
 }
+# DiT precisions actually built per model. bf16 is medium-only.
+_DIT_PRECISIONS = {
+    "sm-music": ("fp16mixed", "fp32"),
+    "sm-sfx":   ("fp16mixed", "fp32"),
+    "medium":   ("bf16", "fp16mixed", "fp32"),
+}
+# Per-DiT default precision (bf16 for medium, fp16mixed elsewhere).
+DIT_DEFAULT_PRECISION = {"sm-music": "fp16mixed", "sm-sfx": "fp16mixed", "medium": "bf16"}
 _DIT_SUBDIR = {"sm-music": "sa3-sm-music", "sm-sfx": "sa3-sm-sfx", "medium": "sa3-m"}
 DECODER_ENGINE_FILENAME = {
     "same-l": {
+        # bf16 is a DiT-only recipe → decoder reuses its canonical fp16-mixed engine.
+        "bf16":      "dec_dynamic_triton_swa.trt",
         "fp16mixed": "dec_dynamic_triton_swa.trt",
         "fp32":      "dec_dynamic_fp32.trt",
     },
     "same-s": {
+        "bf16":      "dec_dynamic_bf16.trt",
         "fp16mixed": "dec_dynamic_bf16.trt",
         "fp32":      "dec_dynamic_fp32.trt",
     },
 }
-PRECISIONS = ("fp16mixed", "fp32")
+PRECISIONS = ("bf16", "fp16mixed", "fp32")
 
 
-def get_dit_engine_path(dit_name: str, precision: str = "fp16mixed") -> Path:
+def default_precision(dit_name: str) -> str:
+    """Default DiT precision for a model: bf16 for medium (FMHA-fused speed
+    default), fp16-mixed otherwise."""
+    return DIT_DEFAULT_PRECISION.get(dit_name, "fp16mixed")
+
+
+def get_dit_engine_path(dit_name: str, precision: str = None) -> Path:
     if dit_name not in _DIT_SUBDIR:
         raise ValueError(f"unknown dit={dit_name!r}; valid: {list(_DIT_SUBDIR)}")
+    if precision is None:
+        precision = default_precision(dit_name)
     if precision not in DIT_ENGINE_FILENAME:
         raise ValueError(f"unknown precision={precision!r}; valid: {PRECISIONS}")
+    if precision == "bf16" and dit_name != "medium":
+        raise ValueError(
+            f"precision='bf16' is only available for --dit medium (FMHA-fused); "
+            f"{dit_name} uses standard attention and already fuses in fp16mixed. "
+            f"Valid for {dit_name}: {_DIT_PRECISIONS.get(dit_name)}")
     return ARCH_DIR / _DIT_SUBDIR[dit_name] / DIT_ENGINE_FILENAME[precision]
 
 
-def get_decoder_engine_path(decoder_name: str, precision: str = "fp16mixed") -> Path:
+def get_decoder_engine_path(decoder_name: str, precision: str = None) -> Path:
     if decoder_name not in DECODER_ENGINE_FILENAME:
         raise ValueError(f"unknown decoder={decoder_name!r}; valid: {list(DECODER_ENGINE_FILENAME)}")
+    if precision is None:
+        precision = "fp16mixed"   # decoders have no bf16-specific engine; canonical
     if precision not in DECODER_ENGINE_FILENAME[decoder_name]:
         raise ValueError(f"unknown precision={precision!r}; valid: {PRECISIONS}")
     return ARCH_DIR / decoder_name / DECODER_ENGINE_FILENAME[decoder_name][precision]
 
 
-def get_engine_files(dit_name: str, decoder_name: str, precision: str = "fp16mixed",
+def get_engine_files(dit_name: str, decoder_name: str, precision: str = None,
                        with_encoder: bool = False) -> list[str]:
     """Relative paths (under ARCH_DIR) needed for the chosen pipeline. Pass this
-    list to _ensure_files() to auto-download anything missing from HF."""
+    list to _ensure_files() to auto-download anything missing from HF.
+    precision=None resolves to the per-model default (bf16 for medium)."""
+    if precision is None:
+        precision = default_precision(dit_name)
     files = list(SHARED_FILES)
     files.append(f"{_DIT_SUBDIR[dit_name]}/{DIT_ENGINE_FILENAME[precision]}")
     files.append(f"{decoder_name}/{DECODER_ENGINE_FILENAME[decoder_name][precision]}")
@@ -903,7 +946,7 @@ def _arrow_pick(prompt: str, options: list[str], default: str | None = None) -> 
 
 
 def prompt_user_if_missing(args):
-    """Fill in --dit / --decoder / --seed interactively if missing."""
+    """Fill in --dit / --decoder / --precision / --seed interactively if missing."""
     if args.dit is None:
         args.dit = _arrow_pick("Choose DiT model:", list(DIT_CHOICES.keys()), default="medium")
         print(f"  → {args.dit}")
@@ -911,6 +954,14 @@ def prompt_user_if_missing(args):
         suggested = DIT_CHOICES[args.dit]["default_decoder"]
         args.decoder = _arrow_pick("Choose audio decoder:", list(DECODER_PATHS.keys()), default=suggested)
         print(f"  → {args.decoder}")
+    # Resolve DiT precision default per model: bf16 for medium (FMHA-fused speed
+    # default), fp16-mixed for sm-music/sm-sfx. bf16 is medium-only (sm-music/
+    # sm-sfx use standard attention and already fuse in fp16mixed).
+    if getattr(args, "precision", None) is None:
+        args.precision = default_precision(args.dit)
+    if args.precision == "bf16" and args.dit != "medium":
+        sys.exit("error: --precision bf16 is only available for --dit medium "
+                 "(sm-music / sm-sfx already fuse in fp16mixed).")
     if args.seed is None:
         args.seed = random.randint(0, 2**31 - 1)
     return args
@@ -958,10 +1009,14 @@ def main():
     ap.add_argument("--decoder", choices=list(DECODER_PATHS.keys()), default=None,
                     help="Audio decoder. 'same-s' pairs with sm-* (110 MB engine). "
                          "'same-l' pairs with medium (1.2 GB engine). Interactive picker if omitted.")
-    ap.add_argument("--precision", choices=list(PRECISIONS), default="fp16mixed",
-                    help="Engine precision. 'fp16mixed' (default) = FP16 trunk + FP32 islands, "
-                         "fastest. 'fp32' = pure FP32, matches PyTorch eager bit-for-bit but ~2× "
-                         "slower and ~2× the VRAM. Engines auto-download from HF if missing.")
+    ap.add_argument("--precision", choices=list(PRECISIONS), default=None,
+                    help="DiT engine precision (default resolves per model: 'bf16' for medium, "
+                         "'fp16mixed' for sm-music/sm-sfx). 'bf16' (MEDIUM ONLY) = FMHA-fused, "
+                         "~1.8-4.7× faster than fp16mixed, within the perceptual floor, but not "
+                         "seed-reproducible vs fp16mixed (differential attention). 'fp16mixed' = "
+                         "FP16 trunk + FP32 islands (canonical, bit-reproducible). 'fp32' = pure "
+                         "FP32, matches PyTorch eager bit-for-bit but ~2× slower and ~2× the VRAM. "
+                         "Engines auto-download from HF if missing.")
     ap.add_argument("--models-dir", default=str(MODELS_DIR),
                     help=f"Directory containing the TRT engines. Default: {MODELS_DIR}")
     # ── Sampling ──
@@ -1165,8 +1220,12 @@ def main():
     _w_m  = torch.zeros(1, T5_MAX_LEN, device="cuda")
     _w_l  = torch.zeros(1, 257, T_lat, device="cuda")
     _w_lat   = torch.zeros(1, IO_CHANNELS, T_lat, device="cuda")
-    _w_audio = torch.zeros(1, 2, T_lat * SAMPLES_PER_LATENT, device="cuda") \
-                if "enc" in runners else None
+    # Encoder warmup is at the chunk_lat shape that encode_chunked actually
+    # uses; encoding at the full T_lat shape diverges past T_lat≈100-200 on
+    # both encoders (see encoder_encode docstring), so we never feed the
+    # engine that shape — encode_chunked stitches chunk_lat=50 windows.
+    _w_audio = torch.zeros(1, 2, DEFAULT_ENCODER_CHUNK_LAT * SAMPLES_PER_LATENT,
+                            device="cuda") if "enc" in runners else None
     # Optional: pre-allocate a pinned-memory destination buffer for the
     # Stage-5 narrow + DtoH path. With pinned dst + non_blocking=True the DMA
     # goes straight from GPU into RAM without the usual pageable→pinned
@@ -1275,7 +1334,7 @@ def main():
         audio_t = torch.from_numpy(audio_np).unsqueeze(0).cuda()   # (1, 2, T)
         sub(f"read+prep ({init_action})  {(time.time() - t0) * 1000:.0f} ms")
         t0 = time.time()
-        init_latents = encoder_encode(runners["enc"], audio_t)
+        init_latents = encode_chunked(runners["enc"], audio_t)
         sub(f"encode  {(time.time() - t0) * 1000:.0f} ms   latents {tuple(init_latents.shape)}")
         if args.free_models:
             runners["enc"].free(); del runners["enc"]

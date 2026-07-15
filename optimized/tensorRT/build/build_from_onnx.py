@@ -141,6 +141,33 @@ TARGETS = {
         "profile":      _DIT_PROFILE,
         "plugin":       False,
     },
+    # SA3 medium DiT in bf16 — the medium SPEED DEFAULT (fp16-mixed above stays
+    # selectable). Reuses the SAME raw fp32 dit.onnx as the fp32 variant, but
+    # builds with BuilderFlag.BF16 + EXPLICIT_BATCH (NOT STRONGLY_TYPED): bf16
+    # carries fp32's dynamic range, so the FP32-softmax islands that fp16-mixed
+    # kept vanish and TRT 10.15's FMHA fuser fires (0 → 96 fused _gemm_mha_v2
+    # nodes) → measured ~1.76×@L=256 / 4.70×@L=4096 vs fp16-mixed, within the
+    # perceptual re-seed floor (FAD 0.59× floor, CLAP within spread, n=128).
+    # It is a build-time PRECISION RECIPE only — no new ONNX, no graph change.
+    # medium-only: sm-music / sm-sfx use standard attention and already fuse in
+    # their fp16-mixed engines. bf16 is NOT seed-reproducible vs fp16-mixed
+    # (differential attention is cancellation-sensitive) — a different-but-equal
+    # take per seed; use fp16-mixed for bit-reproducibility.
+    # Same _DIT_PROFILE (batch=1, dynamic L∈[1,4096], opt=1292) as every DiT
+    # engine → identical CLI/feature surface (varlen, CFG sequential dual-pass,
+    # neg-prompt/APG, a2a, inpaint). The DiT ONNX bakes batch=1, so there is no
+    # varbatch axis on ANY TRT DiT engine (CFG is a sequential dual-pass, as in
+    # fp16-mixed) — fusion is verified to survive the full L profile at batch=1.
+    "sa3-m-bf16": {
+        # 5.8 GB external-data sidecar (fp32 weights) travels alongside.
+        "onnx_hf":      ["sa3-m/dit.onnx", "sa3-m/dit.onnx.data"],
+        "trt_local":    "sa3-m/dit_bf16.trt",
+        "flags":        {"BF16"},
+        "network":      "EXPLICIT_BATCH",
+        "workspace_gb": 16,
+        "profile":      _DIT_PROFILE,
+        "plugin":       False,
+    },
     # ── FP32 variants ────────────────────────────────────────────────────
     # DiT FP32: read the unsurgered FP32 ONNX directly (dit.onnx), build
     # STRONGLY_TYPED. ~2× the engine size of FP16-mixed, ~2× slower, but

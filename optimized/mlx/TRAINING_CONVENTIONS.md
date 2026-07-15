@@ -164,9 +164,14 @@ t={0.25,0.5,0.75}): **pretransform.scale=1.0 asserted against the real model**
 (confirms the softnorm no-scale convention — a prime hidden-bug candidate),
 DiT-only forward (torch cross/global injected → isolates the DiT) **79.0 dB**,
 conditioning cross/global **88.5/77.6 dB**, end-to-end **79.0 dB**, loss torch
-4.716201 vs MLX 4.716814 (**Δ 6.1e-4**). A convention bug (RoPE/attn-mask/adaLN/
-local_add_cond layout/scale) reads ≪40 dB; ~79 dB is the cross-framework fp32
-reduction-order floor through 20 layers. Confirms parity, no bug.
+4.716201 vs MLX 4.716814 (**Δ 6.1e-4**). **Backward also checked**: ∂loss/∂noised
+through the full DiT (torch cross/global injected) agrees at **77.5 dB** — the same
+floor as the forward, so the backward sweep every adapter gradient is built from
+matches too (the local adapter-param VJP was separately verified within-framework to
+≤2.4e-7 MLX / ≤4.4e-7 torch during the DoRA reformulation). A convention/autograd bug
+(RoPE/attn-mask/adaLN/local_add_cond layout/scale) reads ≪40 dB; ~78 dB is the
+cross-framework fp32 reduction-order floor through 20 layers. Confirms fwd+bwd parity,
+no bug.
 
 Verified by a controlled forward (identical latents crop, numpy-seeded noise,
 t=0.5, fixed prompt, fp32) through underfit's torch loop on MPS vs the MLX

@@ -82,10 +82,24 @@ def main():
     mx.eval(pred3)
     loss_m = float(mx.mean((pred3 - target) ** 2))
 
+    # (4) BACKWARD: ∂loss/∂noised through the DiT (with torch's cross/global so
+    # the backward is compared on identical inputs — isolates the DiT backward).
+    cross_t = mx.array(tt["cross"]).astype(mx.float32)
+    gcond_t = mx.array(tt["gcond"]).astype(mx.float32)
+
+    def loss_of_noised(nz):
+        pred = dit(nz, t, cross_t, gcond_t, local_add_cond=lac)
+        return mx.mean((pred - target) ** 2)
+
+    grad_m = mx.grad(loss_of_noised)(noised)
+    mx.eval(grad_m)
+    p_grad = psnr(np.array(grad_m), tt["grad_noised"]) if "grad_noised" in tt else float("nan")
+
     print(f"noised sanity PSNR   = {psnr(np.array(noised), tt['noised']):.1f} dB (inf = bit-identical)")
     print(f"(1) DiT-only forward = {psnr(np.array(pred1), tt['prediction']):6.2f} dB  [conv bug ≪40; fp32 floor ~79]")
     print(f"(2) conditioning     = cross {psnr(np.array(cross_m), tt['cross']):.2f} dB / global {psnr(np.array(gcond_m), tt['gcond']):.2f} dB")
     print(f"(3) end-to-end pred  = {psnr(np.array(pred3), tt['prediction']):6.2f} dB")
+    print(f"(4) BACKWARD d loss/d noised PSNR = {p_grad:6.2f} dB  [full DiT backward; conv bug ≪40]")
     print(f"loss: torch {float(tt['loss']):.6f}  MLX {loss_m:.6f}  |Δ| {abs(float(tt['loss'])-loss_m):.2e}")
 
 

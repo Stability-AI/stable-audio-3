@@ -79,20 +79,25 @@ def main():
     conditioning = model.conditioner(metadata, device)
     conditioning["inpaint_mask"] = [torch.ones(B, 1, T, device=device)]
     conditioning["inpaint_masked_input"] = [torch.zeros(B, C, T, device=device)]
-
     with torch.no_grad():
-        output = model(noised, tt, cond=conditioning, cfg_dropout_prob=0.0,
-                       padding_mask=torch.ones(B, T, dtype=torch.bool, device=device))
         ci = model.get_conditioning_inputs(conditioning)
 
+    # BACKWARD: gradient of the loss w.r.t. the noised input — the full DiT
+    # backward sweep (every interior gradient the adapter grads are built from).
+    noised.requires_grad_(True)
+    output = model(noised, tt, cond=conditioning, cfg_dropout_prob=0.0,
+                   padding_mask=torch.ones(B, T, dtype=torch.bool, device=device))
     loss = ((output.float() - target.float()) ** 2).mean()  # full mask → signal-only == mean
-    print(f"loss = {float(loss):.8f}", flush=True)
+    loss.backward()
+    grad_noised = noised.grad
+    print(f"loss = {float(loss):.8f}   |grad_noised| = {float(grad_noised.abs().mean()):.6e}", flush=True)
     np.savez(f"{args.workdir}/torch_out.npz",
-             prediction=output.float().cpu().numpy(), loss=float(loss),
+             prediction=output.detach().float().cpu().numpy(), loss=float(loss),
              cross=ci["cross_attn_cond"].float().cpu().numpy(),
              gcond=ci["global_cond"].float().cpu().numpy(),
-             noised=noised.float().cpu().numpy(), target=target.float().cpu().numpy(),
-             scale=scale)
+             noised=noised.detach().float().cpu().numpy(),
+             target=target.float().cpu().numpy(),
+             grad_noised=grad_noised.float().cpu().numpy(), scale=scale)
     print(f"wrote {args.workdir}/torch_out.npz", flush=True)
 
 

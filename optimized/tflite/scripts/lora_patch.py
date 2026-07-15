@@ -280,7 +280,10 @@ def get_patched_dit(base_path, specs, *, family: str, precision: str,
             f"merging int8 weights would destroy the GPTQ grid. Use fp32 or w16a32."
         )
 
-    cache_dir = Path(cache_dir or (Path(base_path).resolve().parents[2] / "lora_cache"))
+    # Cache next to the family dirs (models/tflite/lora_cache/) — use the
+    # base's OWN path, not resolve(): the base is usually a symlink into the HF
+    # cache, and resolving it would drop the patched (multi-GB) clones there.
+    cache_dir = Path(cache_dir or (Path(base_path).parent.parent / "lora_cache"))
     cache_dir.mkdir(parents=True, exist_ok=True)
     key = _cache_key(base_path, specs)
     out = cache_dir / f"dit_{family}_{precision}_{key}.tflite"

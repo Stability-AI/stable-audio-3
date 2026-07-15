@@ -270,14 +270,6 @@ class BakedDiT:
                  cfg=1.0, apg=1.0, null_hidden=None, null_mask=None, local_add_cond=None,
                  batched=True):
         from ai_edge_litert import interpreter as tfl
-        self.L = L
-        self.cfg = float(cfg); self.apg = float(apg)
-        self.n_fwd = 0
-        # Batched CFG only applies when there's an uncond branch to co-batch (cfg != 1.0).
-        self.batched = bool(batched) and self.cfg != 1.0
-        B = 2 if self.batched else 1
-        self.B = B
-
         self.it = tfl.Interpreter(model_path=str(path), num_threads=threads)
         det = self.it.get_input_details()
         def pick(pred): return [d for d in det if pred(d)]
@@ -288,14 +280,41 @@ class BakedDiT:
         scalars = sorted(pick(lambda d: len(d["shape"]) == 1), key=lambda d: d["name"])
         self.i_t, self.i_sec = scalars[0], scalars[1]   # args_1=t < args_4=seconds by name
         self.out = self.it.get_output_details()[0]["index"]
+        # Track the currently-allocated (batch, length) so set_conditioning can skip the
+        # expensive resize+allocate when only the conditioning tensors change.
+        self._alloc_B = self._alloc_L = None
+        self.set_conditioning(L, t5_hidden, t5_mask, seconds, cfg=cfg, apg=apg,
+                              null_hidden=null_hidden, null_mask=null_mask,
+                              local_add_cond=local_add_cond, batched=batched)
+
+    def set_conditioning(self, L, t5_hidden, t5_mask, seconds, *, cfg=1.0, apg=1.0,
+                         null_hidden=None, null_mask=None, local_add_cond=None, batched=True):
+        """(Re)bind per-generation conditioning onto this (possibly reused) interpreter.
+
+        The baked DiT holds the conditioning (T5 hidden/mask, seconds, local_add_cond) as
+        RESIDENT input tensors — a fresh generation only changes those, not the graph. A
+        cached BakedDiT can therefore be re-pointed at a new prompt/length WITHOUT rebuilding
+        the interpreter or re-packing XNNPACK's weights: resize+allocate_tensors runs only
+        when the batch (cfg on/off) or length L actually changes, otherwise the residents are
+        overwritten in place (same reuse pattern BakedDecoder/BakedEncoder use for L). Called
+        from __init__ (so the CLI's one-shot path is unchanged) and by the gradio DiT cache."""
+        self.L = L
+        self.cfg = float(cfg); self.apg = float(apg)
+        self.n_fwd = 0
+        # Batched CFG only applies when there's an uncond branch to co-batch (cfg != 1.0).
+        self.batched = bool(batched) and self.cfg != 1.0
+        B = 2 if self.batched else 1
+        self.B = B
         # Resize batch axis to B (the canonical DiT is variable-batch) + length axis to L.
-        self.it.resize_tensor_input(self.i_x["index"],   [B, 256, L], strict=False)
-        self.it.resize_tensor_input(self.i_lac["index"], [B, 257, L], strict=False)
-        self.it.resize_tensor_input(self.i_t5h["index"], [B, COND_TOKENS, COND_DIM], strict=False)
-        self.it.resize_tensor_input(self.i_t5m["index"], [B, COND_TOKENS], strict=False)
-        self.it.resize_tensor_input(self.i_t["index"],   [B], strict=False)
-        self.it.resize_tensor_input(self.i_sec["index"], [B], strict=False)
-        self.it.allocate_tensors()
+        if (self._alloc_B, self._alloc_L) != (B, L):
+            self.it.resize_tensor_input(self.i_x["index"],   [B, 256, L], strict=False)
+            self.it.resize_tensor_input(self.i_lac["index"], [B, 257, L], strict=False)
+            self.it.resize_tensor_input(self.i_t5h["index"], [B, COND_TOKENS, COND_DIM], strict=False)
+            self.it.resize_tensor_input(self.i_t5m["index"], [B, COND_TOKENS], strict=False)
+            self.it.resize_tensor_input(self.i_t["index"],   [B], strict=False)
+            self.it.resize_tensor_input(self.i_sec["index"], [B], strict=False)
+            self.it.allocate_tensors()
+            self._alloc_B, self._alloc_L = B, L
 
         t5h = t5_hidden.astype(np.float32)
         t5m = t5_mask.astype(np.float32)
@@ -315,6 +334,7 @@ class BakedDiT:
             self.t5h, self.t5m = t5h, t5m
             self.it.set_tensor(self.i_sec["index"], sec)   # seconds + lac constant → resident
             self.it.set_tensor(self.i_lac["index"], lac)
+        return self
 
     def _fwd(self, x, t, t5h, t5m):
         """One batch=1 invoke (cfg==1.0 or sequential CFG)."""

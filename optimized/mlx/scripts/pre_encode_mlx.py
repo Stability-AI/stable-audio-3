@@ -396,6 +396,8 @@ def main():
         sys.exit(1)
 
     max_samples = max_samples_for_duration(args.max_duration)
+    import mlx.core as mx
+    print(f"Engine: MLX  ·  device: {mx.default_device()}")
     print(f"Codec:  {args.codec} (pad_modulo={SAME_ENCODER_PAD_MODULO[args.codec]}, fp32)")
     print(f"Input:  {audio_dir} ({len(files)} audio files)")
     print(f"Output: {Path(args.output_dir).expanduser().resolve()}")

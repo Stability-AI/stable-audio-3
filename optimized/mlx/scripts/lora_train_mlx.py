@@ -577,6 +577,10 @@ def main():
             print("WARNING: --demo-every set but no --demo-config — demos disabled")
     demo_dir = args.demo_dir or "."
     demo_decoder_name = args.demo_decoder or DIT_CHOICES[args.dit]["default_decoder"]
+    _model_default_decoder = DIT_CHOICES[args.dit]["default_decoder"]
+    if demo_entries and demo_decoder_name != _model_default_decoder:
+        print(f"demos: decoding with {demo_decoder_name.upper()} instead of the "
+              f"model's {_model_default_decoder.upper()} (faster demos)")
     _demo_dec = {}  # lazy: (decoder, chunk_fn, chunk_cfg)
 
     def _demo_T_lat(entry):

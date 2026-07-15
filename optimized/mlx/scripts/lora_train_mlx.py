@@ -338,6 +338,7 @@ def main():
     session = uuid.uuid4().hex[:8]
     ckpt_dir = Path(args.save_dir) / args.name / session / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Engine: MLX  ·  device: {mx.default_device()}")
     print(f"run: {args.name}  session {session}")
     print(f"checkpoints → {ckpt_dir}")
 

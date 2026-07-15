@@ -6,13 +6,16 @@ https://github.com/microsoft/LoRA/blob/main/loralib/layers.py
 
 import math
 import re
+import types
 from functools import partial
 from itertools import product
 
 import torch
+import torch.nn.functional as F
 import torch.nn.utils.parametrize as parametrize
 from torch import nn
 
+from ...utils.device import disable_autocast
 from ...verbose import vprint
 
 
@@ -296,6 +299,109 @@ class LoRAParametrization(nn.Module):
         )
 
 
+# --- fast LoRA/DoRA forward: reformulated, no W' = f(W0) materialization (see PR) ---
+
+_FAST_LORA_TYPES = ("lora", "dora", "dora-rows", "dora-cols")
+
+
+def _fast_lora_param(module):
+    """The single fast-path-eligible LoRAParametrization on module.weight, else None."""
+    pzs = getattr(module, "parametrizations", None)
+    if pzs is None or "weight" not in pzs:
+        return None
+    plist = pzs["weight"]
+    if len(plist) != 1:
+        return None  # stacked adapters -> naive path
+    p = plist[0]
+    if type(p) is not LoRAParametrization or p.adapter_type not in _FAST_LORA_TYPES:
+        return None
+    if p.swap((0, 1)) != (0, 1):
+        return None  # fan_in_fan_out (embedding) layout
+    if p.forward_fn is not p._adapter_forward_fn:
+        return None  # disable_lora() active
+    if plist.original.requires_grad:
+        return None  # trainable base weight
+    return p
+
+
+@disable_autocast
+def _dora_scale(module, p, W0, A, B, s):
+    """m / (norm(V) + 1e-12) along p._norm_dim, via the norm^2 expansion (fp32)."""
+    W0f = W0.view(W0.shape[0], -1).to(p.lora_A.dtype)
+    dim = p._norm_dim
+    # rowsum/colsum(W0^2) is constant for the frozen base -> cache it (never in state_dict)
+    ck = (W0.data_ptr(), W0._version)
+    cache = module.__dict__.get("_fast_lora_w0_sq")
+    if cache is None or cache[0] != ck:
+        with torch.no_grad():
+            cache = (ck, (W0f * W0f).sum(dim))
+        module._fast_lora_w0_sq = cache
+    if dim == 1:  # dora-rows: per-output-row norm
+        cross = (F.linear(W0f, A) * B).sum(-1)
+        quad = (torch.matmul(B, torch.matmul(A, A.t())) * B).sum(-1)
+    else:  # dora-cols: per-input-column norm
+        cross = (torch.matmul(W0f.t(), B) * A.t()).sum(-1)
+        quad = (torch.matmul(torch.matmul(B.t(), B), A) * A).sum(0)
+    norm = (cache[1] + (2.0 * s) * cross + (s * s) * quad).clamp_min(0).sqrt()
+    return p.magnitude / (norm + 1e-12)
+
+
+def _fast_lora_linear_forward(self, x):
+    p = _fast_lora_param(self)
+    if p is None:
+        return nn.Linear.forward(self, x)  # naive path (reads self.weight)
+
+    W0 = self.parametrizations["weight"].original
+    bias = self.bias
+    is_dora = p.adapter_type != "lora"
+    strength = p.lora_strength
+    if is_dora and strength == 0:
+        return F.linear(x, W0, bias)  # dora_forward's exact early-out
+
+    A = p.dropout_fn(p.lora_A)  # one dropout draw, shared by the data + norm terms
+    B = p.lora_B
+    s = p.scaling * strength  # 0-dim tensor -> strength stays in the graph
+
+    if is_dora and p._norm_dim == 1:
+        # dora-rows scales the OUTPUT by m/rownorm; bias added un-scaled AFTER
+        y = F.linear(x, W0) + F.linear(F.linear(x, A), B) * s
+        y = y * _dora_scale(self, p, W0, A, B, s).to(y.dtype)
+        return y if bias is None else y + bias.to(y.dtype)
+
+    if is_dora:  # dora-cols scales the INPUT by c = m/colnorm
+        x = x * _dora_scale(self, p, W0, A, B, s).to(x.dtype)
+    # lora / dora-cols: un-scaled bias rides the base GEMM (fused, bit-exact at delta=0)
+    return F.linear(x, W0, bias) + F.linear(F.linear(x, A), B) * s
+
+
+def _install_fast_lora_forward(model):
+    """Instance-attribute swap of each LoRA-parametrized nn.Linear's forward (idempotent).
+
+    Leaves state_dict layout and parametrization registration untouched;
+    custom Linear subclasses are skipped.
+    """
+    for module in model.modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        if not parametrize.is_parametrized(module, "weight"):
+            continue
+        if type(module).forward is not nn.Linear.forward:
+            continue  # custom Linear subclass: forward may do more than F.linear
+        if module.__dict__.get("_fast_lora_wrapped", False):
+            continue
+        module.forward = types.MethodType(_fast_lora_linear_forward, module)
+        module._fast_lora_wrapped = True
+
+
+def _uninstall_fast_lora_forward(model):
+    """Restore the original class-level forward on every wrapped module."""
+    for module in model.modules():
+        if module.__dict__.get("_fast_lora_wrapped", False):
+            module.__dict__.pop("forward", None)
+            module.__dict__.pop("_fast_lora_w0_sq", None)
+            module._fast_lora_wrapped = False
+
+
 default_lora_config = {  # specify which layers to add lora to, by default only add to linear layers
     nn.Linear: {
         "weight": partial(LoRAParametrization.from_linear, rank=4),
@@ -413,6 +519,8 @@ def add_lora(model, lora_config=default_lora_config, include=None, exclude=None,
         # Fast path: original behavior, no name inspection needed
         model.apply(partial(apply_lora, lora_config=lora_config))
 
+    _install_fast_lora_forward(model)
+
 def add_lora_by_name(model, target_module_names, lora_config=default_lora_config, svd_bases=None):
     """Add LoRA to specific layers by name. Convenience wrapper around add_lora()."""
     add_lora(model, lora_config=lora_config, include=target_module_names, svd_bases=svd_bases)
@@ -421,10 +529,12 @@ def add_lora_by_name(model, target_module_names, lora_config=default_lora_config
 def merge_lora(model):
     """merge lora parametrization to all layers in a model. This will remove all parametrization"""
     model.apply(partial(apply_lora, register=False, merge=True))
+    _uninstall_fast_lora_forward(model)
 
 def remove_lora(model):
     """remove lora parametrization to all layers in a model. This will remove all parametrization"""
     model.apply(partial(apply_lora, register=False, merge=False))
+    _uninstall_fast_lora_forward(model)
 
 def remove_lora_by_index(model, lora_index):
     """Remove all LoRA parametrizations with a specific lora_index.

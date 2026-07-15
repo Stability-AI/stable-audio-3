@@ -616,7 +616,10 @@ def main():
         whole ARC set (length-agnostic), freed after (peak = base + ARC DiT)."""
         arc_path = args.arc_weights or str(
             ensure_local(f"models/mlx/dit_{args.dit}_f16.npz"))
-        tmp_ckpt = ckpt_dir / f".arc_demo_tmp_{step:08d}.safetensors"
+        # Scratch LoRA for merging into the ARC DiT — write it to the SESSION
+        # dir (ckpt_dir.parent), NOT the scanned checkpoints/ dir, so it never
+        # shows up as a checkpoint (dotfile too, belt + suspenders).
+        tmp_ckpt = ckpt_dir.parent / f".arc_demo_tmp_{step:08d}.safetensors"
         save_lora_checkpoint(
             bundle, tmp_ckpt, include=lora_config.get("include"),
             exclude=lora_config.get("exclude"),

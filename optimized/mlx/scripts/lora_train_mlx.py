@@ -187,6 +187,32 @@ def parse_args():
     ap.add_argument("--dist-shift", default="full",
                     choices=["none", "full", "flux", "logsnr"])
     ap.add_argument("--cfg-dropout-prob", type=float, default=0.1)
+    ap.add_argument("--use-effective-length", action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help="Shift timesteps by the EFFECTIVE latent length "
+                         "ceil(int(seconds_total*44100)/4096) per sample instead "
+                         "of the crop length (underfit model flag "
+                         "use_effective_length_for_schedule; True in the SA3 "
+                         "templates). Only affects the 'full'/'flux'/'logsnr' shift.")
+    # optimizer (underfit reads these from optimizer_configs; torch AdamW defaults)
+    ap.add_argument("--beta1", type=float, default=0.9)
+    ap.add_argument("--beta2", type=float, default=0.999,
+                    help="AdamW β2 (torch default 0.999; SA3 templates use 0.95)")
+    ap.add_argument("--eps", type=float, default=1e-8)
+    ap.add_argument("--weight-decay", type=float, default=0.0,
+                    help="AdamW decoupled weight decay (torch default 0.0; SA3 "
+                         "templates use 0.01)")
+    # LR schedule (underfit's optimizer_configs.diffusion.scheduler; InverseLR
+    # with warmup — at step 0 the SA3 template LR is ~5e-7, not the nominal lr)
+    ap.add_argument("--lr-scheduler", default="none", choices=["none", "inverse"],
+                    help="'inverse' = SAT-dev InverseLR: "
+                         "lr(step) = (1-warmup^(step+1)) * "
+                         "max(final, lr*(1+step/inv_gamma)^-power)")
+    ap.add_argument("--inv-gamma", type=float, default=1e6)
+    ap.add_argument("--lr-power", type=float, default=0.5)
+    ap.add_argument("--lr-warmup", type=float, default=0.0,
+                    help="InverseLR exponential-warmup base in [0,1) (template 0.995)")
+    ap.add_argument("--lr-final", type=float, default=0.0)
     # performance
     ap.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
                     help="mx.compile the train step (loss+grad+optimizer update; "
@@ -387,9 +413,20 @@ def main():
 
     max_new_steps = max(0, args.max_steps - step_offset)
 
-    # ── optimizer: AdamW, torch defaults, single group, no schedule ──────────
-    optimizer = optim.AdamW(learning_rate=args.lr, betas=[0.9, 0.999],
-                            eps=1e-8, weight_decay=0.0)
+    # ── optimizer: AdamW, single group; betas/eps/wd from config (torch
+    # AdamW's decoupled weight decay — matches MLX's AdamW update exactly) ─────
+    def scheduled_lr(step):
+        """SAT-dev InverseLR at 0-based step (== torch last_epoch on a fresh run,
+        whose scheduler restarts even on resume). --lr-scheduler none → flat."""
+        if args.lr_scheduler != "inverse":
+            return args.lr
+        warmup_factor = 1.0 - args.lr_warmup ** (step + 1)
+        lr_mult = (1.0 + step / args.inv_gamma) ** (-args.lr_power)
+        return warmup_factor * max(args.lr_final, args.lr * lr_mult)
+
+    optimizer = optim.AdamW(learning_rate=scheduled_lr(0),
+                            betas=[args.beta1, args.beta2],
+                            eps=args.eps, weight_decay=args.weight_decay)
 
     # ── training-time local conditioning (underfit/upstream convention) ──────
     # The SA3 models are the diffusion_cond_inpaint variant: the trainer feeds
@@ -582,12 +619,21 @@ def main():
                 seconds = mx.array(np.asarray(batch["seconds_total"],
                                               dtype=np.float32))
 
-                # timesteps: sampler + model-config distribution shift
+                # timesteps: sampler + model-config distribution shift. The shift
+                # sequence length is the EFFECTIVE latent length per sample when
+                # --use-effective-length (underfit use_effective_length_for_schedule,
+                # True in the SA3 templates), else the crop length.
                 t_np = sample_training_timesteps(
                     args.timestep_sampler, latents.shape[0], rng=np_rng)
                 if args.dist_shift != "none":
+                    if args.use_effective_length:
+                        seq_len = np.asarray(
+                            [int(math.ceil(int(float(s) * 44100) / 4096))
+                             for s in batch["seconds_total"]])
+                    else:
+                        seq_len = latents.shape[-1]
                     t_np = shift_training_timesteps(
-                        t_np, latents.shape[-1], shift_type=args.dist_shift,
+                        t_np, seq_len, shift_type=args.dist_shift,
                         options=DIST_SHIFT_DEFAULT["options"]
                         if args.dist_shift == "full" else None)
                 timesteps = mx.array(t_np)
@@ -606,6 +652,14 @@ def main():
                     seconds_in = mx.stop_gradient(secs_embedder(
                         [float(s) for s in batch["seconds_total"]]))
 
+                # InverseLR (or flat): the scheduler steps per optimizer step,
+                # last_epoch = raw_step (0-based new-step index), matching torch's
+                # fresh-on-resume scheduler. Setting learning_rate updates the leaf
+                # in optimizer.state, which the compiled step reads via inputs=state.
+                lr_now = scheduled_lr(raw_step)
+                if args.lr_scheduler != "none":
+                    optimizer.learning_rate = lr_now
+
                 t_step = time.time()
                 loss = train_step(latents, timesteps, loss_mask, prompt_cond,
                                   seconds_in, drop)
@@ -620,7 +674,7 @@ def main():
                     tele.flush()
                 rate = raw_step / max(time.time() - t_start, 1e-9)
                 print(f"step {global_step}  train/loss {loss_v:.6f}  "
-                      f"train/lr {args.lr:.3e}  epoch {epoch}  "
+                      f"train/lr {lr_now:.3e}  epoch {epoch}  "
                       f"({rate:.2f} it/s, {step_ms:.0f} ms)", flush=True)
 
                 if args.checkpoint_every > 0 and \

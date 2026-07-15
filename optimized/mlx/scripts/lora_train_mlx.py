@@ -353,19 +353,19 @@ def main():
              if len(dataset) < args.batch_size else ""))
 
     # ── models ───────────────────────────────────────────────────────────────
+    # LoRA training uses the BASE checkpoint (rectified_flow), NOT the shipped
+    # ARC weights inference uses. Default to the base-model npz (auto-downloaded
+    # from HF via weights.TRAINING_BASE); --dit-weights overrides with a path.
     t0 = time.time()
+    import importlib
     if args.dit_weights:
-        import importlib
-        mod = importlib.import_module(DIT_CHOICES[args.dit]["loader"])
-        dit_model = mod.load_dit(args.dit_weights, T_lat=crop_len,
-                                 dtype=mx.float16, compile_=False)
-        cond_src = args.dit_weights
+        base_path = args.dit_weights
     else:
-        print("WARNING: training on the shipped (ARC/rf_denoiser) weights — "
-              "underfit convention is to train on the BASE checkpoint "
-              "(pass --dit-weights)")
-        dit_model, _ = load_dit(args.dit, T_lat=crop_len, dtype=mx.float16)
-        cond_src = str(ensure_local(DIT_CHOICES[args.dit]["ckpt"]))
+        base_path = str(ensure_local(f"models/mlx/dit_{args.dit}-base_f16.npz"))
+    mod = importlib.import_module(DIT_CHOICES[args.dit]["loader"])
+    dit_model = mod.load_dit(base_path, T_lat=crop_len, dtype=mx.float16,
+                             compile_=False)
+    cond_src = base_path
     print(f"DiT loaded ({time.time()-t0:.1f}s, fp16 base, T_lat={crop_len})")
     t5 = T5Gemma.from_npz(str(ensure_local(T5GEMMA_NPZ_REL)))  # frozen
     padding_emb, secs_embedder = load_conditioner_from_npz(cond_src, prefix="cond.")

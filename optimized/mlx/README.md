@@ -211,15 +211,15 @@ Each file becomes `<stem>.npy` latents `[D, T]` + a `<stem>.json` sidecar
 (duration, padding mask, tags) — the exact format underfit's dataset uses.
 Use `same-s` for sm-music/sm-sfx, `same-l` for medium.
 
-**2. Train.** Train on the **BASE** checkpoint (`stabilityai/stable-audio-3-*-base`),
-*not* the shipped ARC weights that inference uses — pass its MLX `.npz` via
-`--dit-weights` (base-ckpt→npz conversion recipe in `TRAINING_CONVENTIONS.md` §9;
-omitting it trains on ARC and prints a warning):
+**2. Train.** Training uses the **BASE** checkpoint (`stabilityai/stable-audio-3-*-base`,
+rectified_flow), *not* the shipped ARC weights inference uses. The base-model npz is
+**auto-downloaded** from HuggingFace on first run — no flag needed (override with
+`--dit-weights <path>`; regenerate one yourself from a `-base` repo with
+`scripts/export_base_npz.py`):
 
 ```bash
 uv run python scripts/lora_train_mlx.py \
-    --dit sm-music --dit-weights models/mlx/dit_sm-music-base_f16.npz \
-    --latents-dir ~/my-latents --lr 1e-4 --name my-lora \
+    --dit sm-music --latents-dir ~/my-latents --lr 1e-4 --name my-lora \
     --adapter-type dora-rows --rank 16 --max-steps 2000
 ```
 

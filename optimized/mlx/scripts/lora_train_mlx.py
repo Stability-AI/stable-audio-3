@@ -644,8 +644,11 @@ def main():
                 sigmas = demo.build_sigmas(steps)
                 noise = mx.random.normal((1, 256, T_lat), dtype=mx.float16,
                                          key=mx.random.key(seed))
+                print(f"  ▸ ARC demo {i}: {T_lat} latents (~{seconds_val:.0f}s audio), "
+                      f"{steps} steps", flush=True)
                 try:
-                    latent = demo.pingpong_sample(model_fn, noise, sigmas, seed=seed)
+                    latent = demo.pingpong_sample(model_fn, noise, sigmas, seed=seed,
+                                                  desc=f"ARC demo {i}")
                     audio = demo.decode_latents(decoder, chunk_fn, chunk_cfg,
                                                 latent, T_lat)
                     meta = {"prompt": prompt, "cfg": cfg, "seed": seed,
@@ -708,9 +711,11 @@ def main():
             elif strength is not None and float(strength) != 1.0:
                 snap = demo.snapshot_adapters(adapters)
                 demo.scale_adapters(snap, float(strength))
+            print(f"  ▸ demo {i}: {T_lat} latents (~{seconds_val:.0f}s audio), "
+                  f"{steps} steps", flush=True)
             try:
                 latent = demo.rf_euler_sample(model_fn, noise, sigmas,
-                                              before_step=before)
+                                              before_step=before, desc=f"demo {i}")
                 audio = demo.decode_latents(decoder, chunk_fn, chunk_cfg, latent, T_lat)
                 meta = {"prompt": prompt, "cfg": cfg, "seed": seed,
                         "steps": steps, "step": int(step)}

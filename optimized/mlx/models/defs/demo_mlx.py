@@ -25,9 +25,11 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 
 import mlx.core as mx
 import numpy as np
+from tqdm import tqdm
 
 from .sa3_pipeline import build_pingpong_schedule, patched_decode
 
@@ -75,14 +77,19 @@ def make_rf_model_fn(dit, cross_attn, global_cond, cfg=1.0,
     return model_fn
 
 
-def rf_euler_sample(model_fn, x, sigmas, before_step=None):
+def rf_euler_sample(model_fn, x, sigmas, before_step=None, desc=None):
     """Euler ODE integration of the RF velocity field: x_{i+1} = x_i + Δt·v.
 
     ``sigmas`` is (steps+1,) descending from σ_max to 0. ``before_step(i, σ)``,
     if given, runs right before each velocity eval (per-step LoRA gating).
+    ``desc``, if given, shows a tqdm step bar — a full-length demo is minutes of
+    generation on MLX, so the bar makes clear it's progressing, not hung.
     """
     num_steps = sigmas.shape[0] - 1
-    for i in range(num_steps):
+    steps = range(num_steps)
+    if desc is not None:
+        steps = tqdm(steps, desc=desc, file=sys.stdout, leave=False, mininterval=0.5)
+    for i in steps:
         t_curr = sigmas[i]
         t_next = sigmas[i + 1]
         if before_step is not None:
@@ -94,7 +101,7 @@ def rf_euler_sample(model_fn, x, sigmas, before_step=None):
     return x
 
 
-def pingpong_sample(model_fn, x, sigmas, seed=0, before_step=None):
+def pingpong_sample(model_fn, x, sigmas, seed=0, before_step=None, desc=None):
     """Ping-pong (rf_denoiser) sampler for ARC demos — the distilled 8-step
     re-noising integrator sa3_mlx ships (``sample_flow_pingpong``). Same
     ``model_fn(x, t)`` / ``x`` / ``sigmas`` interface as ``rf_euler_sample``.
@@ -104,9 +111,17 @@ def pingpong_sample(model_fn, x, sigmas, seed=0, before_step=None):
     in, so they use the pingpong sampler instead (matches underfit's ARC demo,
     which overrides diffusion_objective to rf_denoiser)."""
     from .sa3_pipeline import sample_flow_pingpong
-    return sample_flow_pingpong(model_fn, x, sigmas, seed=seed,
-                                before_step=(lambda i: before_step(i, float(sigmas[i])))
-                                if before_step is not None else None)
+    bar = (tqdm(total=int(sigmas.shape[0]) - 1, desc=desc, file=sys.stdout,
+                leave=False, mininterval=0.5) if desc is not None else None)
+    try:
+        return sample_flow_pingpong(
+            model_fn, x, sigmas, seed=seed,
+            before_step=(lambda i: before_step(i, float(sigmas[i])))
+            if before_step is not None else None,
+            on_step=((lambda *_: bar.update(1)) if bar is not None else None))
+    finally:
+        if bar is not None:
+            bar.close()
 
 
 # ── decode ─────────────────────────────────────────────────────────────────

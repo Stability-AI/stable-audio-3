@@ -265,6 +265,7 @@ def run(
     *,
     max_duration: float = 600.0,
     overwrite: bool = False,
+    exclude: set | None = None,
 ) -> dict:
     """Encode every audio file under ``audio_dir`` into ``output_dir``.
 
@@ -277,6 +278,8 @@ def run(
     audio_dir = Path(audio_dir).expanduser().resolve()
     output_dir = Path(output_dir).expanduser().resolve()
     files = find_audio_files(audio_dir)
+    if exclude:
+        files = [f for f in files if str(f.relative_to(audio_dir)) not in exclude]
     max_samples = max_samples_for_duration(max_duration)
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -384,6 +387,10 @@ def main():
         "--overwrite", action="store_true",
         help="Re-encode files whose outputs already exist",
     )
+    parser.add_argument(
+        "--exclude-file", type=str, default=None,
+        help="Text file of relpaths (one per line, relative to --audio-dir) to skip",
+    )
     args = parser.parse_args()
 
     audio_dir = Path(args.audio_dir).expanduser().resolve()
@@ -395,11 +402,23 @@ def main():
         print(f"No audio files found in {audio_dir}")
         sys.exit(1)
 
+    exclude = set()
+    if args.exclude_file and Path(args.exclude_file).is_file():
+        exclude = {ln.strip() for ln in Path(args.exclude_file).read_text().splitlines()
+                   if ln.strip()}
+    n_before = len(files)
+    if exclude:
+        files = [f for f in files if str(f.relative_to(audio_dir)) not in exclude]
+    if not files:
+        print(f"All {n_before} file(s) excluded by {args.exclude_file}")
+        sys.exit(1)
+
     max_samples = max_samples_for_duration(args.max_duration)
     import mlx.core as mx
     print(f"Engine: MLX  ·  device: {mx.default_device()}")
     print(f"Codec:  {args.codec} (pad_modulo={SAME_ENCODER_PAD_MODULO[args.codec]}, fp32)")
-    print(f"Input:  {audio_dir} ({len(files)} audio files)")
+    print(f"Input:  {audio_dir} ({len(files)} audio files"
+          + (f", {n_before - len(files)} excluded)" if exclude else ")"))
     print(f"Output: {Path(args.output_dir).expanduser().resolve()}")
     print(f"Max:    {max_samples / SAMPLE_RATE:.1f}s ({max_samples:,} samples)\n")
 
@@ -414,6 +433,7 @@ def main():
         encoder,
         max_duration=args.max_duration,
         overwrite=args.overwrite,
+        exclude=exclude,
     )
 
 

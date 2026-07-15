@@ -64,6 +64,7 @@ from functools import partial
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO = SCRIPTS_DIR.parent
@@ -73,6 +74,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 import mlx.core as mx  # noqa: E402
 import mlx.nn as nn  # noqa: E402
 import mlx.optimizers as optim  # noqa: E402
+from mlx.utils import tree_flatten  # noqa: E402
 
 from sa3_mlx import DIT_CHOICES, load_dit  # noqa: E402
 from weights import ensure_local  # noqa: E402
@@ -101,6 +103,14 @@ LATENT_CROP_DEFAULTS = {"sm-music": 1300, "sm-sfx": 1300, "medium": 4096}
 DIST_SHIFT_DEFAULT = {"shift_type": "full",
                       "options": {"min_length": 256, "max_length": 4096}}
 T5_CACHE_CAP = 512  # prompt-conditioning cache entries (oldest evicted first)
+
+
+def _rm(path):
+    """Remove a file, ignoring a missing one (temp-ckpt cleanup)."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def grad_checkpoint(layer):
@@ -202,6 +212,11 @@ def parse_args():
     ap.add_argument("--weight-decay", type=float, default=0.0,
                     help="AdamW decoupled weight decay (torch default 0.0; SA3 "
                          "templates use 0.01)")
+    ap.add_argument("--gradient-clip-val", type=float, default=0.0,
+                    help="Global grad-norm clip over the adapter params before "
+                         "the optimizer step (0 = off). underfit's dashboard "
+                         "passes 1.0; the grad_norm metric is then post-clip, "
+                         "matching underfit's torch loop.")
     # LR schedule (underfit's optimizer_configs.diffusion.scheduler; InverseLR
     # with warmup — at step 0 the SA3 template LR is ~5e-7, not the nominal lr)
     ap.add_argument("--lr-scheduler", default="none", choices=["none", "inverse"],
@@ -245,6 +260,12 @@ def parse_args():
     ap.add_argument("--demo-dir", default=None,
                     help="Where to write demo_<i>_<step>.mp3 (default: cwd, "
                          "which the dashboard sets to <run>/demos/).")
+    ap.add_argument("--arc-weights", default=None,
+                    help="DiT weights for ARC demos (entries with arc=true): the "
+                         "SHIPPED rf_denoiser npz, NOT the training base. Default "
+                         "auto-downloads models/mlx/dit_<dit>_f16.npz. The trained "
+                         "LoRA is merged into a fresh copy of these weights and "
+                         "sampled with the pingpong integrator.")
     return ap.parse_args()
 
 
@@ -352,6 +373,13 @@ def main():
     print(f"dataset: {len(dataset)} latent file(s), crop {crop_len} latents"
           + ("  (oversampling with replacement — tiny dataset)"
              if len(dataset) < args.batch_size else ""))
+    # Batches per epoch — mirrors iterate_batches: tiny sets (< batch) oversample
+    # to batch_size*100 draws (→ 100 batches); else ceil(n / batch). Used as the
+    # tqdm total so the progress bar (and the dashboard's collapse signature)
+    # matches underfit's torch dataloader.
+    _n_idx = (args.batch_size * 100 if len(dataset) < args.batch_size
+              else len(dataset))
+    steps_per_epoch = max(1, (_n_idx + args.batch_size - 1) // args.batch_size)
 
     # ── models ───────────────────────────────────────────────────────────────
     # LoRA training uses the BASE checkpoint (rectified_flow), NOT the shipped
@@ -478,13 +506,30 @@ def main():
     # state structure never changes (no recompile on step 2).
     optimizer.init(bundle.trainable_parameters())
     state = [bundle.state, optimizer.state, mx.random.state]
+    clip_val = float(args.gradient_clip_val or 0.0)
+
+    def _global_l2(tree):
+        """sqrt(Σ ‖leaf‖²) over a param/grad tree in fp32 — the single global L2
+        across all adapter leaves that underfit's _compute_grad_and_lora_norms
+        reports (loop.py:243)."""
+        total = mx.zeros((), dtype=mx.float32)
+        for _, v in tree_flatten(tree):
+            total = total + (v.astype(mx.float32) ** 2).sum()
+        return mx.sqrt(total)
 
     def train_step(latents, timesteps, loss_mask, prompt_cond, seconds_in,
                    drop):
         loss, grads = value_and_grad(bundle, latents, timesteps, loss_mask,
                                      prompt_cond, seconds_in, drop)
+        if clip_val > 0.0:
+            grads, _ = optim.clip_grad_norm(grads, clip_val)
+        # grad_norm on the POST-clip grads, lora_magnitude on the PRE-update
+        # params — the order + definition underfit's torch loop uses (clip →
+        # compute norms → optimizer.step, loop.py:628-637).
+        grad_norm = _global_l2(grads)
+        lora_mag = _global_l2(bundle.trainable_parameters())
         optimizer.update(bundle, grads)
-        return loss
+        return loss, grad_norm, lora_mag
 
     if args.compile:
         train_step = partial(mx.compile, inputs=state, outputs=state)(train_step)
@@ -512,20 +557,97 @@ def main():
     t5_cache = {} if args.t5_cache else None
     t5_stats = {"hits": 0, "misses": 0}
 
-    # ── demos (underfit RF path) ──────────────────────────────────────────────
-    # RF Euler inference on the base model + trained LoRA, decoded to mp3. Baseline
-    # at the start, then every --demo-every steps + a final render. Idempotent.
+    # ── demos (underfit RF + ARC paths) ──────────────────────────────────────
+    # RF/base entries: Euler inference on the BASE model + trained LoRA. ARC
+    # entries (arc=true): the trained LoRA merged into the SHIPPED rf_denoiser
+    # weights, sampled with the pingpong integrator — underfit's "train on base,
+    # demo on ARC" story (its torch loop swaps in the full ARC model; here we
+    # load the ARC npz with the LoRA merged at load). Both decode to mp3.
+    # Baseline at the start, then every --demo-every steps + a final render.
+    # Idempotent (a resume never re-renders an existing demo).
     demo_entries = None
     if args.demo_every > 0:
         if args.demo_config:
             demo_entries = json.loads(Path(args.demo_config).read_text())
-            print(f"demos: {len(demo_entries)} prompt(s) every {args.demo_every} "
+            n_arc = sum(1 for e in demo_entries if e.get("arc"))
+            print(f"demos: {len(demo_entries)} prompt(s) "
+                  f"({n_arc} ARC) every {args.demo_every} "
                   f"step(s) → {args.demo_dir or '.'}")
         else:
             print("WARNING: --demo-every set but no --demo-config — demos disabled")
     demo_dir = args.demo_dir or "."
     demo_decoder_name = args.demo_decoder or DIT_CHOICES[args.dit]["default_decoder"]
     _demo_dec = {}  # lazy: (decoder, chunk_fn, chunk_cfg)
+
+    def _demo_conditioning(prompt, seconds_val):
+        """cross_attn [1,257,768] fp16 + global_cond [1,768] fp16 for one demo
+        prompt. Model-independent (T5Gemma + the trained seconds conditioner),
+        so RF (base) and ARC demos share it."""
+        prompt_cond = build_conditioning(t5, padding_emb, [prompt],
+                                         cache=t5_cache, cache_stats=t5_stats)
+        if bundle.secs is not None:
+            sec_tok = bundle.secs(mx.array([seconds_val], dtype=mx.float32))
+        else:
+            sec_tok = secs_embedder([seconds_val])
+        sec_tok = mx.stop_gradient(sec_tok.astype(mx.float32))
+        cross = mx.concatenate([prompt_cond, sec_tok], axis=1).astype(mx.float16)
+        gcond = sec_tok[:, 0, :].astype(mx.float16)
+        return cross, gcond
+
+    def _run_arc_demos(step, arc_pending, decoder, chunk_fn, chunk_cfg,
+                       T_lat, seconds_val):
+        """Merge the trained LoRA into a fresh copy of the SHIPPED rf_denoiser
+        weights and sample with the pingpong integrator. Loaded once for the
+        whole ARC set, freed after (peak = base + ARC DiT during the demo)."""
+        arc_path = args.arc_weights or str(
+            ensure_local(f"models/mlx/dit_{args.dit}_f16.npz"))
+        tmp_ckpt = ckpt_dir / f".arc_demo_tmp_{step:08d}.safetensors"
+        save_lora_checkpoint(
+            bundle, tmp_ckpt, include=lora_config.get("include"),
+            exclude=lora_config.get("exclude"),
+            extra_config={"step": int(step), "base_model": base_model})
+        t_a = time.time()
+        try:
+            arc_dit = mod.load_dit(arc_path, T_lat=T_lat, dtype=mx.float16,
+                                   compile_=False, lora_paths=[str(tmp_ckpt)],
+                                   lora_strength=1.0, lora_log=lambda *a, **k: None)
+            print(f"  ARC model ({args.dit}) + LoRA merged "
+                  f"({time.time()-t_a:.1f}s)")
+        except Exception as e:
+            print(f"  ARC demos skipped: could not load "
+                  f"{Path(arc_path).name} with LoRA merged: {e}", flush=True)
+            _rm(tmp_ckpt)
+            return
+        try:
+            for i, entry in arc_pending:
+                prompt = entry.get("prompt", "")
+                cfg = float(entry.get("cfg", 1))
+                seed = int(entry.get("seed", 0))
+                steps = int(entry.get("steps", 8))
+                cross, gcond = _demo_conditioning(prompt, seconds_val)
+                null = mx.zeros_like(cross) if cfg != 1.0 else None
+                model_fn = demo.make_rf_model_fn(arc_dit, cross, gcond, cfg=cfg,
+                                                 null_cross_attn=null)
+                sigmas = demo.build_sigmas(steps)
+                noise = mx.random.normal((1, 256, T_lat), dtype=mx.float16,
+                                         key=mx.random.key(seed))
+                try:
+                    latent = demo.pingpong_sample(model_fn, noise, sigmas, seed=seed)
+                    audio = demo.decode_latents(decoder, chunk_fn, chunk_cfg,
+                                                latent, T_lat)
+                    meta = {"prompt": prompt, "cfg": cfg, "seed": seed,
+                            "steps": steps, "step": int(step), "arc": True}
+                    demo.save_demo_mp3(audio, i, step, demo.SAMPLE_RATE,
+                                       demo_dir, meta)
+                    print(f"  ♪ ARC demo {i} @ step {step}: {prompt[:44]!r} "
+                          f"→ demo_{i}_{step:08d}.mp3", flush=True)
+                except Exception as e:
+                    print(f"  ARC demo {i} failed: {e}", flush=True)
+        finally:
+            del arc_dit
+            if hasattr(mx, "clear_cache"):
+                mx.clear_cache()
+            _rm(tmp_ckpt)
 
     def run_demos(step):
         if not demo_entries:
@@ -545,22 +667,18 @@ def main():
         adapters = list(iter_trainable_lora_layers(bundle))
         T_lat = crop_len
         seconds_val = T_lat * demo.SAMPLES_PER_LATENT / demo.SAMPLE_RATE
-        for i, entry in pending:
+        rf_pending = [(i, e) for i, e in pending if not e.get("arc")]
+        arc_pending = [(i, e) for i, e in pending if e.get("arc")]
+
+        # ── RF/base demos (Euler on the base model + trained LoRA) ──
+        for i, entry in rf_pending:
             prompt = entry.get("prompt", "")
             cfg = float(entry.get("cfg", 7))
             seed = int(entry.get("seed", 0))
             steps = int(entry.get("steps", 50))
             strength = entry.get("lora_strength")
             interval = entry.get("lora_interval_max")
-            prompt_cond = build_conditioning(t5, padding_emb, [prompt],
-                                             cache=t5_cache, cache_stats=t5_stats)
-            if bundle.secs is not None:
-                sec_tok = bundle.secs(mx.array([seconds_val], dtype=mx.float32))
-            else:
-                sec_tok = secs_embedder([seconds_val])
-            sec_tok = mx.stop_gradient(sec_tok.astype(mx.float32))
-            cross = mx.concatenate([prompt_cond, sec_tok], axis=1).astype(mx.float16)
-            gcond = sec_tok[:, 0, :].astype(mx.float16)
+            cross, gcond = _demo_conditioning(prompt, seconds_val)
             null = mx.zeros_like(cross) if cfg != 1.0 else None
             model_fn = demo.make_rf_model_fn(bundle.dit, cross, gcond, cfg=cfg,
                                              null_cross_attn=null)
@@ -595,6 +713,12 @@ def main():
             finally:
                 if snap is not None:
                     demo.scale_adapters(snap, 1.0)  # restore trained factors
+
+        # ── ARC demos (pingpong on the shipped ARC weights + trained LoRA) ──
+        if arc_pending:
+            _run_arc_demos(step, arc_pending, decoder, chunk_fn, chunk_cfg,
+                           T_lat, seconds_val)
+
         if hasattr(mx, "clear_cache"):
             mx.clear_cache()
 
@@ -608,9 +732,18 @@ def main():
     run_demos(step_offset)  # baseline (untrained / resumed state)
     try:
         while raw_step < max_new_steps:
-            for batch in iterate_batches(dataset, args.batch_size,
-                                         shuffle=True,
-                                         seed=args.seed + epoch):
+            # tqdm per epoch — byte-identical to underfit's torch loop
+            # (loop.py:516) so the dashboard's progress collapse, history parser,
+            # and grad-norm / lora-magnitude charts work unchanged. desc
+            # "Step N, Epoch E"; postfix train/loss,lr,grad_norm,lora_magnitude.
+            pbar = tqdm(
+                iterate_batches(dataset, args.batch_size, shuffle=True,
+                                seed=args.seed + epoch),
+                total=steps_per_epoch,
+                desc=f"Step {raw_step + step_offset}, Epoch {epoch}",
+                mininterval=0, miniters=1, file=sys.stdout,
+            )
+            for batch in pbar:
                 if raw_step >= max_new_steps:
                     break
                 global_step = raw_step + step_offset + 1
@@ -661,11 +794,9 @@ def main():
                 if args.lr_scheduler != "none":
                     optimizer.learning_rate = lr_now
 
-                t_step = time.time()
-                loss = train_step(latents, timesteps, loss_mask, prompt_cond,
-                                  seconds_in, drop)
-                mx.eval(state, loss)
-                step_ms = (time.time() - t_step) * 1000.0
+                loss, grad_norm, lora_mag = train_step(
+                    latents, timesteps, loss_mask, prompt_cond, seconds_in, drop)
+                mx.eval(state, loss, grad_norm, lora_mag)
 
                 raw_step += 1
                 loss_v = float(loss)
@@ -673,17 +804,38 @@ def main():
                                        float(t_np.mean()), loss_v))
                 if raw_step % 10 == 0:
                     tele.flush()
-                rate = raw_step / max(time.time() - t_start, 1e-9)
-                print(f"step {global_step}  train/loss {loss_v:.6f}  "
-                      f"train/lr {lr_now:.3e}  epoch {epoch}  "
-                      f"({rate:.2f} it/s, {step_ms:.0f} ms)", flush=True)
 
-                if args.checkpoint_every > 0 and \
-                        global_step % args.checkpoint_every == 0:
-                    checkpoint(global_step, epoch)  # save BEFORE demos
-                    last_saved_step = global_step
-                if args.demo_every > 0 and global_step % args.demo_every == 0:
-                    run_demos(global_step)
+                # Metrics on the tqdm postfix — the dashboard parses
+                # train/loss=, train/lr=, train/grad_norm=, train/lora_magnitude=
+                # per step (server.py _HISTORY_RE/_LR_RE/_GN_RE/_LM_RE), and the
+                # "Step N," prefix gives it the authoritative global step.
+                pbar.set_postfix({
+                    "train/loss": f"{loss_v:.6f}",
+                    "train/lr": f"{lr_now:.3e}",
+                    "train/grad_norm": f"{float(grad_norm):.6f}",
+                    "train/lora_magnitude": f"{float(lora_mag):.6f}",
+                })
+                pbar.set_description(f"Step {global_step}, Epoch {epoch}")
+
+                save_now = (args.checkpoint_every > 0
+                            and global_step % args.checkpoint_every == 0)
+                demo_now = (args.demo_every > 0
+                            and global_step % args.demo_every == 0)
+                if save_now or demo_now:
+                    # Clear + disable the bar so checkpoint/demo prints land on
+                    # their own lines (matches the torch loop, loop.py:680).
+                    pbar.clear()
+                    pbar.disable = True
+                    try:
+                        if save_now:
+                            checkpoint(global_step, epoch)  # save BEFORE demos
+                            last_saved_step = global_step
+                        if demo_now:
+                            run_demos(global_step)
+                    finally:
+                        pbar.disable = False
+                        pbar.refresh()
+            pbar.close()
             epoch += 1
     except KeyboardInterrupt:
         print("\ninterrupted — saving final checkpoint")

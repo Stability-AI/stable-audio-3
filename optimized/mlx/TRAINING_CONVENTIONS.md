@@ -201,3 +201,27 @@ trainer — final agreement **loss 3.9829 vs 3.9823, prediction PSNR 80.7 dB**
 | peak memory | 3.67 GiB driver-allocated | (not instrumented; comparable class) |
 | loss regime | 1–43, spikes at low t | same (0.9–35, spikes at low t) |
 | checkpoint | underfit-valid, 423 keys | underfit-valid, identical key set |
+
+## 11. Dashboard integration (implements §6/§7 for the underfit dashboard)
+
+- **Progress output is byte-identical to underfit's torch loop** (loop.py:516):
+  one `tqdm` per epoch, `desc="Step N, Epoch E"`, `mininterval=0, miniters=1,
+  file=sys.stdout`, postfix `{train/loss:.6f, train/lr:.3e, train/grad_norm:.6f,
+  train/lora_magnitude:.6f}`. The dashboard collapses the progress bar on tqdm's
+  `\r` and parses those four keys per step (server.py `_HISTORY_RE`/`_LR_RE`/
+  `_GN_RE`/`_LM_RE`) — so `underfit.backends.mlx_engine.run_mlx_training` just
+  inherits stdout (no line translation, which would break `\r` and drop the
+  postfix). grad_norm/lora_magnitude are one global L2 over the adapter grads
+  (post-clip) / params (pre-update), matching `_compute_grad_and_lora_norms`.
+- **`--gradient-clip-val`** (dashboard passes 1.0) clips the global adapter-grad
+  norm via `mlx.optimizers.clip_grad_norm` before the step; grad_norm is reported
+  post-clip like torch. Default 0 = off.
+- **ARC demos** (entries `arc=true`): the trained LoRA is merged into a fresh copy
+  of the shipped rf_denoiser weights (`dit_<dit>_f16.npz`, auto-downloaded, or
+  `--arc-weights`) and sampled with the pingpong integrator — underfit's
+  train-on-base / demo-on-ARC story (its torch loop swaps the full ARC model in
+  place; the MLX path loads it with the LoRA merged at load, once per demo round,
+  freed after). The seconds conditioner is model-independent, so the trained
+  `bundle.secs` is reused for both RF and ARC conditioning. RF/base entries keep
+  the plain-Euler path. cfg/steps default to 1/8 for ARC, `demo_cfg_scales[0]`/
+  `demo_steps` for RF.

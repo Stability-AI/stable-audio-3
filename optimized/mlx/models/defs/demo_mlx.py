@@ -94,6 +94,21 @@ def rf_euler_sample(model_fn, x, sigmas, before_step=None):
     return x
 
 
+def pingpong_sample(model_fn, x, sigmas, seed=0, before_step=None):
+    """Ping-pong (rf_denoiser) sampler for ARC demos — the distilled 8-step
+    re-noising integrator sa3_mlx ships (``sample_flow_pingpong``). Same
+    ``model_fn(x, t)`` / ``x`` / ``sigmas`` interface as ``rf_euler_sample``.
+
+    Base demos integrate the rectified_flow BASE model with plain Euler; ARC
+    demos run the SHIPPED rf_denoiser (ARC) weights with the trained LoRA merged
+    in, so they use the pingpong sampler instead (matches underfit's ARC demo,
+    which overrides diffusion_objective to rf_denoiser)."""
+    from .sa3_pipeline import sample_flow_pingpong
+    return sample_flow_pingpong(model_fn, x, sigmas, seed=seed,
+                                before_step=(lambda i: before_step(i, float(sigmas[i])))
+                                if before_step is not None else None)
+
+
 # ── decode ─────────────────────────────────────────────────────────────────
 
 def decode_latents(decoder, chunk_fn, chunk_cfg, latents, T_lat):

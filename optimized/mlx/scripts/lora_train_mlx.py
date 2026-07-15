@@ -579,6 +579,18 @@ def main():
     demo_decoder_name = args.demo_decoder or DIT_CHOICES[args.dit]["default_decoder"]
     _demo_dec = {}  # lazy: (decoder, chunk_fn, chunk_cfg)
 
+    def _demo_T_lat(entry):
+        """Per-demo latent length. The dashboard sets `duration` (seconds) on a
+        demo entry only when it isn't at the crop length (see index.html
+        demo_cond serialization) — full-length demos carry it, crop-length ones
+        omit it. The DiT is length-agnostic (dit_mlx*), so one loaded model
+        serves both without reloading."""
+        dur = entry.get("duration")
+        if dur:
+            return max(2, int(round(float(dur) * demo.SAMPLE_RATE
+                                    / demo.SAMPLES_PER_LATENT)))
+        return crop_len
+
     def _demo_conditioning(prompt, seconds_val):
         """cross_attn [1,257,768] fp16 + global_cond [1,768] fp16 for one demo
         prompt. Model-independent (T5Gemma + the trained seconds conditioner),
@@ -594,11 +606,10 @@ def main():
         gcond = sec_tok[:, 0, :].astype(mx.float16)
         return cross, gcond
 
-    def _run_arc_demos(step, arc_pending, decoder, chunk_fn, chunk_cfg,
-                       T_lat, seconds_val):
+    def _run_arc_demos(step, arc_pending, decoder, chunk_fn, chunk_cfg):
         """Merge the trained LoRA into a fresh copy of the SHIPPED rf_denoiser
         weights and sample with the pingpong integrator. Loaded once for the
-        whole ARC set, freed after (peak = base + ARC DiT during the demo)."""
+        whole ARC set (length-agnostic), freed after (peak = base + ARC DiT)."""
         arc_path = args.arc_weights or str(
             ensure_local(f"models/mlx/dit_{args.dit}_f16.npz"))
         tmp_ckpt = ckpt_dir / f".arc_demo_tmp_{step:08d}.safetensors"
@@ -608,7 +619,7 @@ def main():
             extra_config={"step": int(step), "base_model": base_model})
         t_a = time.time()
         try:
-            arc_dit = mod.load_dit(arc_path, T_lat=T_lat, dtype=mx.float16,
+            arc_dit = mod.load_dit(arc_path, T_lat=crop_len, dtype=mx.float16,
                                    compile_=False, lora_paths=[str(tmp_ckpt)],
                                    lora_strength=1.0, lora_log=lambda *a, **k: None)
             print(f"  ARC model ({args.dit}) + LoRA merged "
@@ -624,6 +635,8 @@ def main():
                 cfg = float(entry.get("cfg", 1))
                 seed = int(entry.get("seed", 0))
                 steps = int(entry.get("steps", 8))
+                T_lat = _demo_T_lat(entry)
+                seconds_val = T_lat * demo.SAMPLES_PER_LATENT / demo.SAMPLE_RATE
                 cross, gcond = _demo_conditioning(prompt, seconds_val)
                 null = mx.zeros_like(cross) if cfg != 1.0 else None
                 model_fn = demo.make_rf_model_fn(arc_dit, cross, gcond, cfg=cfg,
@@ -665,8 +678,6 @@ def main():
             print(f"  demo decoder {demo_decoder_name} loaded ({time.time()-t_d:.1f}s)")
         decoder, chunk_fn, chunk_cfg = _demo_dec["dec"]
         adapters = list(iter_trainable_lora_layers(bundle))
-        T_lat = crop_len
-        seconds_val = T_lat * demo.SAMPLES_PER_LATENT / demo.SAMPLE_RATE
         rf_pending = [(i, e) for i, e in pending if not e.get("arc")]
         arc_pending = [(i, e) for i, e in pending if e.get("arc")]
 
@@ -678,6 +689,8 @@ def main():
             steps = int(entry.get("steps", 50))
             strength = entry.get("lora_strength")
             interval = entry.get("lora_interval_max")
+            T_lat = _demo_T_lat(entry)
+            seconds_val = T_lat * demo.SAMPLES_PER_LATENT / demo.SAMPLE_RATE
             cross, gcond = _demo_conditioning(prompt, seconds_val)
             null = mx.zeros_like(cross) if cfg != 1.0 else None
             model_fn = demo.make_rf_model_fn(bundle.dit, cross, gcond, cfg=cfg,
@@ -716,8 +729,7 @@ def main():
 
         # ── ARC demos (pingpong on the shipped ARC weights + trained LoRA) ──
         if arc_pending:
-            _run_arc_demos(step, arc_pending, decoder, chunk_fn, chunk_cfg,
-                           T_lat, seconds_val)
+            _run_arc_demos(step, arc_pending, decoder, chunk_fn, chunk_cfg)
 
         if hasattr(mx, "clear_cache"):
             mx.clear_cache()

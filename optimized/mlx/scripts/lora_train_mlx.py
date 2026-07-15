@@ -647,6 +647,7 @@ def main():
                 print(f"  ▸ ARC demo {i}: {T_lat} latents (~{seconds_val:.0f}s audio), "
                       f"{steps} steps", flush=True)
                 try:
+                    t_gen = time.time()
                     latent = demo.pingpong_sample(model_fn, noise, sigmas, seed=seed,
                                                   desc=f"ARC demo {i}")
                     audio = demo.decode_latents(decoder, chunk_fn, chunk_cfg,
@@ -656,7 +657,7 @@ def main():
                     demo.save_demo_mp3(audio, i, step, demo.SAMPLE_RATE,
                                        demo_dir, meta)
                     print(f"  ♪ ARC demo {i} @ step {step}: {prompt[:44]!r} "
-                          f"→ demo_{i}_{step:08d}.mp3", flush=True)
+                          f"→ demo_{i}_{step:08d}.mp3 ({time.time()-t_gen:.0f}s)", flush=True)
                 except Exception as e:
                     print(f"  ARC demo {i} failed: {e}", flush=True)
         finally:
@@ -714,6 +715,7 @@ def main():
             print(f"  ▸ demo {i}: {T_lat} latents (~{seconds_val:.0f}s audio), "
                   f"{steps} steps", flush=True)
             try:
+                t_gen = time.time()
                 latent = demo.rf_euler_sample(model_fn, noise, sigmas,
                                               before_step=before, desc=f"demo {i}")
                 audio = demo.decode_latents(decoder, chunk_fn, chunk_cfg, latent, T_lat)
@@ -725,7 +727,7 @@ def main():
                     meta["lora_interval_max"] = interval
                 demo.save_demo_mp3(audio, i, step, demo.SAMPLE_RATE, demo_dir, meta)
                 print(f"  ♪ demo {i} @ step {step}: {prompt[:48]!r} "
-                      f"→ demo_{i}_{step:08d}.mp3", flush=True)
+                      f"→ demo_{i}_{step:08d}.mp3 ({time.time()-t_gen:.0f}s)", flush=True)
             except Exception as e:
                 print(f"  demo {i} failed: {e}", flush=True)
             finally:

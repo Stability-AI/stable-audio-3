@@ -219,6 +219,35 @@ printed prominently as a `▸ saved` line at the end of each run.
 
 Use `--threads` to control the XNNPACK CPU thread count (default 8).
 
+## Web UI (gradio)
+
+A browser UI over the same TFLite backend — every generation mode plus a
+spectrogram player, a history panel, and playback options (auto-play, infinite
+radio with pre-generation, loop, hotswap, MP3/WAV save).
+
+```bash
+./sa3-gradio                       # sm-music, opens a public share link
+./sa3-gradio --dit medium          # start on the medium DiT
+./sa3-gradio --no-share            # local-only (http://localhost:7860)
+./sa3-gradio --port 7871           # pick the port
+```
+
+`./sa3-gradio` is a wrapper around `.venv/bin/python scripts/sa3_gradio.py`; on
+first run it offers to install the UI-only extras (`gradio`, `pillow`,
+`soundfile`) into `.venv`. In the browser:
+
+- **Precision** dropdown next to the model picker — `fp32` (default) / `w16a32`
+  / `w8a32` / `w8a8-dyn`, applied to the DiT + codec.
+- **LoRA** panel — upload a `.safetensors` adapter or pick one from
+  `loras/<model>/` (e.g. `loras/sa3-medium/`), set its strength, stack several;
+  settings are remembered per model. The panel is disabled under a quantized
+  precision (see the LoRA note above) and has no per-step range (frozen graph).
+- **Audio-to-audio / inpainting** — upload a reference clip; inpainting adds a
+  start/end range. Both are combinable.
+
+Generated WAV/MP3s land in `output/gradio/`. First use of a model/precision
+loads its weights (cached after).
+
 ### Without the wrapper
 
 ```bash
@@ -253,6 +282,8 @@ For sub-realtime latency on a supported device, prefer the GPU siblings:
 | `--cfg`               | 1.0      | Guidance scale; 1.0 = off, >1 toward prompt, <1 toward uncond. ≠1 runs cond+uncond each step |
 | `--apg`               | 1.0      | Adaptive Projected Guidance; only matters when `--cfg ≠ 1`            |
 | `--cfg-batched`       | on       | When `--cfg ≠ 1`, run cond+uncond as one batch=2 invoke on the variable-batch DiT (~7–29% faster on Apple-Silicon AMX). `--no-cfg-batched` → sequential batch=1 dual-pass. Bit-identical at `fp32`/`w8a32` — see [Precision variants](#precision-variants---precision) for `w16a32`/`w8a8-dyn` |
+| `--lora`              | —        | A `.safetensors` LoRA adapter (SA3-native/underfit or PEFT) merged into the DiT, optional `strength=S`; repeat to stack. Requires `--dit-precision fp32` or `w16a32`. See [LoRA](#lora) |
+| `--lora-strength`     | 1.0      | Default strength for `--lora` adapters without their own `strength=`  |
 | `--init-audio`        | —        | WAV (any format via ffmpeg) input for audio-to-audio / inpaint       |
 | `--init-noise-level`  | 1.0      | σmax; 0.4–0.8 typical for variation, 1.0 = full regen, >1 = overshoot |
 | `--inpaint-range`     | —        | `START,END` seconds; regenerate that span, keep the rest              |
@@ -265,6 +296,40 @@ All `.tflite` models are **fp32** except T5Gemma, which is **fp16** (numerically
 lossless there). There is no dtype knob: on CPU, int8/fp16 weights buy size, not
 speed (XNNPACK dequantizes to fp32 to matmul), and int8 costs quality on the DiT
 — so this release ships the fp32 graphs directly. (See "Notes on the design".)
+
+## LoRA
+
+Apply a LoRA finetune by merging it into the DiT's weight buffers at load —
+same adapters and semantics as the MLX backend's `--lora`:
+
+```bash
+# one adapter
+./sa3 --dit medium --decoder same-l --prompt "progressive metal" \
+      --lora plini-sa3-380.safetensors
+
+# per-adapter strength; stack several
+./sa3 --dit medium --decoder same-l --prompt "..." \
+      --lora a.safetensors strength=0.8 --lora b.safetensors strength=0.5
+```
+
+The adapter is a `.safetensors` file (SA3-native `train_lora.py` / underfit
+output, or a PEFT adapter directory) — pickle `.ckpt/.pt` is refused. All nine
+adapter types (lora, dora-rows/cols, bora, the four -xs) are supported; the base
+must match `--dit`. The merge is written into a cached copy of the DiT under
+`models/tflite/lora_cache/` (keyed by adapter + strength content hash) and reused
+on repeat runs, so the ~5–15 s patch cost is paid once. A medium fp32 cache entry
+is ~5.4 GB — delete `lora_cache/` to reclaim.
+
+Requires `--dit-precision fp32` (default) or `w16a32`. **LoRA on the quantized
+DiTs (`w8a32` / `w8a8-dyn` / `w4a32`) isn't figured out yet** — those store
+weights as GPTQ-calibrated int8, so merging would mean dequantize → add the LoRA
+delta → re-quantize, and a naive re-quant throws away the GPTQ error-feedback
+grid (you'd get a model that's both LoRA-adapted *and* degraded). Doing it well
+needs a GPTQ pass over the merged weights; until then `--lora` refuses quantized
+precisions (the CLI errors, the web UI disables the LoRA panel). Use fp32/w16a32
+for LoRA — on CPU fp32 is the fast-and-accurate choice anyway, so this is rarely
+a real constraint. **Per-step gating (`steps=`) is also MLX-only** — a frozen
+TFLite graph merges weights once at load; use `optimized/mlx` for step-gated LoRA.
 
 ## Files
 

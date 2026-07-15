@@ -407,11 +407,77 @@ def encoder_encode(runner: TRTRunner, audio: torch.Tensor) -> torch.Tensor:
 DEFAULT_ENCODER_CHUNK_LAT = 50    # safe length: cos ≥ 0.998 vs PT for both arches
 DEFAULT_ENCODER_OVERLAP_LAT = 8   # 4 latents trimmed from each interior edge
 
+# When the engine supports batching, use the batched path only past this many
+# chunks. Below it, the per-call warmup overhead exceeds the savings from
+# launching one big kernel. Crossover measured on H100 SAME-L: 8 chunks
+# (T_lat=322) → serial 162 ms vs batched 237 ms; 16 chunks (T_lat=645) →
+# 333 ms vs 348 ms (tied); 32 chunks → 679 ms vs 570 ms (batched 19% faster).
+BATCHED_ENCODER_MIN_CHUNKS = 16
+
+# Upper cap on chunks per batched encode_chunked call. Empirically: 98 chunks
+# (≈ T_lat 4095 ≈ 6:20 of audio) is reliable; 119 chunks (T_lat 5000) drops to
+# cos≈0.96 with min 0.73 on real music. BF16/FP16-mixed state drifts across
+# many super-batches in a content-dependent way. The serial chunked path holds
+# cos≥0.998 across the full T_lat range tested (up to 20 min), so fall back to
+# it past this threshold — slower, but accurate.
+BATCHED_ENCODER_MAX_CHUNKS = 100
+
+
+def _runner_max_batch(runner: TRTRunner) -> int:
+    """Highest batch size the engine's `audio` profile accepts (max across
+    profiles). Returns 1 if the engine is batch=1-only."""
+    eng = runner.engine
+    best = 1
+    for p in range(eng.num_optimization_profiles):
+        try:
+            _min, _opt, _max = eng.get_tensor_profile_shape("audio", p)
+            if _max[0] > best:
+                best = int(_max[0])
+        except Exception:
+            pass
+    return best
+
+
+def _runner_supports_batching(runner: TRTRunner) -> bool:
+    """True if the engine's optimization profile allows batch>1 for `audio`."""
+    return _runner_max_batch(runner) > 1
+
+
+def _runner_audio_samples_range(runner: TRTRunner) -> tuple[int, int]:
+    """Min/max audio length (samples in dim -1) the engine accepts, across
+    all optimization profiles. (min, max). Defaults to (0, 0) if unknown."""
+    eng = runner.engine
+    lo, hi = None, None
+    for p in range(eng.num_optimization_profiles):
+        try:
+            _min, _opt, _max = eng.get_tensor_profile_shape("audio", p)
+            lo = int(_min[-1]) if lo is None else min(lo, int(_min[-1]))
+            hi = int(_max[-1]) if hi is None else max(hi, int(_max[-1]))
+        except Exception:
+            pass
+    return (lo or 0, hi or 0)
+
+
+def _run_batched(runner: TRTRunner, audio_batch: torch.Tensor) -> torch.Tensor:
+    """Run a batched encoder call. audio_batch: (B, 2, chunk_lat*4096)."""
+    ctx = runner.context
+    in_dt = runner.in_dtype["audio"]
+    out_dt = runner.out_dtype["latent"]
+    a = audio_batch.to(in_dt).contiguous()
+    ctx.set_input_shape("audio", tuple(a.shape))
+    out_shape = tuple(ctx.get_tensor_shape("latent"))
+    out = torch.empty(out_shape, dtype=out_dt, device="cuda")
+    ctx.set_tensor_address("audio", a.data_ptr())
+    ctx.set_tensor_address("latent", out.data_ptr())
+    ctx.execute_async_v3(runner.stream.cuda_stream); runner.stream.synchronize()
+    return out.float()
+
 
 def encode_chunked(runner: TRTRunner, audio: torch.Tensor, *,
                     chunk_lat: int = DEFAULT_ENCODER_CHUNK_LAT,
                     overlap_lat: int = DEFAULT_ENCODER_OVERLAP_LAT,
-                    warmup_passes: int = 2) -> torch.Tensor:
+                    warmup_passes: int = 1,
+                    max_batch: int | None = None) -> torch.Tensor:
     """Chunked SAME-S/L encode. Equivalent to encoder_encode for short audio,
     but reliably accurate at any length.
 
@@ -420,6 +486,13 @@ def encode_chunked(runner: TRTRunner, audio: torch.Tensor, *,
     the encoders' BF16/FP16-mixed trunks don't always handle cleanly), and
     stitches the resulting latents by keeping the interior of each chunk.
 
+    If the engine supports batched audio inputs (built with a dynamic batch
+    dimension and an optimization profile max>1, e.g. enc_batched_chunk50.trt)
+    AND the number of chunks ≥ BATCHED_ENCODER_MIN_CHUNKS, all chunks are
+    stacked into one `execute_async_v3` call — meaningfully faster past ~120 s
+    of audio. For shorter inputs the per-call warmup overhead exceeds the
+    batch savings, so the serial path is used instead.
+
     Args:
       audio:        (1, 2, T_samples), T_samples must be a multiple of 4096.
       chunk_lat:    latents per chunk; default 50 (≈ 1.86 s) — verified to
@@ -427,7 +500,14 @@ def encode_chunked(runner: TRTRunner, audio: torch.Tensor, *,
       overlap_lat:  overlap between adjacent chunks; default 8 (4 latents
                     trimmed from each interior edge).
       warmup_passes: zero-audio calls at chunk_lat before the real chunks,
-                    to stabilise engine state. Default 2.
+                    to stabilise engine state across content/shape changes.
+                    Default 1; 0 is unreliable when audio content varies
+                    between calls.
+      max_batch:    chunks per execute call. Defaults to the engine's own
+                    optimization-profile max — so an engine built with
+                    max=64 automatically gets 64-wide super-batches without
+                    touching this code. Pass an int to override (will be
+                    clamped to the engine's max).
 
     Returns: (1, 256, T_lat) where T_lat = T_samples // 4096.
     """
@@ -435,18 +515,34 @@ def encode_chunked(runner: TRTRunner, audio: torch.Tensor, *,
     if audio.shape[-1] % SAMPLES_PER_LATENT_ != 0:
         raise ValueError(f"audio length {audio.shape[-1]} not divisible by {SAMPLES_PER_LATENT_}")
     T_lat = audio.shape[-1] // SAMPLES_PER_LATENT_
+
     if T_lat <= chunk_lat:
-        # Single shot — still warm the engine at this exact shape first
-        warm = torch.zeros_like(audio)
+        # Short-audio single-shot path.
+        #
+        # Pick the target audio length based on what the engine accepts:
+        #   - If the engine's audio profile covers T_lat * SAMPLES_PER_LATENT_
+        #     natively (e.g. the canonical serial engine with min_L=32 .. max_L=
+        #     4096), encode at exactly that shape — matches PT eager bit-for-bit
+        #     for T_lat in [audio_min/SPL, audio_max/SPL].
+        #   - Otherwise pad up to the engine's minimum supported length (e.g.
+        #     the batched engine is fixed at chunk_lat*SPL). The encoder is
+        #     context-sensitive: PT itself produces different first-latent
+        #     output when given padded vs. native-short audio (cos drops to
+        #     0.91 PT-vs-PT at T_lat=2). Replicate-padding preserves the
+        #     boundary statistics better than zeros.
+        samples = T_lat * SAMPLES_PER_LATENT_
+        audio_min, audio_max = _runner_audio_samples_range(runner)
+        if audio_min and samples >= audio_min and samples <= audio_max:
+            audio_in = audio
+        else:
+            pad_samples = max(audio_min, chunk_lat * SAMPLES_PER_LATENT_) - samples
+            audio_in = torch.nn.functional.pad(audio, (0, pad_samples), mode="replicate")
+        # Warm at this exact shape (engine state is call-history-sensitive).
+        warm = torch.zeros_like(audio_in)
         for _ in range(warmup_passes):
             _ = encoder_encode(runner, warm)
-        return encoder_encode(runner, audio)
-
-    # Pre-warm at chunk_lat (zero audio, same shape as real chunks)
-    warm = torch.zeros(1, 2, chunk_lat * SAMPLES_PER_LATENT_,
-                        device=audio.device, dtype=torch.float32)
-    for _ in range(warmup_passes):
-        _ = encoder_encode(runner, warm)
+        z = encoder_encode(runner, audio_in)
+        return z[..., :T_lat]
 
     # Chunk start positions; last chunk anchored to the end
     step = chunk_lat - overlap_lat
@@ -454,11 +550,63 @@ def encode_chunked(runner: TRTRunner, audio: torch.Tensor, *,
     if not starts or starts[-1] != T_lat - chunk_lat:
         starts.append(T_lat - chunk_lat)
 
+    # Resolve max_batch from the engine's optimization profile so different
+    # arch builds (sm_90/sm_100/sm_120) can each pick their own cap. Clamp a
+    # caller-supplied value to what the engine actually accepts.
+    engine_max = _runner_max_batch(runner)
+    if max_batch is None:
+        max_batch = engine_max
+    else:
+        max_batch = min(max_batch, engine_max)
+
+    # Use the batched path only in a sweet spot:
+    #   - enough chunks (>=MIN) to amortise the per-call warmup overhead, and
+    #   - not so many (<=MAX) that BF16/FP16-mixed state drift across many
+    #     super-batches kicks the cos down to ~0.94.
+    # Outside that range, fall back to chunk-by-chunk serial execute calls.
+    n_chunks = len(starts)
+    batched = (engine_max > 1
+               and BATCHED_ENCODER_MIN_CHUNKS <= n_chunks <= BATCHED_ENCODER_MAX_CHUNKS)
+
+    # Pre-warm at the fixed shape every real call uses. Batched engines always
+    # pad up to max_batch chunks, so every execute_async_v3 call sees
+    # (max_batch, 2, chunk_lat*S); serial engines see (1, 2, chunk_lat*S).
+    warm_batch = max_batch if batched else 1
+    warm_shape = (warm_batch, 2, chunk_lat * SAMPLES_PER_LATENT_)
+    warm = torch.zeros(*warm_shape, device=audio.device, dtype=torch.float32)
+    for _ in range(warmup_passes):
+        if batched:
+            _ = _run_batched(runner, warm)
+        else:
+            _ = encoder_encode(runner, warm[0:1])
+
     # Run all chunks (all same shape ⇒ stable engine state)
-    chunks = []
-    for s in starts:
-        chunk_audio = audio[..., s * SAMPLES_PER_LATENT_ : (s + chunk_lat) * SAMPLES_PER_LATENT_].contiguous()
-        chunks.append((s, encoder_encode(runner, chunk_audio)))
+    chunks: list = []
+    if batched:
+        # Stack chunks into (n, 2, chunk_lat*S). Pad up to max_batch with zero
+        # entries so every execute_async_v3 call uses exactly (max_batch, ...);
+        # this matches the warmup shape and keeps the engine state consistent.
+        stacked = torch.stack([
+            audio[0, :, s * SAMPLES_PER_LATENT_ : (s + chunk_lat) * SAMPLES_PER_LATENT_]
+            for s in starts
+        ], dim=0)
+        outs = []
+        for i in range(0, len(starts), max_batch):
+            batch = stacked[i : i + max_batch]
+            n_real = batch.shape[0]
+            if n_real < max_batch:
+                pad = torch.zeros(max_batch - n_real, 2, chunk_lat * SAMPLES_PER_LATENT_,
+                                   device=audio.device, dtype=batch.dtype)
+                batch = torch.cat([batch, pad], dim=0)
+            z = _run_batched(runner, batch)  # (max_batch, 256, chunk_lat)
+            outs.append(z[:n_real])           # drop padding rows
+        z_all = torch.cat(outs, dim=0)        # (len(starts), 256, chunk_lat)
+        for i, s in enumerate(starts):
+            chunks.append((s, z_all[i:i+1]))  # (1, 256, chunk_lat) each
+    else:
+        for s in starts:
+            chunk_audio = audio[..., s * SAMPLES_PER_LATENT_ : (s + chunk_lat) * SAMPLES_PER_LATENT_].contiguous()
+            chunks.append((s, encoder_encode(runner, chunk_audio)))
 
     # Stitch: take the interior of each chunk (first/last include their outer edge)
     out = torch.zeros(1, 256, T_lat, device=audio.device, dtype=torch.float32)

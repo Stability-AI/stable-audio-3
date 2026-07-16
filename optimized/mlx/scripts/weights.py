@@ -46,6 +46,15 @@ SHARED: list[tuple[str, str]] = [
     ("models/mlx/t5gemma_f16.npz", "MLX/t5gemma_f16.npz"),
 ]
 
+# Base-model DiT weights — needed only for LoRA *training* (lora_train_mlx.py
+# trains on the BASE checkpoint, not the ARC weights inference uses). Not part
+# of any install bundle; auto-downloaded lazily by the trainer via ensure_local.
+TRAINING_BASE: list[tuple[str, str]] = [
+    ("models/mlx/dit_sm-music-base_f16.npz", "MLX/dit_sm-music-base_f16.npz"),
+    ("models/mlx/dit_sm-sfx-base_f16.npz",   "MLX/dit_sm-sfx-base_f16.npz"),
+    ("models/mlx/dit_medium-base_f16.npz",   "MLX/dit_medium-base_f16.npz"),
+]
+
 # Human-friendly bundle sizes (for the install prompt).
 BUNDLE_SIZES = {
     "medium":   "5.9 GB  (medium DiT + SAME-L codec)",
@@ -60,6 +69,8 @@ for _items in DIT_BUNDLES.values():
     for _rel, _hf in _items:
         FLAT_MANIFEST[_rel] = _hf
 for _rel, _hf in SHARED:
+    FLAT_MANIFEST[_rel] = _hf
+for _rel, _hf in TRAINING_BASE:
     FLAT_MANIFEST[_rel] = _hf
 
 

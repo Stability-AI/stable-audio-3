@@ -779,7 +779,8 @@ def render_queue_status(entry=None, generating=False):
 
 # ── Gradio UI ──────────────────────────────────────────────────────────────
 def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
-             default_seconds: float, default_steps: int):
+             default_seconds: float, default_steps: int,
+             preload_loras: tuple = (), server_port: int | None = None):
     import gradio as gr
     import random as _random
 
@@ -1103,19 +1104,23 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                     _dd0 = _lora_dd_choices(initial_dit)
                     lora_inputs, lora_rows, lora_rm_btns = [], [], []
                     lora_dds, lora_files, lora_srows = [], [], []
+                    # --lora on the CLI preloads slot(s) 0..N: the trained ckpt
+                    # is active on launch (underfit's "load the LoRA by default").
                     for _i in range(1, 4):
-                        with gr.Group(visible=False) as _grp:
+                        _prel = preload_loras[_i - 1] if _i - 1 < len(preload_loras) else None
+                        with gr.Group(visible=_prel is not None) as _grp:
                             with gr.Row(equal_height=True):
                                 _lf = gr.File(label=f"LoRA {_i} (.safetensors)",
                                               file_types=[".safetensors"],
-                                              type="filepath", scale=1, height=88)
+                                              type="filepath", scale=1, height=88,
+                                              value=_prel)
                                 _ld = gr.Dropdown(
                                     label=f"…or pick from loras/{LORA_DIR_NAMES[initial_dit]}/",
                                     choices=_dd0, value=_DD_NONE, scale=1,
                                     visible=len(_dd0) > 1)
                                 _rm = gr.Button("✕", size="sm", scale=0,
                                                 min_width=36)
-                            with gr.Row(visible=False) as _srow:
+                            with gr.Row(visible=_prel is not None) as _srow:
                                 _ls = gr.Slider(label="strength", minimum=0.0,
                                                 maximum=10.0, value=1.0, step=0.1,
                                                 scale=2, min_width=110)
@@ -1133,7 +1138,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                         lora_srows.append(_srow)
                         lora_inputs += [_lf, _ld, _ls, _ln, _lx]
                     lora_add_btn = gr.Button("+ Add LoRA", size="sm")
-                    lora_vis = gr.State([False, False, False])
+                    lora_vis = gr.State([k < len(preload_loras) for k in range(3)])
                     # Per-model LoRA memory: switching DiT saves the outgoing
                     # model's slots and restores the incoming model's.
                     lora_mem = gr.State({})
@@ -1324,6 +1329,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         )
 
     demo.queue(max_size=16).launch(share=share, server_name="0.0.0.0",
+                                   server_port=server_port,
                                    allowed_paths=[str(OUTPUT_DIR)],
                                    prevent_thread_lock=False, show_error=True)
 
@@ -1340,17 +1346,27 @@ def main():
     ap.add_argument("--default-steps", type=int, default=8)
     ap.add_argument("--share", action=argparse.BooleanOptionalAction, default=True,
                     help="Create a public gradio.live URL (default on)")
+    ap.add_argument("--lora", action="append", default=None, metavar="PATH",
+                    help="Preload a LoRA .safetensors into a slot (active on "
+                         "launch). Repeatable for up to 3 slots. underfit uses "
+                         "this to open the gradio with a trained checkpoint loaded.")
+    ap.add_argument("--port", type=int, default=None,
+                    help="Server port (default: gradio picks 7860+).")
     args = ap.parse_args()
 
     if args.decoder is None:
         args.decoder = DEFAULT_DECODERS[args.dit]
+    preload = tuple(args.lora or ())[:3]
 
     print(f"\n━━━ SA3 MLX — gradio ━━━")
     print(f"  initial dit:     {args.dit}")
     print(f"  initial decoder: {args.decoder}")
     print(f"  models:          {', '.join(DIT_CHOICES.keys())}  (runtime-switchable)")
+    if preload:
+        print(f"  preloaded LoRA:  {', '.join(preload)}")
     build_ui(args.dit, args.decoder, share=args.share,
-             default_seconds=args.default_seconds, default_steps=args.default_steps)
+             default_seconds=args.default_seconds, default_steps=args.default_steps,
+             preload_loras=preload, server_port=args.port)
 
 
 if __name__ == "__main__":

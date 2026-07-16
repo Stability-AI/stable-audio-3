@@ -255,7 +255,9 @@ class DiT(nn.Module):
         x_pp = self.preprocess_conv(x_lc) + x_lc
 
         if local_add_cond is None:
-            local = mx.broadcast_to(self._local_zeros_1, (B, self.T_lat, LOCAL_ADD_COND_DIM))
+            # Zero local-add-cond at the INPUT length (not the baked self.T_lat),
+            # so one loaded model runs any sequence length (see dit_mlx_medium).
+            local = mx.zeros((B, x.shape[-1], LOCAL_ADD_COND_DIM))
         else:
             local = local_add_cond
         h = self.transformer(x_pp, context, global_embed, local)

@@ -338,7 +338,11 @@ class DiT(nn.Module):
         x_pp = self.preprocess_conv(x_lc) + x_lc
 
         if local_add_cond is None:
-            local = mx.broadcast_to(self._local_zeros_1, (B, self.T_lat, LOCAL_ADD_COND_DIM))
+            # Zero local-add-cond at the INPUT length (not the baked self.T_lat),
+            # so one loaded model runs any sequence length — text-to-audio
+            # inference always loads T_lat == the gen length (identical result),
+            # but training demos reuse the crop-length model for longer clips.
+            local = mx.zeros((B, x.shape[-1], LOCAL_ADD_COND_DIM))
         else:
             local = local_add_cond
 

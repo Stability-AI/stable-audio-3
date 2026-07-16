@@ -200,6 +200,14 @@ Apple-Silicon backend). Three steps: **pre-encode → train → generate**. See
 `TRAINING_CONVENTIONS.md` for the complete convention inventory and the
 torch(MPS)-vs-MLX forward+backward parity results.
 
+> **Want a UI instead of the CLI? Use [underfit](https://github.com/dada-bots/underfit).**
+> It's a full LoRA-training dashboard that drives *this* MLX trainer as its
+> Apple-Silicon backend — dataset scanning/encoding, live loss + loss-by-timestep
+> curves, demo MP3s with spectrograms, per-checkpoint gradio launch, and
+> one-click model downloads. On a Mac it's the recommended way to train; follow
+> underfit's *Apple-Silicon quickstart*. The commands below are the lower-level
+> path — good for scripting, CI, or headless runs.
+
 **1. Pre-encode** your audio to SAME latents (once, offline — torch-free):
 
 ```bash

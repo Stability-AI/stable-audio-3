@@ -248,11 +248,14 @@ Optimized inference runtimes are available under [optimized/](optimized) — pic
 | [optimized/tensorRT](optimized/tensorRT) | Linux + NVIDIA GPU | CUDA/TensorRT | `curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/tensorRT/bootstrap.sh \| bash` |
 
 
+Beyond inference, **[optimized/mlx](optimized/mlx)** and **[optimized/tflite](optimized/tflite)** each ship a **web UI** (`./sa3-gradio`), and **optimized/mlx** also does **LoRA training** on Apple Silicon (pure-MLX, no PyTorch) — see its [LoRA training](optimized/mlx/README.md#lora-training) section, or [underfit](https://github.com/dada-bots/underfit) for a full training dashboard built on it.
+
 ## Docs
 
 | Guide | Description |
 |-------|-------------|
 | [Inference Methods](docs/workflows/inference.md) | Overview of inference modes (text-to-audio, inpainting, etc.) |
+| [MLX LoRA training](optimized/mlx/README.md#lora-training) | Finetune on Apple Silicon (pure-MLX); powers underfit's Mac backend |
 | [LoRA Training](docs/workflows/lora.md) | Fine-tune with LoRA: setup, training loop, and checkpointing |
 | [Autoencoder Workflows](docs/workflows/autoencoder.md) | Encode and decode audio with the VAE directly |
 | [Prompting Guide](docs/guides/prompting.md) | Prompt and control signal reference |

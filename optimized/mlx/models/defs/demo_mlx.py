@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -146,34 +147,69 @@ def decode_latents(decoder, chunk_fn, chunk_cfg, latents, T_lat):
     return np.array(audio.astype(mx.float32))[0]
 
 
-def save_demo_mp3(audio_np, demo_index, step, sample_rate, out_dir, meta=None):
-    """Peak-normalized int16 → mp3 + json sidecar (underfit's on-disk demo format).
+# Warn once (not per demo) when ffmpeg is missing and we fall back to WAV.
+_WARNED_NO_FFMPEG = False
 
-    Atomic (temp wav → ffmpeg → rename); idempotent (skips if the mp3 exists).
+
+def save_demo_mp3(audio_np, demo_index, step, sample_rate, out_dir, meta=None):
+    """Peak-normalized int16 → mp3 (or WAV without ffmpeg) + json sidecar.
+
+    underfit's on-disk demo format. Atomic (temp file → rename); idempotent
+    (skips if the demo already exists, in either extension).
+
+    MP3 needs ffmpeg. If ffmpeg isn't on PATH we save a WAV instead so a
+    training run never crashes on the demo step — the dashboard plays WAV
+    fine, it's just larger on disk. A single warning is printed the first
+    time this happens.
     """
+    global _WARNED_NO_FFMPEG
     final_mp3 = os.path.join(out_dir, f"demo_{demo_index}_{step:08d}.mp3")
+    final_wav = os.path.join(out_dir, f"demo_{demo_index}_{step:08d}.wav")
+    # Idempotent: a resume never re-renders an existing demo (either format).
     if os.path.exists(final_mp3):
         return final_mp3
+    if os.path.exists(final_wav):
+        return final_wav
+
     peak = float(np.abs(audio_np).max())
     pcm = (audio_np / max(peak, 1e-8) * 32767.0).astype(np.int16)  # (2, T)
-    tmp_wav = os.path.join(out_dir, f".tmp_demo_{demo_index}_{step:08d}.wav")
-    tmp_mp3 = os.path.join(out_dir, f".tmp_demo_{demo_index}_{step:08d}.mp3")
-    import wave
-    with wave.open(tmp_wav, "wb") as w:
-        w.setnchannels(pcm.shape[0])
-        w.setsampwidth(2)
-        w.setframerate(sample_rate)
-        w.writeframes(pcm.T.tobytes())  # (T, C) interleaved
-    subprocess.run(
-        ["ffmpeg", "-i", tmp_wav, "-q:a", "0", "-y", tmp_mp3, "-loglevel", "error"],
-        check=True,
-    )
-    os.replace(tmp_mp3, final_mp3)
-    os.remove(tmp_wav)
+
+    def _write_wav(path):
+        import wave
+        with wave.open(path, "wb") as w:
+            w.setnchannels(pcm.shape[0])
+            w.setsampwidth(2)
+            w.setframerate(sample_rate)
+            w.writeframes(pcm.T.tobytes())  # (T, C) interleaved
+
+    if shutil.which("ffmpeg") is not None:
+        tmp_wav = os.path.join(out_dir, f".tmp_demo_{demo_index}_{step:08d}.wav")
+        tmp_mp3 = os.path.join(out_dir, f".tmp_demo_{demo_index}_{step:08d}.mp3")
+        _write_wav(tmp_wav)
+        subprocess.run(
+            ["ffmpeg", "-i", tmp_wav, "-q:a", "0", "-y", tmp_mp3, "-loglevel", "error"],
+            check=True,
+        )
+        os.replace(tmp_mp3, final_mp3)
+        os.remove(tmp_wav)
+        final = final_mp3
+    else:
+        if not _WARNED_NO_FFMPEG:
+            print(
+                "WARNING: ffmpeg not found — saving training demos as WAV instead of MP3.\n"
+                "         MP3 demos need ffmpeg; install it for smaller files: brew install ffmpeg",
+                file=sys.stderr, flush=True,
+            )
+            _WARNED_NO_FFMPEG = True
+        tmp_wav = os.path.join(out_dir, f".tmp_demo_{demo_index}_{step:08d}.wav")
+        _write_wav(tmp_wav)
+        os.replace(tmp_wav, final_wav)  # atomic
+        final = final_wav
+
     if meta is not None:
         with open(os.path.join(out_dir, f"demo_{demo_index}_{step:08d}.json"), "w") as f:
             json.dump(meta, f)
-    return final_mp3
+    return final
 
 
 # ── per-entry LoRA strength / σ-interval (scale lora_B pre-norm) ─────────────

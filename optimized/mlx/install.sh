@@ -113,6 +113,20 @@ fi
 step "Installing dependencies (uv pip install -r requirements.txt)"
 VIRTUAL_ENV="$VENV_DIR" uv pip install -r "$SCRIPT_DIR/requirements.txt"
 
+# ── ffmpeg (optional) ────────────────────────────────────────────────────────
+# Soft dependency: dataset decode already works via libsndfile (bundled with the
+# soundfile wheel just installed), and training demos fall back to WAV without
+# ffmpeg. It's only needed for compact MP3 demos + sa3_mlx.py's exotic-WAV
+# fallback path — so a missing ffmpeg is a warning, never a failure.
+step "Checking for ffmpeg (optional)"
+if command -v ffmpeg >/dev/null 2>&1; then
+    ok "ffmpeg found at $(command -v ffmpeg)"
+else
+    warn "ffmpeg not found — demos will save as WAV (larger); exotic-format audio"
+    warn "  loading is disabled. Install it (fast, prebuilt bottle on Apple Silicon):"
+    printf '    %sbrew install ffmpeg%s\n' "$BOLD" "$RESET" >&2
+fi
+
 # ── hand off to install.py ──────────────────────────────────────────────────
 # Any unrecognized args we collected (e.g. --download medium,sm-music) get
 # forwarded to install.py via EXTRA_ARGS.

@@ -393,7 +393,7 @@ class SA3Inference:
     DEFAULT_SIGMA_MAX = 1.0  # mega-graph path requires this
 
     def __init__(self, dit: str, decoder: str, *,
-                 precision: str = "fp16mixed",
+                 precision: str | None = None,
                  default_T_lat: int = 324, default_steps: int = 8,
                  default_seconds: float = 30.0,
                  models_dir: Path | None = None,
@@ -404,9 +404,13 @@ class SA3Inference:
         Args:
             dit:            one of DIT_CHOICES — "sm-music" / "sm-sfx" / "medium"
             decoder:        one of DECODER_PATHS — "same-s" / "same-l"
-            precision:      "fp16mixed" (default, fastest) or "fp32" (bit-equiv
-                            PyTorch eager, ~2× slower). Engines auto-download
-                            from HF if the requested precision file is missing.
+            precision:      None (default → per model: "bf16" for medium, else
+                            "fp16mixed"), or an explicit "bf16" (medium only;
+                            FMHA-fused, ~1.8-4.7× faster, within the perceptual
+                            floor, not seed-reproducible vs fp16mixed),
+                            "fp16mixed" (canonical, bit-reproducible), or "fp32"
+                            (bit-equiv PyTorch eager, ~2× slower). Engines auto-
+                            download from HF if the requested file is missing.
             default_T_lat:  latent length to build the initial graph at
             default_steps:  pingpong steps for the initial graph
             default_seconds: duration condition for the initial graph (used for
@@ -420,8 +424,15 @@ class SA3Inference:
             raise ValueError(f"unknown dit={dit!r}; valid: {list(DIT_CHOICES)}")
         if decoder not in DECODER_PATHS:
             raise ValueError(f"unknown decoder={decoder!r}; valid: {list(DECODER_PATHS)}")
+        # Resolve precision default per model: bf16 for medium (FMHA-fused speed
+        # default), fp16-mixed for sm-music/sm-sfx. bf16 is medium-only.
+        if precision is None:
+            precision = canon.default_precision(dit)
         if precision not in canon.PRECISIONS:
             raise ValueError(f"unknown precision={precision!r}; valid: {canon.PRECISIONS}")
+        if precision == "bf16" and dit != "medium":
+            raise ValueError("precision='bf16' is only available for dit='medium' "
+                             "(sm-music/sm-sfx already fuse in fp16mixed)")
 
         # Quiet: patch canon's stage/sub/_stage_vram to no-ops so loading
         # doesn't spam stdout (gradio in particular wants a clean log).
@@ -633,9 +644,12 @@ def main():
     ap.add_argument("--inpaint-range", default=None)
     ap.add_argument("--dit", choices=list(DIT_CHOICES.keys()), default=None)
     ap.add_argument("--decoder", choices=list(DECODER_PATHS.keys()), default=None)
-    ap.add_argument("--precision", choices=list(canon.PRECISIONS), default="fp16mixed",
-                    help="Engine precision: 'fp16mixed' (default, fast) or 'fp32' "
-                         "(bit-equiv PyTorch eager, slower). Auto-downloads from HF.")
+    ap.add_argument("--precision", choices=list(canon.PRECISIONS), default=None,
+                    help="DiT engine precision. Default resolves per model: 'bf16' for medium "
+                         "(FMHA-fused, ~1.8-4.7× faster, within perceptual floor; not "
+                         "seed-reproducible vs fp16mixed), 'fp16mixed' for sm-music/sm-sfx. "
+                         "'fp16mixed' = canonical/bit-reproducible. 'fp32' = bit-equiv PyTorch "
+                         "eager, slower. bf16 is medium-only. Auto-downloads from HF.")
     ap.add_argument("--models-dir", default=str(canon.MODELS_DIR))
     ap.add_argument("--seconds", type=float, default=30.0)
     ap.add_argument("--steps", type=int, default=8)

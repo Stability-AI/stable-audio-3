@@ -117,6 +117,35 @@ package install + a ~5 GB engine download).
 Omit `--dit` / `--decoder` for an interactive arrow-key picker. Relative
 `--out` paths land in `output/`; absolute paths are honoured as-is.
 
+### DiT precision (`--precision`)
+
+The default resolves per model — no flag needed for the recommended setup:
+
+| model            | default     | why                                                        |
+|------------------|-------------|------------------------------------------------------------|
+| `medium`         | `bf16`      | FMHA-fused (0 → 96 fused attention nodes) → **1.8× @256 / 4.7× @4096** vs fp16-mixed, within the perceptual floor |
+| `sm-music`/`sm-sfx` | `fp16mixed` | standard attention — already fuses in fp16-mixed           |
+
+`--precision` also takes `fp16mixed` and `fp32` explicitly:
+
+- **`bf16`** — *medium only.* Same `dit.onnx` as fp32, built with `BuilderFlag.BF16`;
+  bf16 carries fp32's range so the FP32-softmax islands vanish and TRT's FMHA fuser
+  fires. **Not seed-reproducible vs fp16-mixed** — the medium DiT uses *differential*
+  attention (cancellation-sensitive), so bf16 is a different-but-equal take per seed
+  (quality within the re-seed floor; exact samples differ). Same varlen profile
+  (L 1..4096, opt 1292) and full mode/feature set as the other precisions.
+- **`fp16mixed`** — canonical FP16 trunk + FP32 islands. Bit-reproducible; use it when
+  you need exact per-seed reproducibility or max per-step fidelity.
+- **`fp32`** — pure FP32, bit-equivalent to PyTorch eager (~2× slower, ~2× VRAM).
+
+```bash
+# medium defaults to bf16 (fast); force the reproducible engine instead:
+./sa3 --prompt "..." --dit medium --decoder same-l --precision fp16mixed
+```
+
+The TRT DiT engines are static batch=1 (the ONNX bakes batch=1), so CFG runs as a
+sequential cond+uncond dual-pass at batch=1 for every precision.
+
 ## Speed & memory
 
 Measured on **H100 SXM 80 GB** at `--steps 8` (rf-denoiser sweet spot).

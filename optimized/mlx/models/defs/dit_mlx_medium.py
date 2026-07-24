@@ -338,7 +338,11 @@ class DiT(nn.Module):
         x_pp = self.preprocess_conv(x_lc) + x_lc
 
         if local_add_cond is None:
-            local = mx.broadcast_to(self._local_zeros_1, (B, self.T_lat, LOCAL_ADD_COND_DIM))
+            # Zero local-add-cond at the INPUT length (not the baked self.T_lat),
+            # so one loaded model runs any sequence length — text-to-audio
+            # inference always loads T_lat == the gen length (identical result),
+            # but training demos reuse the crop-length model for longer clips.
+            local = mx.zeros((B, x.shape[-1], LOCAL_ADD_COND_DIM))
         else:
             local = local_add_cond
 
@@ -405,11 +409,22 @@ def convert_weights(safetensors_path, out_path=None):
     return out
 
 
-def load_dit(weights_path, T_lat=320, dtype=mx.float16, compile_=False):
+def load_dit(weights_path, T_lat=320, dtype=mx.float16, compile_=False,
+             lora_paths=None, lora_strength=1.0, lora_log=print,
+             lora_specs=None, num_steps=None):
     """Build MLX DiT and load weights.
 
     weights_path: either the .safetensors (we'll convert in-memory) or a
                   pre-converted .safetensors-mlx file.
+
+    lora_paths: optional list of LoRA adapters (.safetensors / PEFT dir) to merge
+      into the weights at load time. lora_strength scales every adapter's delta.
+      See models/defs/lora_merge.py.
+    lora_specs: optional list of parsed --lora specs (lora_merge.parse_lora_spec)
+      with per-adapter strength and step range; needs num_steps (the sampling
+      schedule length). Adapters gated to a sub-range of steps are managed by a
+      LoraStepPlan stashed on the returned model as ``model._lora_plan`` — wire
+      its ``.sync`` as the sampler's ``before_step``. Supersedes lora_paths.
     """
     weights_path = str(weights_path)
     if weights_path.endswith(".safetensors") and ("medium-ARC" in weights_path):
@@ -417,6 +432,15 @@ def load_dit(weights_path, T_lat=320, dtype=mx.float16, compile_=False):
         wd = convert_weights(weights_path, out_path=None)
     else:
         wd = dict(mx.load(weights_path))
+
+    plan = None
+    if lora_specs:
+        from .lora_merge import prepare_loras
+        plan = prepare_loras(wd, lora_specs, num_steps=num_steps, log=lora_log)
+    elif lora_paths:
+        from .lora_merge import merge_loras_into_weights
+        stats = merge_loras_into_weights(wd, lora_paths, strength=lora_strength, log=lora_log)
+        lora_log(f"lora: merged {stats['merged']} layer(s) from {stats['adapters']} adapter(s)")
 
     model = DiT(T_lat=T_lat)
 
@@ -429,6 +453,9 @@ def load_dit(weights_path, T_lat=320, dtype=mx.float16, compile_=False):
     del wd, wd_list
     import gc; gc.collect()
     mx.eval(model.parameters())
+    if plan is not None:
+        plan.attach(model)
+    model._lora_plan = plan
 
     if compile_:
         # Compile the model for graph fusion

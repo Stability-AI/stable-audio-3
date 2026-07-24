@@ -1,18 +1,28 @@
+from __future__ import annotations
+
 import re
 from pathlib import Path
 
 import pytest
-import torch
-import torchaudio
 
-from stable_audio_3 import AutoencoderModel, StableAudioModel
-from stable_audio_3.model_configs import ae_models, base_models
+try:  # torch is absent in the torch-free MLX venv; MLX-only tests don't need it
+    import torch
+    import torchaudio
+
+    from stable_audio_3 import AutoencoderModel, StableAudioModel
+    from stable_audio_3.model_configs import ae_models, base_models
+except ModuleNotFoundError:
+    torch = None
+    torchaudio = None
+    AutoencoderModel = StableAudioModel = None
+    ae_models = ()
+    base_models = ()
 
 # ---------------------------------------------------------------------------
 # Hardware detection — used by fixtures and tests to gate GPU-only paths
 # ---------------------------------------------------------------------------
-HAS_CUDA = torch.cuda.is_available()
-HAS_MPS = torch.backends.mps.is_available()
+HAS_CUDA = torch is not None and torch.cuda.is_available()
+HAS_MPS = torch is not None and torch.backends.mps.is_available()
 HAS_ACCEL = HAS_CUDA or HAS_MPS
 ACCEL_DEVICE = "cuda" if HAS_CUDA else ("mps" if HAS_MPS else "cpu")
 

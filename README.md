@@ -239,18 +239,28 @@ Run `stable-audio --help` for the full list of flags.
 ## Hardware Support
 Stable Audio 3 scales from a laptop to a GPU server.
 
-MLX and TensorRT available (experimental), check out the scripts and docs in [optimized/mlx](optimized/mlx) and [optimized/tensorRT](optimized/tensorRT).
+Optimized inference runtimes are available under [optimized/](optimized) — pick by platform:
 
+| Route | Platforms | Backend | One-liner |
+|---|---|---|---|
+| [optimized/tflite](optimized/tflite) | **macOS / Linux / Windows**, x86 & ARM | CPU (LiteRT/XNNPACK) | `curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/tflite/bootstrap.sh \| bash`<br>Windows: `irm https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/tflite/bootstrap.ps1 \| iex` <br>*(the curl\|bash line needs Git Bash or WSL on Windows — stock Windows has no bash)* |
+| [optimized/mlx](optimized/mlx) | Apple Silicon Macs | Metal GPU (MLX) | `curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/mlx/bootstrap.sh \| bash` |
+| [optimized/tensorRT](optimized/tensorRT) | Linux + NVIDIA GPU | CUDA/TensorRT | `curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/tensorRT/bootstrap.sh \| bash` |
+
+
+Beyond inference, **[optimized/mlx](optimized/mlx)** and **[optimized/tflite](optimized/tflite)** each ship a **web UI** (`./sa3-gradio`), and **optimized/mlx** also does **LoRA training** on Apple Silicon (pure-MLX, no PyTorch) — see its [LoRA training](optimized/mlx/README.md#lora-training) section, or [underfit](https://github.com/dada-bots/underfit) for a full training dashboard built on it.
 
 ## Docs
 
 | Guide | Description |
 |-------|-------------|
 | [Inference Methods](docs/workflows/inference.md) | Overview of inference modes (text-to-audio, inpainting, etc.) |
+| [MLX LoRA training](optimized/mlx/README.md#lora-training) | Finetune on Apple Silicon (pure-MLX); powers underfit's Mac backend |
 | [LoRA Training](docs/workflows/lora.md) | Fine-tune with LoRA: setup, training loop, and checkpointing |
 | [Autoencoder Workflows](docs/workflows/autoencoder.md) | Encode and decode audio with the VAE directly |
 | [Prompting Guide](docs/guides/prompting.md) | Prompt and control signal reference |
 | [Model Overview](docs/guides/model-overview.md) | Architecture and design overview |
+| [TFLite inference](optimized/tflite/README.md) | Portable CPU inference — macOS / Linux / Windows, x86 & ARM |
 | [MLX inference](optimized/mlx/README.md) | Optimized MLX inference for M-series Mac |
 | [TensorRT inference](optimized/tensorRT/README.md) | Optimized TensorRT inference for Nvidia GPUs |
 

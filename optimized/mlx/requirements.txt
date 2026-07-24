@@ -2,3 +2,7 @@ mlx>=0.30
 numpy>=1.24
 sentencepiece>=0.2
 huggingface_hub>=0.20
+# Dataset encode (pre_encode_mlx.py) decodes wav/flac/mp3/ogg via libsndfile.
+# The >=0.12 wheel BUNDLES libsndfile (macOS arm64 dylib), so no `brew install
+# libsndfile` is ever needed — installing this package is the whole fix.
+soundfile>=0.12

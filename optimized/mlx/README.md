@@ -94,6 +94,18 @@ Apple Silicon only (MLX is Metal-backed). Python 3.10+. `./install.sh
 ./sa3 --prompt "ambient drone" --cfg 3.0 --negative-prompt "drums, vocals" \
       --dit sm-music --decoder same-s --out drone.wav
 
+# Apply a LoRA finetune (merged into the DiT at load; base must match --dit)
+./sa3 --prompt "arabic maqam oud taqsim" --dit medium --decoder same-l \
+      --lora ./my_lora.safetensors --lora-strength 1.0 --out maqam.wav
+
+# Per-LoRA strength + sampling-step gating (skipping step 1 often helps).
+# steps= is 1-based inclusive: 2-8, 2- (2..last), -4 (1..4), 3 (just step 3).
+# Step-gated adapters are re-merged in place at the few step boundaries
+# (~80 ms each on medium) — no extra memory, every step runs at full speed.
+./sa3 --prompt "progressive metal instrumental" --dit medium --decoder same-l \
+      --lora plini.safetensors strength=0.8 steps=2- \
+      --lora rain_texture.safetensors steps=-4 --out prog.wav
+
 # Generate + play immediately (afplay; Ctrl-C stops both)
 ./sa3 --prompt "rainforest" --dit sm-sfx --decoder same-s --play
 
@@ -113,6 +125,24 @@ uv run python scripts/sa3_mlx.py --prompt "..." --dit medium --decoder same-l
 # or, after `source .venv/bin/activate`:
 python scripts/sa3_mlx.py --prompt "..." --dit medium --decoder same-l
 ```
+
+## Web UI (gradio)
+
+```bash
+./sa3-gradio                  # public gradio.live share link by default
+./sa3-gradio --no-share       # local-only (http://127.0.0.1:7860)
+./sa3-gradio --dit medium     # initial model (switchable in the UI)
+```
+
+Every generation mode is wired: text-to-audio, CFG 0–10 (0 = the negative prompt
+takes over, 0.5 = halfway between both prompts, >1 = extrapolate), audio-to-audio
+(guide audio + σmax slider), and inpainting (separate reference audio + start/end
+range sliders) — a2a and inpainting combine, so an inpainted span can regenerate
+from the guide audio instead of noise. Each clip renders with a 3-band tinted stereo mel
+spectrogram (bass=red / mid=green / high=blue). Models hot-swap from the
+dropdowns and cache in unified memory, so switching back is instant; WAVs land
+in `output/gradio/`. The UI needs two extra packages (`gradio`, `pillow`) —
+`./sa3-gradio` offers to install them into `.venv` on first run.
 
 ## Speed & memory
 
@@ -161,6 +191,78 @@ Sample run on **M4 Pro / 48 GB**:
 └───────────┴─────────┴─────────┴───────────┴───────────┴────────────┘
 ```
 
+## LoRA training
+
+Finetune SA3 on your own audio, entirely in MLX (no PyTorch) — a full training
+CLI that replicates [underfit](https://github.com/dada-bots/underfit)'s
+conventions, defaults, and checkpoint format (so it can run as underfit's
+Apple-Silicon backend). Three steps: **pre-encode → train → generate**. See
+`TRAINING_CONVENTIONS.md` for the complete convention inventory and the
+torch(MPS)-vs-MLX forward+backward parity results.
+
+> **Want a UI instead of the CLI? Use [underfit](https://github.com/dada-bots/underfit).**
+> It's a full LoRA-training dashboard that drives *this* MLX trainer as its
+> Apple-Silicon backend — dataset scanning/encoding, live loss + loss-by-timestep
+> curves, demo MP3s with spectrograms, per-checkpoint gradio launch, and
+> one-click model downloads. On a Mac it's the recommended way to train; follow
+> underfit's *Apple-Silicon quickstart*. The commands below are the lower-level
+> path — good for scripting, CI, or headless runs.
+
+**1. Pre-encode** your audio to SAME latents (once, offline — torch-free):
+
+```bash
+uv run python scripts/pre_encode_mlx.py \
+    --audio-dir ~/my-clips --output-dir ~/my-latents --codec same-s
+```
+
+Each file becomes `<stem>.npy` latents `[D, T]` + a `<stem>.json` sidecar
+(duration, padding mask, tags) — the exact format underfit's dataset uses.
+Use `same-s` for sm-music/sm-sfx, `same-l` for medium.
+
+**2. Train.** Training uses the **BASE** checkpoint (`stabilityai/stable-audio-3-*-base`,
+rectified_flow), *not* the shipped ARC weights inference uses. The base-model npz is
+**auto-downloaded** from HuggingFace on first run — no flag needed (override with
+`--dit-weights <path>`; regenerate one yourself from a `-base` repo with
+`scripts/export_base_npz.py`):
+
+```bash
+uv run python scripts/lora_train_mlx.py \
+    --dit sm-music --latents-dir ~/my-latents --lr 1e-4 --name my-lora \
+    --adapter-type dora-rows --rank 16 --max-steps 2000
+```
+
+Defaults mirror underfit (dora-rows / rank 16, AdamW, uniform sampler + the
+"full" distribution shift, CFG-dropout 0.1, signal-only masked rectified-flow
+loss, checkpoint every 1000 steps). To match the full dashboard template config,
+add `--timestep-sampler trunc_logit_normal --use-effective-length --beta2 0.95
+--weight-decay 0.01 --lr-scheduler inverse --lr-warmup 0.995`. Checkpoints land at
+`output/runs/<name>/<uuid>/checkpoints/<name>-step=S-epoch=E.safetensors` with
+`lora_config` metadata; resume with `--lora-ckpt-path <ckpt>`.
+
+Optional training-time demos (RF-Euler inference → mp3, underfit's on-disk
+format): `--demo-every 1000 --demo-config demos.json`, where `demos.json` is a
+list of `{"prompt", "cfg", "seed", "steps", "lora_strength"?, "lora_interval_max"?}`.
+
+**3. Generate** with your adapter — the checkpoint applies to the shipped ARC
+model at inference via `--lora` (see "Apply a LoRA finetune" above; also
+`scripts/sa3_gradio.py --lora <ckpt>` to open the web UI with it preloaded):
+
+```bash
+./sa3 --dit sm-music --decoder same-s --prompt "..." --out finetuned.wav \
+      --lora "output/runs/my-lora/"*"/checkpoints/my-lora-step=2000-epoch="*.safetensors
+```
+
+### Building your own loop
+
+The CLI is assembled from reusable pieces: `inject_trainable_lora` /
+`save_lora_checkpoint` / `apply_lora_checkpoint` (`models/defs/lora.py` — all 9
+LoRA/DoRA/BoRA/-XS types with the no-weight-materialization forward), the RF
+loss + samplers + distribution shift (`models/defs/training.py`), the
+pre-encoded dataset + prompt templates (`models/defs/latent_dataset.py`), and
+`encode_audio` (`models/defs/audio_encoding.py`). Checkpoints use the same
+safetensors keys + `lora_config` metadata as the PyTorch trainer, so adapters
+are interchangeable in either direction.
+
 ## Flag reference
 
 | Flag                  | Default  | Notes                                                                 |
@@ -178,6 +280,8 @@ Sample run on **M4 Pro / 48 GB**:
 | `--init-noise-level`  | 1.0      | σmax; 0.4–0.8 typical for variation, 1.0 = full regen, >1 = overshoot |
 | `--inpaint-range`     | —        | `START,END` seconds; regenerate that span, keep the rest              |
 | `--dit-dtype`         | fp16     | DiT compute dtype (decoder always FP32; T5Gemma always fp16)          |
+| `--lora`              | —        | A `.safetensors` LoRA adapter (SA3-native/underfit or PEFT) with optional `strength=S` and `steps=MIN-MAX` tokens; repeat the flag to stack adapters. Full-range adapters merge at load; step-gated ones re-merge in place at step boundaries. Pickle `.ckpt/.pt` is refused. Base must match `--dit` |
+| `--lora-strength`     | 1.0      | Default strength for adapters without their own `strength=`; 0 = bit-exact bypass, >1 amplifies |
 | `--free-models`       | on       | Progressive model freeing; `--no-free-models` keeps them resident     |
 | `--out`               | out.wav  | Relative → `output/<file>`; absolute → as-is. 16-bit PCM stereo @ 44.1 kHz, trimmed to exactly `--seconds` |
 | `--play`              | off      | After writing, play via `afplay`; Ctrl-C stops both processes         |
@@ -189,6 +293,7 @@ sa3_mlx/
 ├── sa3                            ← shell wrapper (use this)
 ├── install.sh                     ← uv bootstrap (run once)
 ├── README.md
+├── TRAINING_CONVENTIONS.md         ← LoRA-training conventions + MPS-vs-MLX parity
 ├── requirements.txt
 ├── output/                        ← default landing zone for generated WAVs
 ├── scripts/
@@ -197,7 +302,12 @@ sa3_mlx/
 │   ├── examples.py                ← shared examples block (--help + post-install)
 │   ├── install.py                 ← install.sh's Python half (bundle picker)
 │   ├── test_all_configs.py        ← npz + CLI config sanity tests
-│   └── benchmark.py               ← wall-time + peak-RAM matrix across model × duration
+│   ├── benchmark.py               ← wall-time + peak-RAM matrix across model × duration
+│   ├── lora_train_mlx.py          ← LoRA training CLI (underfit conventions)
+│   ├── pre_encode_mlx.py          ← audio → SAME-latent pre-encode (torch-free)
+│   ├── sa3_gradio.py              ← web UI (invoked by ./sa3-gradio; --lora preload)
+│   ├── test_lora_merge.py         ← adapter-math tests (weight-free; run in CI)
+│   └── parity_forward_{torch,mlx}.py  ← torch(MPS)-vs-MLX fwd+bwd parity harness
 └── models/
     ├── defs/
     │   ├── sa3_pipeline.py        ← sampler + conditioner + unpatch
@@ -205,7 +315,13 @@ sa3_mlx/
     │   ├── dit_mlx.py             ← small DiT (sm-music + sm-sfx)
     │   ├── dit_mlx_medium.py      ← medium DiT (differential attention)
     │   ├── same_s_{encoder,decoder}.py    ← small codec
-    │   └── same_l_{encoder,decoder}.py    ← large codec
+    │   ├── same_l_{encoder,decoder}.py    ← large codec
+    │   ├── lora.py                ← trainable LoRA/DoRA/BoRA adapters (9 types)
+    │   ├── lora_merge.py          ← inference-time LoRA merge + per-step gating
+    │   ├── training.py            ← RF loss + timestep samplers + distribution shift
+    │   ├── latent_dataset.py      ← pre-encoded dataset + underfit prompt templates
+    │   ├── audio_encoding.py      ← waveform → SAME latents (pre-encode bridge)
+    │   └── demo_mlx.py            ← training-time RF-Euler demos → mp3
     └── mlx/                       ← .npz weights (auto-downloaded; ~8.4 GB total)
         ├── t5gemma_f16.npz                541 MB    text encoder + tokenizer
         ├── dit_sm-music_f16.npz           877 MB    DiT + conditioner baked in

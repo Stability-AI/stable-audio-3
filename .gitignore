@@ -169,3 +169,5 @@ wandb/*
 .DS_Store
 *.safetensors
 .claude
+# LoRA-merged DiT cache (patched copies; regenerated on demand)
+optimized/tflite/models/tflite/lora_cache/

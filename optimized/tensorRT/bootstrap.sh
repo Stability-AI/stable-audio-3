@@ -46,7 +46,14 @@ warn() { printf '%swarning%s: %s\n' "$YELLOW" "$RESET" "$1" >&2; }
 # ── 1. platform sanity ──────────────────────────────────────────────────────
 OS="$(uname -s)"; ARCH="$(uname -m)"
 if [[ "$OS" != "Linux" ]]; then
-    fail "this stack is Linux-only (TensorRT requires NVIDIA's Linux CUDA toolchain). Detected $OS/$ARCH."
+    printf '\n%serror%s: this stack is Linux-only (TensorRT requires the NVIDIA Linux CUDA toolchain). Detected %s/%s.\n' "$RED" "$RESET" "$OS" "$ARCH" >&2
+    printf '\n  For your platform use one of the other optimized routes:\n' >&2
+    printf '    CPU (macOS/Linux/Windows, x86/ARM):\n' >&2
+    printf '      curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/tflite/bootstrap.sh | bash\n' >&2
+    printf '      (Windows: irm https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/tflite/bootstrap.ps1 | iex)\n' >&2
+    printf '    Apple Silicon GPU (fastest on Mac):\n' >&2
+    printf '      curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/mlx/bootstrap.sh | bash\n' >&2
+    exit 1
 fi
 if [[ "$ARCH" != "x86_64" && "$ARCH" != "aarch64" ]]; then
     warn "untested architecture $ARCH — TensorRT typically supports x86_64 and aarch64."

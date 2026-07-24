@@ -1,0 +1,21 @@
+# Model weights — pulled from HuggingFace, never committed here.
+# (The SentencePiece tokenizer at models/tokenizer.model IS committed — it's
+#  small and the .tflite T5Gemma is encoder-only.)
+*.tflite
+
+# Generated audio — anywhere on the tree, including output/.
+*.wav
+*.mp3
+output/
+
+# LoRA adapter library (user .safetensors, scanned by the gradio dropdown) and
+# the LoRA-merged DiT cache (patched multi-GB copies, regenerated on demand).
+loras/
+lora_cache/
+
+# Python virtualenv created by install.sh
+.venv/
+
+# Python bytecode caches
+__pycache__/
+*.pyc

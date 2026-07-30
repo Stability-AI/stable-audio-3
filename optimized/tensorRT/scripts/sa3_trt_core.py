@@ -617,9 +617,22 @@ class DiTRunner:
         ctx.set_tensor_address("seconds_total",  self._sec_buf.data_ptr())
         ctx.set_tensor_address("local_add_cond", local_add_cond.float().contiguous().data_ptr())
         ctx.set_tensor_address("velocity",       self._vel_buf.data_ptr())
-        ctx.execute_async_v3(self.runner.stream.cuda_stream)
+        if not ctx.execute_async_v3(self.runner.stream.cuda_stream):
+            raise RuntimeError(
+                f"DiT execute_async_v3 failed (L={L}). A failed enqueue otherwise "
+                f"returns the previous buffer contents as if it had succeeded.")
         self.runner.stream.synchronize()
-        return self._vel_buf.float()
+        # .clone(), NOT .float(): _vel_buf is already FP32, so .float() is a no-op
+        # that hands back the SAME tensor every call. Any caller holding two
+        # results at once then sees one aliased buffer — which silently turned CFG
+        # into a no-op, because
+        #     v_cond   = dit.step(..., embeds,      ...)
+        #     v_uncond = dit.step(..., null_embeds, ...)
+        # left v_cond pointing at the unconditional velocity, so the guided render
+        # followed the NEGATIVE prompt. Returning a copy is the contract callers
+        # already assume. (The graph-capture path is unaffected: it reads
+        # _out_buf under an explicit capture protocol.)
+        return self._vel_buf.clone()
 
     def bind_persistent(self, L: int):
         """Allocate persistent input buffers + bind tensor addresses once.

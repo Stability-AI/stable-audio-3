@@ -119,28 +119,40 @@ Omit `--dit` / `--decoder` for an interactive arrow-key picker. Relative
 
 ### DiT precision (`--precision`)
 
-The default resolves per model — no flag needed for the recommended setup:
+`fp16mixed` is the default for every model — no flag needed for the recommended setup:
 
 | model            | default     | why                                                        |
 |------------------|-------------|------------------------------------------------------------|
-| `medium`         | `bf16`      | FMHA-fused (0 → 96 fused attention nodes) → **1.8× @256 / 4.7× @4096** vs fp16-mixed, within the perceptual floor |
+| `medium`         | `fp16mixed` | FMHA-fused (96 fused attention nodes) **and** fp32-accurate at every length |
 | `sm-music`/`sm-sfx` | `fp16mixed` | standard attention — already fuses in fp16-mixed           |
 
-`--precision` also takes `fp16mixed` and `fp32` explicitly:
+`--precision` also takes `bf16` (medium only) and `fp32` explicitly:
 
+- **`fp16mixed`** — canonical: FP16 trunk, FP32 islands around RMSNorm and RoPE
+  generation, and an FP16 attention core (QK^T → Softmax → P·V) so TRT's FMHA fuser
+  fires. Teacher-forced velocity cos **1.0000** vs the FP32 engine at every length.
+  Bit-reproducible run to run.
+  <br>Medium used to default to `bf16` because this engine's attention core was
+  stuck in FP32 and therefore unfused — 0 fused MHA nodes. Bounding the RoPE island
+  before QK^T fixed that (**4.3× faster at L=4096**), which retired the reason to
+  prefer `bf16`. Engines built before 2026-07 are the slow variant; rebuild with
+  `build_from_onnx.py sa3-m`.
 - **`bf16`** — *medium only.* Same `dit.onnx` as fp32, built with `BuilderFlag.BF16`;
-  bf16 carries fp32's range so the FP32-softmax islands vanish and TRT's FMHA fuser
-  fires. **Not seed-reproducible vs fp16-mixed** — the medium DiT uses *differential*
-  attention (cancellation-sensitive), so bf16 is a different-but-equal take per seed
-  (quality within the re-seed floor; exact samples differ). Same varlen profile
+  a uniform bf16 trunk also lets the FMHA fuser fire, and it is ~3% faster than
+  `fp16mixed`. **But it drifts at long sequence**: weakly-typed BF16 lets TRT
+  evaluate RoPE's rotation angle in bf16, and that angle reaches ~4155 rad at
+  L=4092 where bf16's spacing is 32 rad (bigger than a full 2π rotation), so
+  position information for the fast-rotating dims is destroyed. The latent inflates
+  ~2.5× over the 8 steps and a 6-minute render clips 2–3% of samples. Clean at short
+  lengths; use `fp16mixed` for anything long. Also **not seed-reproducible vs
+  fp16-mixed** — a different-but-equal take per seed. Same varlen profile
   (L 1..4096, opt 1292) and full mode/feature set as the other precisions.
-- **`fp16mixed`** — canonical FP16 trunk + FP32 islands. Bit-reproducible; use it when
-  you need exact per-seed reproducibility or max per-step fidelity.
 - **`fp32`** — pure FP32, bit-equivalent to PyTorch eager (~2× slower, ~2× VRAM).
 
 ```bash
-# medium defaults to bf16 (fast); force the reproducible engine instead:
-./sa3 --prompt "..." --dit medium --decoder same-l --precision fp16mixed
+# medium defaults to fp16mixed; the last ~3% of speed, at the cost of long-seq
+# accuracy, is opt-in:
+./sa3 --prompt "..." --dit medium --decoder same-l --precision bf16
 ```
 
 The TRT DiT engines are static batch=1 (the ONNX bakes batch=1), so CFG runs as a
@@ -165,7 +177,7 @@ variance once the graph is built).
 
 ```bash
 .venv/bin/python scripts/bench_dit_profile.py \
-    --engines "canonical=models/sm_90/sa3-sm-music/dit_bf16.trt" \
+    --engines "canonical=models/sm_90/sa3-sm-music/dit_fp16mixed.trt" \
     --lvals 1,32,128,256,512,1024,1292,2048,4096 --warmup 3 --runs 7
 ```
 
@@ -216,9 +228,9 @@ optimized/tensorRT/
 └── models/                      ← .trt engines (auto-downloaded per arch; ~8 GB)
     └── sm_<cc>/                 ← arch dir matches `nvidia-smi --query-gpu=compute_cap`
         ├── t5gemma/t5gemma_fp16mixed.trt
-        ├── sa3-sm-music/dit_bf16.trt
-        ├── sa3-sm-sfx/dit_bf16.trt
-        ├── sa3-m/dit_bf16.trt
+        ├── sa3-sm-music/dit_fp16mixed.trt
+        ├── sa3-sm-sfx/dit_fp16mixed.trt
+        ├── sa3-m/dit_fp16mixed.trt      ← + dit_bf16.trt / dit_fp32.trt if selected
         ├── same-s/{enc,dec}_dynamic_bf16.trt
         └── same-l/{enc,dec}_dynamic_triton_swa.trt
 ```
@@ -243,7 +255,8 @@ invocation per sampling step handles everything.
   specific cross-attention output token collapsed in magnitude.
 - **PCM-baked SAME-S decoder**: the int16 narrow + transpose are folded
   into the decoder engine itself; saves ~3 ms of post-decode CPU work.
-- **Mixed precision**: DiT runs BF16, decoder int32→int16, T5Gemma
+- **Mixed precision**: DiT runs FP16-mixed (FP16 trunk + FP32 RMSNorm/RoPE
+  islands + FMHA-fused FP16 attention core), decoder int32→int16, T5Gemma
   FP16-mixed. `--quiet` skips per-stage NVML probes for an extra ~4 ms.
 - **Auto-download**: missing engines are pulled from
   `stabilityai/stable-audio-3-optimized/tensorRT/sm_<cc>/` on first use.

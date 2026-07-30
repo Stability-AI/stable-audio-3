@@ -24,7 +24,7 @@ HuggingFace                    onnx/<engine>/  ←─────── publish 
                              no graphsurgeon)            build_same_*.py)
 ```
 
-The SA3 DiT ships both an FP32 canonical `dit.onnx` (regenerable from PyTorch source) and a pre-processed `dit_fp16mixed.onnx` (canonical + FP32 islands around RMSNorm / Softmax / RoPE, rest converted to FP16). Consumers use the pre-processed one; producers refresh both when the model retrains.
+The SA3 DiT ships both an FP32 canonical `dit.onnx` (regenerable from PyTorch source) and a pre-processed `dit_fp16mixed.onnx` (canonical + FP32 islands around RMSNorm and RoPE *generation*, FP16 attention core, rest converted to FP16). Consumers use the pre-processed one; producers refresh both when the model retrains.
 
 ## Consumer flow (default)
 
@@ -144,9 +144,13 @@ python build_dit_fp16mixed.py \
 # repeat for sa3-sm-sfx and sa3-m
 ```
 
-This wraps every RMSNorm chain, attention `Softmax`, and the RoPE region in `Cast(FP32) → op → Cast(FP16)` islands and converts the rest of the weights to FP16, then compiles a `STRONGLY_TYPED` TRT engine. It writes BOTH the modified `dit_fp16mixed.onnx` (~half the size of the original) AND the TRT engine. Publishing the modified ONNX is what lets consumers compile their own engines with plain `build_from_onnx.py` (no `onnx-graphsurgeon` dependency on the consumer side).
+This wraps every RMSNorm chain, attention `Softmax`, and the RoPE region in `Cast(FP32) → op → Cast(FP16)` islands, converts the rest of the weights to FP16, then **bounds the RoPE island before QK^T** (`bound_attention_core()`) so the attention core — QK^T → Softmax → P·V — runs FP16, and finally compiles a `STRONGLY_TYPED` TRT engine. It writes BOTH the modified `dit_fp16mixed.onnx` (~half the size of the original) AND the TRT engine. Publishing the modified ONNX is what lets consumers compile their own engines with plain `build_from_onnx.py` (no `onnx-graphsurgeon` dependency on the consumer side).
 
-Naive `BuilderFlag.FP16` (without the surgery) catastrophically overflows in RMSNorm variance + attention softmax — the islands are mandatory. BF16 was tried earlier and compounds quantisation error over 8 sampling steps (cos-sim drifts from 0.99 single-step to 0.81 final-latent vs PT FP32) — audibly degraded.
+The attention-core step is not cosmetic. Without it the RoPE island emits q/k in FP32 and nothing casts them back, so the whole O(L²) core stays FP32 and TRT's FMHA fuser cannot fire: **0 fused MHA nodes and 4.3× slower at L=4096** on the medium DiT, for no accuracy gain (teacher-forced velocity cos vs the FP32 engine is 1.0000 with the step, 0.9998 without). PyTorch does the same thing the step does — `apply_rotary_pos_emb` ends with `t.to(out_dtype)` and attention is then a fused `scaled_dot_product_attention` over FP16 inputs — and TRT's FMHA kernels accumulate softmax in FP32 internally anyway. `--no-bound-attn` skips it, only useful for reproducing the pre-2026-07 engines.
+
+`STRONGLY_TYPED` is **mandatory**, not stylistic. Building the same graph weakly-typed with `BuilderFlag.FP16` fuses just as well and runs just as fast, but the FP16 flag also lets TRT re-cast the FP32 RMSNorm islands — i.e. it silently degrades to naive FP16 (measured: teacher-forced cos 0.88 @L=256, 0.77 @L=4092). Note this is the opposite of the fp8-GEMM recipe, where weakly-typed is required; the rule is per-pattern.
+
+Naive `BuilderFlag.FP16` (without the surgery) catastrophically overflows in RMSNorm variance — the RMSNorm islands are mandatory. BF16 was tried earlier and is audibly degraded on long renders, but the mechanism is narrower than the "compounds quantisation error over 8 sampling steps" story recorded here previously: a per-op ablation showed bf16 arithmetic through the rest of the DiT is clean, and the single culprit is the **RoPE rotation angle**. `t · inv_freq` reaches ~4155 rad at L=4092, where bf16's spacing is 32 rad — larger than a full 2π rotation — so `cos`/`sin` of it carry no position information for the fast-rotating dims (9 of 16 frequency pairs destroyed). The latent then inflates ~2.5× over the 8 steps and the decoder clips 2–3% of samples. It is clean at short lengths. The general rule: **any Fourier or rotary feature whose angle can exceed ~2048 rad is unsafe in bf16 by construction** — that is where bf16's ULP first exceeds 2π.
 
 Each script also writes the ONNX to `<HF_REPO>/onnx/<engine>/<file>.onnx`. After all 8 are done:
 
@@ -165,7 +169,7 @@ git push
 | `build.py` | Interactive menu (default entry point) | consumer |
 | `build_from_onnx.py` | One target → download ONNX from HF + compile to TRT. **For the SA3 DiTs, pulls `dit_fp16mixed.onnx` (the pre-processed island-wrapped graph)** so the consumer just needs to invoke `STRONGLY_TYPED` compilation — no `onnx-graphsurgeon` required | consumer |
 | `build_dit_profile.py` | Build a DiT with custom `(min, opt, max)` profile shapes (experimental — short-form / fixed-shape variants). Operates on either ONNX flavor. | consumer |
-| `build_dit_fp16mixed.py` | **Producer-side** ONNX surgery: takes the canonical FP32 `dit.onnx`, finds RMSNorm chains + attention `Softmax` + RoPE region, wraps each in `Cast(FP32) ↔ Cast(FP16)` islands, converts non-island weights to FP16, and writes both the modified `dit_fp16mixed.onnx` AND the TRT engine. Only re-run when the model retrains or the island recipe changes. Requires `onnx` + `onnx-graphsurgeon`. | producer |
+| `build_dit_fp16mixed.py` | **Producer-side** ONNX surgery: takes the canonical FP32 `dit.onnx`, finds RMSNorm chains + attention `Softmax` + RoPE region, wraps each in `Cast(FP32) ↔ Cast(FP16)` islands, converts non-island weights to FP16, then bounds the RoPE island before QK^T (`bound_attention_core()`, `--no-bound-attn` to skip) so the attention core runs FP16 and TRT's FMHA fuser fires — 96/96 attentions on the medium DiT, 4.3× at L=4096. Writes both the modified `dit_fp16mixed.onnx` AND the TRT engine, which **must** be `STRONGLY_TYPED` (weakly-typed + `BuilderFlag.FP16` re-casts the FP32 islands and silently degrades to naive FP16). Only re-run when the model retrains or the island recipe changes. Requires `onnx` + `onnx-graphsurgeon`. | producer |
 | `build_t5gemma.py` | Trace + export T5Gemma encoder ONNX + build TRT | producer |
 | `build_same_s_decoder.py` | Trace + export SAME-S decoder ONNX + build TRT | producer |
 | `build_same_s_encoder.py` | Trace + export SAME-S encoder ONNX + build TRT | producer |

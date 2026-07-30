@@ -141,18 +141,26 @@ TARGETS = {
         "profile":      _DIT_PROFILE,
         "plugin":       False,
     },
-    # SA3 medium DiT in bf16 — the medium SPEED DEFAULT (fp16-mixed above stays
-    # selectable). Reuses the SAME raw fp32 dit.onnx as the fp32 variant, but
-    # builds with BuilderFlag.BF16 + EXPLICIT_BATCH (NOT STRONGLY_TYPED): bf16
-    # carries fp32's dynamic range, so the FP32-softmax islands that fp16-mixed
-    # kept vanish and TRT 10.15's FMHA fuser fires (0 → 96 fused _gemm_mha_v2
-    # nodes) → measured ~1.76×@L=256 / 4.70×@L=4096 vs fp16-mixed, within the
-    # perceptual re-seed floor (FAD 0.59× floor, CLAP within spread, n=128).
-    # It is a build-time PRECISION RECIPE only — no new ONNX, no graph change.
+    # SA3 medium DiT in bf16 — SELECTABLE, no longer the medium default (see the
+    # sa3-m entry above). Reuses the SAME raw fp32 dit.onnx as the fp32 variant,
+    # but builds with BuilderFlag.BF16 + EXPLICIT_BATCH (NOT STRONGLY_TYPED): a
+    # uniform bf16 trunk lets TRT 10.15's FMHA fuser fire (0 → 96 fused
+    # _gemm_mha_v2 nodes). It is a build-time PRECISION RECIPE only — no new
+    # ONNX, no graph change.
+    #
+    # The ~1.76×@L=256 / 4.70×@L=4096 speedup this engine was shipped for was
+    # measured against an fp16-mixed engine whose attention core was stuck in
+    # FP32; with that fixed (build_dit_fp16mixed.py's bound_attention_core) bf16
+    # is only ~3% ahead, and it loses on accuracy: weakly-typed BF16 also lets
+    # TRT evaluate RoPE's rotation angle in bf16, and that angle reaches ~4155
+    # rad at L=4092 where bf16's spacing is 32 rad (> 2π), so position info for
+    # the fast-rotating dims is destroyed — the latent inflates ~2.5× over 8
+    # steps and a 6-min render clips 2–3% of samples. Clean at short lengths.
+    # (The FAD 0.59× floor / CLAP-within-spread n=128 result that cleared this
+    # engine predates the long-sequence finding.)
     # medium-only: sm-music / sm-sfx use standard attention and already fuse in
-    # their fp16-mixed engines. bf16 is NOT seed-reproducible vs fp16-mixed
-    # (differential attention is cancellation-sensitive) — a different-but-equal
-    # take per seed; use fp16-mixed for bit-reproducibility.
+    # their fp16-mixed engines. bf16 is also NOT seed-reproducible vs fp16-mixed;
+    # use fp16-mixed for bit-reproducibility.
     # Same _DIT_PROFILE (batch=1, dynamic L∈[1,4096], opt=1292) as every DiT
     # engine → identical CLI/feature surface (varlen, CFG sequential dual-pass,
     # neg-prompt/APG, a2a, inpaint). The DiT ONNX bakes batch=1, so there is no

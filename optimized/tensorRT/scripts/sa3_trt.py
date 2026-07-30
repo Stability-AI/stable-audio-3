@@ -404,13 +404,14 @@ class SA3Inference:
         Args:
             dit:            one of DIT_CHOICES — "sm-music" / "sm-sfx" / "medium"
             decoder:        one of DECODER_PATHS — "same-s" / "same-l"
-            precision:      None (default → per model: "bf16" for medium, else
-                            "fp16mixed"), or an explicit "bf16" (medium only;
-                            FMHA-fused, ~1.8-4.7× faster, within the perceptual
-                            floor, not seed-reproducible vs fp16mixed),
-                            "fp16mixed" (canonical, bit-reproducible), or "fp32"
-                            (bit-equiv PyTorch eager, ~2× slower). Engines auto-
-                            download from HF if the requested file is missing.
+            precision:      None (default → "fp16mixed" for every model), or an
+                            explicit "fp16mixed" (canonical: FP16 trunk, FP32
+                            RMSNorm/RoPE islands, FMHA-fused FP16 attention core),
+                            "bf16" (medium only; ~3% faster but its bf16 RoPE
+                            angle drifts at long sequence, and not seed-
+                            reproducible vs fp16mixed), or "fp32" (bit-equiv
+                            PyTorch eager, ~2× slower). Engines auto-download
+                            from HF if the requested file is missing.
             default_T_lat:  latent length to build the initial graph at
             default_steps:  pingpong steps for the initial graph
             default_seconds: duration condition for the initial graph (used for
@@ -424,8 +425,8 @@ class SA3Inference:
             raise ValueError(f"unknown dit={dit!r}; valid: {list(DIT_CHOICES)}")
         if decoder not in DECODER_PATHS:
             raise ValueError(f"unknown decoder={decoder!r}; valid: {list(DECODER_PATHS)}")
-        # Resolve precision default per model: bf16 for medium (FMHA-fused speed
-        # default), fp16-mixed for sm-music/sm-sfx. bf16 is medium-only.
+        # Resolve precision default per model: fp16-mixed everywhere.
+        # bf16 is medium-only and selectable.
         if precision is None:
             precision = canon.default_precision(dit)
         if precision not in canon.PRECISIONS:
@@ -645,11 +646,13 @@ def main():
     ap.add_argument("--dit", choices=list(DIT_CHOICES.keys()), default=None)
     ap.add_argument("--decoder", choices=list(DECODER_PATHS.keys()), default=None)
     ap.add_argument("--precision", choices=list(canon.PRECISIONS), default=None,
-                    help="DiT engine precision. Default resolves per model: 'bf16' for medium "
-                         "(FMHA-fused, ~1.8-4.7× faster, within perceptual floor; not "
-                         "seed-reproducible vs fp16mixed), 'fp16mixed' for sm-music/sm-sfx. "
-                         "'fp16mixed' = canonical/bit-reproducible. 'fp32' = bit-equiv PyTorch "
-                         "eager, slower. bf16 is medium-only. Auto-downloads from HF.")
+                    help="DiT engine precision. Default is 'fp16mixed' for every model: "
+                         "canonical FP16 trunk + FP32 RMSNorm/RoPE islands + FMHA-fused FP16 "
+                         "attention core, fp32-accurate at every length. 'bf16' (medium only) "
+                         "is ~3%% faster but evaluates RoPE's angle in bf16 and drifts at long "
+                         "sequence (clips on a 6-min render); not seed-reproducible vs "
+                         "fp16mixed. 'fp32' = bit-equiv PyTorch eager, slower. "
+                         "Auto-downloads from HF.")
     ap.add_argument("--models-dir", default=str(canon.MODELS_DIR))
     ap.add_argument("--seconds", type=float, default=30.0)
     ap.add_argument("--steps", type=int, default=8)

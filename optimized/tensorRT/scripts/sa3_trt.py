@@ -391,6 +391,13 @@ class SA3Inference:
 
     MAX_GRAPHS = 4
     DEFAULT_SIGMA_MAX = 1.0  # mega-graph path requires this
+    # Hard latent-length bounds. Every DiT engine's TRT profile is L=1..4096, the
+    # SAME-L decoder caps at 4096, and for --precision fp8 the baked RoPE cos/sin
+    # tables are sized to exactly 4096 (a longer render needs a re-bake). Enforced
+    # in get_graph() so every library caller (gradio / API / generate) is covered,
+    # not just the CLI.
+    DIT_MIN_L = 1
+    DIT_MAX_L = 4096
 
     def __init__(self, dit: str, decoder: str, *,
                  precision: str | None = None,
@@ -407,6 +414,9 @@ class SA3Inference:
             precision:      None (default → "fp16mixed" for every model), or an
                             explicit "fp16mixed" (canonical: FP16 trunk, FP32
                             RMSNorm/RoPE islands, FMHA-fused FP16 attention core),
+                            "fp8" (medium only; max-speed clean tier — fp8 linears
+                            + bf16 fused FMHA + baked fp32 RoPE, ~1.3× faster than
+                            fp16mixed and clean at long sequence, capped L≤4096),
                             "bf16" (medium only; ~3% faster but its bf16 RoPE
                             angle drifts at long sequence, and not seed-
                             reproducible vs fp16mixed), or "fp32" (bit-equiv
@@ -434,6 +444,9 @@ class SA3Inference:
         if precision == "bf16" and dit != "medium":
             raise ValueError("precision='bf16' is only available for dit='medium' "
                              "(sm-music/sm-sfx already fuse in fp16mixed)")
+        if precision == "fp8" and dit != "medium":
+            raise ValueError("precision='fp8' is only available for dit='medium' "
+                             "(fp8 linears + bf16 FMHA + baked fp32 RoPE; sm-music/sm-sfx ship fp16mixed only)")
 
         # Quiet: patch canon's stage/sub/_stage_vram to no-ops so loading
         # doesn't spam stdout (gradio in particular wants a clean log).
@@ -532,6 +545,18 @@ class SA3Inference:
         LRU-evicts when the cache exceeds MAX_GRAPHS to keep VRAM bounded.
         Called under the inference lock when reached from generate().
         """
+        # Hard length cap (see DIT_MAX_L). Reject cleanly here so the library path
+        # fails with a clear message rather than a cryptic TRT profile error deep
+        # in graph build. For fp8 this is a real correctness limit (baked RoPE table).
+        if not (self.DIT_MIN_L <= T_lat <= self.DIT_MAX_L):
+            max_s = self.DIT_MAX_L * SAMPLES_PER_LATENT / SAMPLE_RATE
+            reason = ("the fp8 baked RoPE table (sized to L=4096; a longer render needs a "
+                      "re-bake — build/make_rope_baked_onnx.py --max-t)"
+                      if self.precision == "fp8" else
+                      "the DiT engine's optimization profile (built for L=1..4096)")
+            raise ValueError(
+                f"T_lat={T_lat} is out of range [{self.DIT_MIN_L}, {self.DIT_MAX_L}] "
+                f"(~{max_s:.0f}s max), bounded by {reason} and the SAME-L decoder's 4096 cap.")
         key = (T_lat, steps)
         if key in self._graphs:
             self._graph_lru.remove(key)
@@ -648,8 +673,11 @@ def main():
     ap.add_argument("--precision", choices=list(canon.PRECISIONS), default=None,
                     help="DiT engine precision. Default is 'fp16mixed' for every model: "
                          "canonical FP16 trunk + FP32 RMSNorm/RoPE islands + FMHA-fused FP16 "
-                         "attention core, fp32-accurate at every length. 'bf16' (medium only) "
-                         "is ~3%% faster but evaluates RoPE's angle in bf16 and drifts at long "
+                         "attention core, fp32-accurate at every length. 'fp8' (medium only) "
+                         "is the max-speed clean tier — fp8 linears + bf16 fused FMHA + baked "
+                         "fp32 RoPE, ~1.3x faster than fp16mixed at every length and clean at "
+                         "long sequence (L<=4096). 'bf16' (medium only) is ~3%% faster than "
+                         "fp16mixed but evaluates RoPE's angle in bf16 and drifts at long "
                          "sequence (clips on a 6-min render); not seed-reproducible vs "
                          "fp16mixed. 'fp32' = bit-equiv PyTorch eager, slower. "
                          "Auto-downloads from HF.")
@@ -707,7 +735,13 @@ def main():
 
     DIT_MIN_L, DIT_MAX_L = 1, 4096
     if T_lat < DIT_MIN_L or T_lat > DIT_MAX_L:
-        sys.exit(f"error: T_lat={T_lat} out of [{DIT_MIN_L}, {DIT_MAX_L}]")
+        max_s = DIT_MAX_L * SAMPLES_PER_LATENT / SAMPLE_RATE
+        why = ("the fp8 baked RoPE table (sized to L=4096; a longer render needs a re-bake — "
+               "build/make_rope_baked_onnx.py --max-t)"
+               if args.precision == "fp8" else
+               "the DiT engine's L=1..4096 profile") + " and the SAME-L decoder's 4096 cap"
+        sys.exit(f"error: T_lat={T_lat} (= {args.seconds}s) out of [{DIT_MIN_L}, {DIT_MAX_L}] "
+                 f"(~{max_s:.0f}s max), bounded by {why}.")
 
     # Inpaint validation (unchanged from sa3_trt)
     inpaint_range = None

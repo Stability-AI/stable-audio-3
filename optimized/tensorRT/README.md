@@ -126,7 +126,7 @@ Omit `--dit` / `--decoder` for an interactive arrow-key picker. Relative
 | `medium`         | `fp16mixed` | FMHA-fused (96 fused attention nodes) **and** fp32-accurate at every length |
 | `sm-music`/`sm-sfx` | `fp16mixed` | standard attention — already fuses in fp16-mixed           |
 
-`--precision` also takes `bf16` (medium only) and `fp32` explicitly:
+`--precision` also takes `fp8` and `bf16` (both medium only) and `fp32` explicitly:
 
 - **`fp16mixed`** — canonical: FP16 trunk, FP32 islands around RMSNorm and RoPE
   generation, and an FP16 attention core (QK^T → Softmax → P·V) so TRT's FMHA fuser
@@ -137,6 +137,21 @@ Omit `--dit` / `--decoder` for an interactive arrow-key picker. Relative
   before QK^T fixed that (**4.3× faster at L=4096**), which retired the reason to
   prefer `bf16`. Engines built before 2026-07 are the slow variant; rebuild with
   `build_from_onnx.py sa3-m`.
+- **`fp8`** — *medium only; the max-speed clean tier.* fp8 E4M3 on the 176 linear
+  GEMMs + bf16 fused FMHA (96 nodes) + a **baked fp32 RoPE constant table** (position
+  cos/sin computed host-side at build and frozen as a graph constant — no in-graph trig,
+  so the island is precision-policy-robust and cross-runtime-stable). **~1.3× faster than
+  `fp16mixed` at every length** (H200, same-run round-robin: 1.40× @L129 / 1.32× @L1292 /
+  1.34× @L4092 — also ahead of `bf16`) and **clean at long sequence** (latent std 0.86 vs
+  eager 0.95, **0.000% clip** at 2-min and 6-min), so it stays clean exactly where `bf16`
+  clips. It is a **speed tier over an already-good default, not a fidelity upgrade**:
+  single-step velocity cos vs the FP32 engine is ~0.92–0.97 (below fp16mixed's ~1.0) but
+  the 8-step render stays coherent. **Capped at L≤4096** — the baked table is sized to the
+  profile max, which is *also* the SAME-L decoder's own cap, so this is not a new
+  end-to-end limit; longer renders are rejected (a re-bake would be needed). **Not
+  seed-reproducible vs fp16-mixed.** Built weakly-typed `EXPLICIT_BATCH` + `BF16` + `FP8` +
+  `OBEY_PRECISION_CONSTRAINTS` (rebuild: `build_from_onnx.py sa3-m-fp8`; producer:
+  `build/make_rope_baked_onnx.py`, identity check: `scripts/verify_fp8_rope.py`).
 - **`bf16`** — *medium only.* Same `dit.onnx` as fp32, built with `BuilderFlag.BF16`;
   a uniform bf16 trunk also lets the FMHA fuser fire, and it is ~3% faster than
   `fp16mixed`. **But it drifts at long sequence**: weakly-typed BF16 lets TRT
@@ -150,8 +165,10 @@ Omit `--dit` / `--decoder` for an interactive arrow-key picker. Relative
 - **`fp32`** — pure FP32, bit-equivalent to PyTorch eager (~2× slower, ~2× VRAM).
 
 ```bash
-# medium defaults to fp16mixed; the last ~3% of speed, at the cost of long-seq
-# accuracy, is opt-in:
+# medium defaults to fp16mixed. fp8 is the max-speed clean tier (~1.3x faster at
+# every length, clean at long L where bf16 clips):
+./sa3 --prompt "..." --dit medium --decoder same-l --precision fp8
+# bf16 trades long-sequence accuracy for the last ~3% of speed:
 ./sa3 --prompt "..." --dit medium --decoder same-l --precision bf16
 ```
 
@@ -230,7 +247,7 @@ optimized/tensorRT/
         ├── t5gemma/t5gemma_fp16mixed.trt
         ├── sa3-sm-music/dit_fp16mixed.trt
         ├── sa3-sm-sfx/dit_fp16mixed.trt
-        ├── sa3-m/dit_fp16mixed.trt      ← + dit_bf16.trt / dit_fp32.trt if selected
+        ├── sa3-m/dit_fp16mixed.trt      ← + dit_fp8.trt / dit_bf16.trt / dit_fp32.trt if selected
         ├── same-s/{enc,dec}_dynamic_bf16.trt
         └── same-l/{enc,dec}_dynamic_triton_swa.trt
 ```

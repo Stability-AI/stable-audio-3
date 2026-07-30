@@ -103,7 +103,7 @@ T5GEMMA_PATH = ARCH_DIR / "t5gemma" / "t5gemma_fp16mixed.trt"
 DIT_ENGINE_FILES = {
     "sm-music": ["sa3-sm-music/dit_fp16mixed.trt"],
     "sm-sfx":   ["sa3-sm-sfx/dit_fp16mixed.trt"],
-    "medium":   ["sa3-m/dit_bf16.trt"],   # bf16 (FMHA-fused) is the medium default
+    "medium":   ["sa3-m/dit_fp16mixed.trt"],   # fp16mixed is the medium default
 }
 DECODER_FILES = {
     "same-s": [
@@ -129,7 +129,7 @@ DIT_CHOICES = {
                  "default_decoder": "same-s"},
     "sm-sfx":   {"engine": ARCH_DIR / "sa3-sm-sfx" / "dit_fp16mixed.trt",
                  "default_decoder": "same-s"},
-    "medium":   {"engine": ARCH_DIR / "sa3-m" / "dit_bf16.trt",   # bf16 = medium default
+    "medium":   {"engine": ARCH_DIR / "sa3-m" / "dit_fp16mixed.trt",  # medium default
                  "default_decoder": "same-l"},
 }
 DECODER_PATHS = {
@@ -145,18 +145,24 @@ ENCODER_PATHS = {
 # ─── Precision-keyed engine maps ─────────────────────────────────────────
 #
 # Three DiT precisions:
+#   fp16mixed  — canonical AND the default for every DiT, medium included since
+#                2026-07. FP16 trunk with FP32 islands around RMSNorm and the RoPE
+#                *generation*; the attention core (QK^T → Softmax → P·V) runs FP16
+#                so TRT's FMHA fuser fires (96 fused nodes on medium). Before that
+#                island was bounded the whole O(L²) core sat in FP32 unfused, which
+#                is what made bf16 look 4.7× faster. Now: teacher-forced velocity
+#                cos 1.0000 vs the FP32 engine at every length, and within ~3% of
+#                bf16's speed. Requires STRONGLY_TYPED (see build_dit_fp16mixed.py).
 #   bf16       — medium ONLY. Same dit.onnx as fp32, built with BuilderFlag.BF16
-#                (EXPLICIT_BATCH). bf16 carries fp32's range, so the FP32-softmax
-#                islands vanish and TRT 10.15's FMHA fuser fires (0 → 96 fused
-#                _gemm_mha_v2 nodes) → 1.76×@256 / 4.70×@4096 vs fp16-mixed,
-#                within the perceptual re-seed floor (FAD 0.59× floor, n=128).
-#                NOT seed-reproducible vs fp16-mixed (differential attention is
-#                cancellation-sensitive → a different-but-equal take per seed).
-#                THE MEDIUM DEFAULT. (sm-music/sm-sfx use standard attention and
-#                already fuse in fp16-mixed — no bf16 engine for them.)
-#   fp16mixed  — canonical (FP16 trunk + FP32 islands around RMSNorm/Softmax/
-#                RoPE). Kept selectable for bit-reproducibility / max per-step
-#                fidelity. The sm-music / sm-sfx default.
+#                (EXPLICIT_BATCH), which lets the FMHA fuser fire on a uniform bf16
+#                trunk. Marginally the fastest engine, but LOW-FIDELITY AT LONG
+#                SEQUENCE: it evaluates RoPE's rotation angle in bf16, and that
+#                angle reaches ~4155 rad at L=4092 where bf16's spacing is 32 rad
+#                (> 2π), so position information for the fast-rotating dims is
+#                destroyed. Over 8 sampling steps the latent inflates ~2.5× and the
+#                decoder clips 2–3% of samples on a 6-min render. Fine at short
+#                lengths (clean at L=256); prefer fp16mixed for anything long.
+#                Also not seed-reproducible vs fp16mixed.
 #   fp32       — pure-FP32, bit-equivalent to PyTorch eager. ~2× size/latency.
 #
 # The lookup tables below resolve the engine filename per (dit/decoder,
@@ -165,7 +171,7 @@ ENCODER_PATHS = {
 # by bf16 (it's a DiT-trunk fusion recipe), so decoder "bf16" reuses the
 # canonical decoder engine. Encoders are FP16-mixed only.
 DIT_ENGINE_FILENAME = {
-    "bf16":      "dit_bf16.trt",        # medium only (FMHA-fused; medium default)
+    "bf16":      "dit_bf16.trt",        # medium only; drifts at long sequence
     "fp16mixed": "dit_fp16mixed.trt",
     "fp32":      "dit_fp32.trt",
 }
@@ -175,8 +181,11 @@ _DIT_PRECISIONS = {
     "sm-sfx":   ("fp16mixed", "fp32"),
     "medium":   ("bf16", "fp16mixed", "fp32"),
 }
-# Per-DiT default precision (bf16 for medium, fp16mixed elsewhere).
-DIT_DEFAULT_PRECISION = {"sm-music": "fp16mixed", "sm-sfx": "fp16mixed", "medium": "bf16"}
+# Per-DiT default precision — fp16mixed everywhere. Medium moved off bf16 once
+# fp16mixed's attention core was fused (4.3x faster than the old fp16mixed engine,
+# ~3% off bf16, and fp32-accurate at every sequence length).
+DIT_DEFAULT_PRECISION = {"sm-music": "fp16mixed", "sm-sfx": "fp16mixed",
+                         "medium": "fp16mixed"}
 _DIT_SUBDIR = {"sm-music": "sa3-sm-music", "sm-sfx": "sa3-sm-sfx", "medium": "sa3-m"}
 DECODER_ENGINE_FILENAME = {
     "same-l": {
@@ -195,8 +204,13 @@ PRECISIONS = ("bf16", "fp16mixed", "fp32")
 
 
 def default_precision(dit_name: str) -> str:
-    """Default DiT precision for a model: bf16 for medium (FMHA-fused speed
-    default), fp16-mixed otherwise."""
+    """Default DiT precision: fp16-mixed for every model.
+
+    Medium used bf16 until 2026-07, when bounding the fp16-mixed RoPE island let
+    its attention core fuse — that made fp16-mixed 4.3x faster than before and
+    within ~3% of bf16, while staying accurate at long sequence (bf16 evaluates
+    RoPE's angle too coarsely past ~2048 rad and drifts).
+    """
     return DIT_DEFAULT_PRECISION.get(dit_name, "fp16mixed")
 
 
@@ -229,7 +243,7 @@ def get_engine_files(dit_name: str, decoder_name: str, precision: str = None,
                        with_encoder: bool = False) -> list[str]:
     """Relative paths (under ARCH_DIR) needed for the chosen pipeline. Pass this
     list to _ensure_files() to auto-download anything missing from HF.
-    precision=None resolves to the per-model default (bf16 for medium)."""
+    precision=None resolves to the per-model default (fp16-mixed)."""
     if precision is None:
         precision = default_precision(dit_name)
     files = list(SHARED_FILES)
@@ -603,9 +617,22 @@ class DiTRunner:
         ctx.set_tensor_address("seconds_total",  self._sec_buf.data_ptr())
         ctx.set_tensor_address("local_add_cond", local_add_cond.float().contiguous().data_ptr())
         ctx.set_tensor_address("velocity",       self._vel_buf.data_ptr())
-        ctx.execute_async_v3(self.runner.stream.cuda_stream)
+        if not ctx.execute_async_v3(self.runner.stream.cuda_stream):
+            raise RuntimeError(
+                f"DiT execute_async_v3 failed (L={L}). A failed enqueue otherwise "
+                f"returns the previous buffer contents as if it had succeeded.")
         self.runner.stream.synchronize()
-        return self._vel_buf.float()
+        # .clone(), NOT .float(): _vel_buf is already FP32, so .float() is a no-op
+        # that hands back the SAME tensor every call. Any caller holding two
+        # results at once then sees one aliased buffer — which silently turned CFG
+        # into a no-op, because
+        #     v_cond   = dit.step(..., embeds,      ...)
+        #     v_uncond = dit.step(..., null_embeds, ...)
+        # left v_cond pointing at the unconditional velocity, so the guided render
+        # followed the NEGATIVE prompt. Returning a copy is the contract callers
+        # already assume. (The graph-capture path is unaffected: it reads
+        # _out_buf under an explicit capture protocol.)
+        return self._vel_buf.clone()
 
     def bind_persistent(self, L: int):
         """Allocate persistent input buffers + bind tensor addresses once.
@@ -954,9 +981,9 @@ def prompt_user_if_missing(args):
         suggested = DIT_CHOICES[args.dit]["default_decoder"]
         args.decoder = _arrow_pick("Choose audio decoder:", list(DECODER_PATHS.keys()), default=suggested)
         print(f"  → {args.decoder}")
-    # Resolve DiT precision default per model: bf16 for medium (FMHA-fused speed
-    # default), fp16-mixed for sm-music/sm-sfx. bf16 is medium-only (sm-music/
-    # sm-sfx use standard attention and already fuse in fp16mixed).
+    # Resolve DiT precision default per model: fp16-mixed everywhere. bf16 is
+    # medium-only and selectable (sm-music / sm-sfx use standard attention and
+    # already fuse in fp16mixed).
     if getattr(args, "precision", None) is None:
         args.precision = default_precision(args.dit)
     if args.precision == "bf16" and args.dit != "medium":
@@ -1010,13 +1037,14 @@ def main():
                     help="Audio decoder. 'same-s' pairs with sm-* (110 MB engine). "
                          "'same-l' pairs with medium (1.2 GB engine). Interactive picker if omitted.")
     ap.add_argument("--precision", choices=list(PRECISIONS), default=None,
-                    help="DiT engine precision (default resolves per model: 'bf16' for medium, "
-                         "'fp16mixed' for sm-music/sm-sfx). 'bf16' (MEDIUM ONLY) = FMHA-fused, "
-                         "~1.8-4.7× faster than fp16mixed, within the perceptual floor, but not "
-                         "seed-reproducible vs fp16mixed (differential attention). 'fp16mixed' = "
-                         "FP16 trunk + FP32 islands (canonical, bit-reproducible). 'fp32' = pure "
-                         "FP32, matches PyTorch eager bit-for-bit but ~2× slower and ~2× the VRAM. "
-                         "Engines auto-download from HF if missing.")
+                    help="DiT engine precision (default is 'fp16mixed' for every model). "
+                         "'fp16mixed' = FP16 trunk + FP32 RMSNorm/RoPE islands with an FMHA-fused "
+                         "FP16 attention core (canonical; fp32-accurate at every length). "
+                         "'bf16' (MEDIUM ONLY) = ~3%% faster still, but it evaluates RoPE's angle "
+                         "in bf16 and drifts at long sequence (clips 2-3%% of samples on a 6-min "
+                         "render); fine for short clips, not seed-reproducible vs fp16mixed. "
+                         "'fp32' = pure FP32, matches PyTorch eager bit-for-bit but ~2× slower "
+                         "and ~2× the VRAM. Engines auto-download from HF if missing.")
     ap.add_argument("--models-dir", default=str(MODELS_DIR),
                     help=f"Directory containing the TRT engines. Default: {MODELS_DIR}")
     # ── Sampling ──

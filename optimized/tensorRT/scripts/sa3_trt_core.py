@@ -163,6 +163,24 @@ ENCODER_PATHS = {
 #                decoder clips 2–3% of samples on a 6-min render. Fine at short
 #                lengths (clean at L=256); prefer fp16mixed for anything long.
 #                Also not seed-reproducible vs fp16mixed.
+#   fp8        — medium ONLY, MAX-SPEED clean tier. fp8 E4M3 on the 176 linear
+#                GEMMs + bf16 fused FMHA (96 nodes) + a BAKED fp32 RoPE constant
+#                table: position cos/sin are computed host-side at build time and
+#                frozen as a graph Constant (no in-graph trig), so the island is
+#                precision-policy-robust and cross-runtime-stable — a constant
+#                can't be re-fused to bf16 the way a runtime pin can. ~1.3× faster
+#                than fp16mixed at every length (measured H200, same-run round-
+#                robin: 1.40× @L129 / 1.32× @L1292 / 1.30× @L4092) and CLEAN at
+#                long sequence (latent std 0.86 vs eager 0.95, 0.000% clip @2min &
+#                full) — the baked RoPE dodges bf16's long-angle drift. It is a
+#                SPEED tier over an already-good default, NOT a fidelity upgrade:
+#                single-step velocity cos vs fp32 is ~0.92–0.97 (below fp16mixed's
+#                ~1.0) but the 8-step render stays coherent. Built weakly-typed
+#                EXPLICIT_BATCH + BF16 + FP8 + OBEY_PRECISION_CONSTRAINTS (the
+#                opposite of fp16mixed's STRONGLY_TYPED — see build_from_onnx.py).
+#                The baked table is sized to the profile max L=4096 (= the SAME-L
+#                decoder's own cap), so within the shipped range no re-bake is
+#                needed; L>4096 is rejected (a re-bake would be required).
 #   fp32       — pure-FP32, bit-equivalent to PyTorch eager. ~2× size/latency.
 #
 # The lookup tables below resolve the engine filename per (dit/decoder,
@@ -172,14 +190,15 @@ ENCODER_PATHS = {
 # canonical decoder engine. Encoders are FP16-mixed only.
 DIT_ENGINE_FILENAME = {
     "bf16":      "dit_bf16.trt",        # medium only; drifts at long sequence
+    "fp8":       "dit_fp8.trt",         # medium only; max-speed clean tier (fp8 lin + baked RoPE)
     "fp16mixed": "dit_fp16mixed.trt",
     "fp32":      "dit_fp32.trt",
 }
-# DiT precisions actually built per model. bf16 is medium-only.
+# DiT precisions actually built per model. bf16 and fp8 are medium-only.
 _DIT_PRECISIONS = {
     "sm-music": ("fp16mixed", "fp32"),
     "sm-sfx":   ("fp16mixed", "fp32"),
-    "medium":   ("bf16", "fp16mixed", "fp32"),
+    "medium":   ("bf16", "fp8", "fp16mixed", "fp32"),
 }
 # Per-DiT default precision — fp16mixed everywhere. Medium moved off bf16 once
 # fp16mixed's attention core was fused (4.3x faster than the old fp16mixed engine,
@@ -189,18 +208,20 @@ DIT_DEFAULT_PRECISION = {"sm-music": "fp16mixed", "sm-sfx": "fp16mixed",
 _DIT_SUBDIR = {"sm-music": "sa3-sm-music", "sm-sfx": "sa3-sm-sfx", "medium": "sa3-m"}
 DECODER_ENGINE_FILENAME = {
     "same-l": {
-        # bf16 is a DiT-only recipe → decoder reuses its canonical fp16-mixed engine.
+        # bf16/fp8 are DiT-only recipes → decoder reuses its canonical fp16-mixed engine.
         "bf16":      "dec_dynamic_triton_swa.trt",
+        "fp8":       "dec_dynamic_triton_swa.trt",
         "fp16mixed": "dec_dynamic_triton_swa.trt",
         "fp32":      "dec_dynamic_fp32.trt",
     },
     "same-s": {
         "bf16":      "dec_dynamic_bf16.trt",
+        "fp8":       "dec_dynamic_bf16.trt",
         "fp16mixed": "dec_dynamic_bf16.trt",
         "fp32":      "dec_dynamic_fp32.trt",
     },
 }
-PRECISIONS = ("bf16", "fp16mixed", "fp32")
+PRECISIONS = ("bf16", "fp8", "fp16mixed", "fp32")
 
 
 def default_precision(dit_name: str) -> str:
@@ -225,6 +246,11 @@ def get_dit_engine_path(dit_name: str, precision: str = None) -> Path:
         raise ValueError(
             f"precision='bf16' is only available for --dit medium (FMHA-fused); "
             f"{dit_name} uses standard attention and already fuses in fp16mixed. "
+            f"Valid for {dit_name}: {_DIT_PRECISIONS.get(dit_name)}")
+    if precision == "fp8" and dit_name != "medium":
+        raise ValueError(
+            f"precision='fp8' is only available for --dit medium (fp8 linears + "
+            f"bf16 fused FMHA + baked fp32 RoPE); {dit_name} ships fp16mixed only. "
             f"Valid for {dit_name}: {_DIT_PRECISIONS.get(dit_name)}")
     return ARCH_DIR / _DIT_SUBDIR[dit_name] / DIT_ENGINE_FILENAME[precision]
 
@@ -1070,6 +1096,10 @@ def main():
                     help="DiT engine precision (default is 'fp16mixed' for every model). "
                          "'fp16mixed' = FP16 trunk + FP32 RMSNorm/RoPE islands with an FMHA-fused "
                          "FP16 attention core (canonical; fp32-accurate at every length). "
+                         "'fp8' (MEDIUM ONLY) = the max-speed clean tier: fp8 linears + bf16 fused "
+                         "FMHA + a baked fp32 RoPE constant table, ~1.3× faster than fp16mixed at "
+                         "every length and clean at long sequence (std 0.86, 0.000%% clip @6-min); "
+                         "capped at L<=4096 (the baked table = the SAME-L decoder's own cap). "
                          "'bf16' (MEDIUM ONLY) = ~3%% faster still, but it evaluates RoPE's angle "
                          "in bf16 and drifts at long sequence (clips 2-3%% of samples on a 6-min "
                          "render); fine for short clips, not seed-reproducible vs fp16mixed. "

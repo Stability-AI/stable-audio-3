@@ -56,6 +56,82 @@ from sa3_trt_core import (
 
 
 # ─── Full-pipeline CUDA-graph runner ─────────────────────────────────────
+# Decoders whose TRT engine cannot be CUDA-graph-captured, per GPU architecture.
+# A non-capturable engine inside the mega-graph is SILENTLY DROPPED (see _enqueue):
+# the stage never records, and replay returns whatever its output buffer held from
+# the pre-capture warmup. For a decoder that means every render is the warmup decode
+# of zero latents — a constant wash, byte-identical across seeds and prompts, exit
+# code 0.
+#
+# SAME-L is not capturable on sm_120. Its Triton SWA plugin dispatches into a
+# JIT-compiled kernel, which capture cannot record there; TRT reports
+#   "The CUDA stream is in capturing mode, but this TRT engine is not stream
+#    capturable"
+# and enqueueV3 returns False. SAME-S is fine on both arches, and SAME-L is fine on
+# sm_90, so this is deliberately narrow rather than a blanket disable.
+_CAPTURE_BLOCKED = {"sm_120": {"same-l"}}
+
+
+def _delegate_to_eager() -> None:
+    """Hand off to canon.main() for any configuration the mega-graph cannot serve.
+
+    Called BEFORE this module loads any engine, so only one set is ever resident —
+    canon.main() loads its own. `--mega-graph`/`--no-mega-graph` are stripped because
+    canon's parser does not define them.
+    """
+    print()
+    print(dim("  Mega-graph path unavailable for this configuration; "
+              "delegating to sa3_trt.main()..."))
+    sys.argv = [a for a in sys.argv if a not in ("--mega-graph", "--no-mega-graph")]
+    canon.main()
+
+
+def _live_gpu_arch() -> str:
+    """sm_XX of the GPU actually executing, from the CUDA device itself.
+
+    Deliberately NOT canon._detect_gpu_arch(): that prefers the `.arch` file written
+    by install.sh, which records the *install-time* choice and can legitimately
+    disagree with the hardware (installing sm_90 engines on a newer card). Graph
+    capturability is a property of the silicon, so it has to come from the device.
+    Checked on this box: `.arch` said sm_90 while the GPU reported 12.0, which would
+    have made the guard below a no-op on exactly the machine it exists for.
+    """
+    try:
+        major, minor = canon.torch.cuda.get_device_capability(0)
+        return f"sm_{major}{minor}"
+    except Exception:
+        return canon._detect_gpu_arch()
+
+
+def _decoder_blocks_capture(decoder: str) -> bool:
+    """True if `decoder` cannot be graph-captured on the GPU we are running on."""
+    arch = _live_gpu_arch()
+    if decoder not in _CAPTURE_BLOCKED.get(arch, set()):
+        return False
+    print(f"  {yellow('note')}  {decoder} is not CUDA-graph-capturable on {arch} — "
+          f"using the eager path (the mega-graph would silently drop the decode)")
+    return True
+
+
+def _enqueue(ctx, stream, what: str) -> None:
+    """execute_async_v3 with its return value CHECKED.
+
+    Under CUDA-graph capture a refusal is silent and destructive: enqueueV3 returns
+    False, nothing is recorded into the graph, and replay then re-reads whatever the
+    output buffer held from the pre-capture warmup. The stage simply vanishes from
+    the pipeline while every call still "succeeds".
+
+    That is exactly how the SAME-L decoder failed on sm_120: its engine is not
+    stream-capturable there, so the captured graph held T5 + all 8 DiT steps but no
+    decode, and every render returned the warmup decode of zero latents — a constant
+    wash, byte-identical across seeds and prompts, with exit code 0.
+    """
+    if not ctx.execute_async_v3(stream.cuda_stream):
+        raise RuntimeError(
+            f"{what}: TRT execute_async_v3 refused to enqueue. Under graph capture "
+            f"this silently omits the stage — treat any output as invalid.")
+
+
 class FullPipelineGraph:
     """Captures T5 + DiT-loop + decoder + narrow + DtoH in ONE CUDA graph.
 
@@ -235,7 +311,7 @@ class FullPipelineGraph:
                 # that the engine state evolution is the same — what matters
                 # for downstream determinism is that EACH engine's call count
                 # and rough input pattern matches canonical).
-                self.t5_runner.context.execute_async_v3(capture_stream.cuda_stream)
+                _enqueue(self.t5_runner.context, capture_stream, "t5 (mega-graph)")
                 # DiT single step with zero inputs (matches canon's warmup
                 # `dit.step(_w_x, _w_t, _w_h, _w_m, 30.0, _w_l)`).
                 self.dit._t_buf[0] = 0.5
@@ -244,23 +320,23 @@ class FullPipelineGraph:
                 self.dit._t5_mask_buf.copy_(zero_m)
                 self.dit._local_add_cond_buf.copy_(zero_l)
                 self.dit._sec_buf[0] = 30.0
-                self.dit.runner.context.execute_async_v3(capture_stream.cuda_stream)
+                _enqueue(self.dit.runner.context, capture_stream, "dit (mega-graph)")
                 # Decoder with zero latents (matches canon's _w_lat = zeros).
                 self.decoder_in_buf.copy_(zero_latents)
-                self.dec_runner.context.execute_async_v3(capture_stream.cuda_stream)
+                _enqueue(self.dec_runner.context, capture_stream, "decoder (mega-graph)")
             # Then canon runs ONE full sampling pass (8 DiT calls, no decoder).
             # Mirror that here so the DiT context's state also matches.
             self.dit._x_buf.copy_(zero_x)
             for i in range(ns):
                 self.dit._t_buf[0] = float(sigmas[i])
-                self.dit.runner.context.execute_async_v3(capture_stream.cuda_stream)
+                _enqueue(self.dit.runner.context, capture_stream, "dit (mega-graph)")
             # Then canon's GraphPingpongSampler.build() does 2 more 8-step
             # passes of the DiT (still no decoder). Mirror that too.
             for _w in range(2):
                 self.dit._x_buf.copy_(zero_x)
                 for i in range(ns):
                     self.dit._t_buf[0] = float(sigmas[i])
-                    self.dit.runner.context.execute_async_v3(capture_stream.cuda_stream)
+                    _enqueue(self.dit.runner.context, capture_stream, "dit (mega-graph)")
                     v = self.dit._vel_buf.float()
                     denoised = self.dit._x_buf - self._sigma_curr_bufs[i] * v
                     if i < ns - 1:
@@ -287,7 +363,7 @@ class FullPipelineGraph:
         with canon.torch.cuda.stream(capture_stream):
             with canon.torch.cuda.graph(self._graph, stream=capture_stream):
                 # Stage 1: T5
-                self.t5_runner.context.execute_async_v3(capture_stream.cuda_stream)
+                _enqueue(self.t5_runner.context, capture_stream, "t5 (mega-graph)")
                 # Cast attn_mask → fp32 → dit's t5_mask_buf
                 self.dit._t5_mask_buf.copy_(self.attn_mask_buf.float())
                 # T5 hidden (fp32) → dit's t5_hidden_buf
@@ -297,7 +373,7 @@ class FullPipelineGraph:
                 # Stage 3: DiT loop
                 for i in range(ns):
                     self.dit._t_buf[0] = self._sigma_curr_bufs[i]
-                    self.dit.runner.context.execute_async_v3(capture_stream.cuda_stream)
+                    _enqueue(self.dit.runner.context, capture_stream, "dit (mega-graph)")
                     v = self.dit._vel_buf.float()
                     denoised = self.dit._x_buf - self._sigma_curr_bufs[i] * v
                     if i < ns - 1:
@@ -311,7 +387,7 @@ class FullPipelineGraph:
                         self.latents_out_buf.copy_(new_x)
                 # Stage 4: Decoder
                 self.decoder_in_buf.copy_(self.latents_out_buf)
-                self.dec_runner.context.execute_async_v3(capture_stream.cuda_stream)
+                _enqueue(self.dec_runner.context, capture_stream, "decoder (mega-graph)")
                 # Stage 5a: narrow + cast int32 → int16 (or legacy fp32 → int16)
                 if self._dec_out_name == "pcm":
                     # Belt-and-suspenders int16 clamp. New engines (from the
@@ -730,7 +806,8 @@ def main():
     # Can we use the mega-graph fast path?
     use_mega = (args.mega_graph and args.cfg == 1.0 and
                 inpaint_range is None and args.init_audio is None and
-                sigma_max == 1.0)
+                sigma_max == 1.0 and
+                not _decoder_blocks_capture(args.decoder))
     # sigma_max==1 → noise = pure_noise (no init_latents mixing); plus the
     # negative cases above. Anything else → eager.
 
@@ -783,6 +860,18 @@ def main():
     }
     if args.init_audio:
         engine_specs["enc"] = ENCODER_PATHS[args.decoder]
+    # Load engines ONLY for the mega-graph path. The eager fallback below delegates
+    # to canon.main(), which loads its own T5 + DiT + decoder — so loading here too
+    # doubled peak VRAM (measured 26-30 GB vs 11-15 GB for medium + same-l at L=256,
+    # because this frame keeps the first set referenced). On a 32 GB card that OOM'd
+    # every eager mode: CFG != 1, audio-to-audio, inpaint, --init-noise-level != 1,
+    # and --no-mega-graph. It is also the "malloc_consolidate(): invalid chunk size"
+    # abort recorded against medium + same-l + cfg>1 — the real trigger is eager +
+    # same-l holding two engine sets, not CFG.
+    if not use_mega:
+        _delegate_to_eager()
+        return
+
     t0 = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(engine_specs)) as ex:
         futs = {name: ex.submit(TRTRunner, path) for name, path in engine_specs.items()}
@@ -859,27 +948,8 @@ def main():
         print(f"  {bold(green('▸ saved'))}  {bold(cyan(out_display))}   {dim(f'({out_path.resolve()})')}")
         return
 
-    # ── Eager fallback path: re-run sa3_trt.main() ──
-    # We've consumed CLI args; the cleanest thing is to spawn the canonical
-    # main() — but it parses its own args, so we'd have to manipulate sys.argv.
-    # Practical: re-invoke canon main with the same argv.
-    print()
-    print(dim("  Mega-graph path unavailable for this configuration; delegating to sa3_trt.main()..."))
-    # canon's main parses sys.argv directly; we leave sys.argv intact (already
-    # contains all the same flags — the only flag we added is --mega-graph
-    # which canon will reject. Strip it.)
-    new_argv = []
-    skip_next = False
-    for a in sys.argv:
-        if skip_next:
-            skip_next = False
-            continue
-        if a in ("--mega-graph", "--no-mega-graph"):
-            continue
-        new_argv.append(a)
-    sys.argv = new_argv
-    # canon already had _import_heavy()'d so canon.torch is set.
-    canon.main()
+    # unreachable: use_mega is True here (the eager path returned above)
+
 
 
 if __name__ == "__main__":

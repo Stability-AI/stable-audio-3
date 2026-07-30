@@ -166,15 +166,38 @@ TARGETS = {
     # neg-prompt/APG, a2a, inpaint). The DiT ONNX bakes batch=1, so there is no
     # varbatch axis on ANY TRT DiT engine (CFG is a sequential dual-pass, as in
     # fp16-mixed) — fusion is verified to survive the full L profile at batch=1.
+    # SA3 medium DiT in bf16 — SELECTABLE (fp16-mixed is the medium default).
+    # Reads the ROPE-BAKED ONNX from build_dit_bf16.py, NOT the raw dit.onnx.
+    #
+    # Baking is what makes a bf16 trunk safe here. RoPE's angle is t*inv_freq with
+    # inv_freq[0] == 1.0 exactly, so it reaches ~4155 rad at L=4092 — and bf16's
+    # spacing up there is 32 rad, more than a full 2*pi rotation. Computing that
+    # angle in bf16 destroys 9/16 frequency pairs, the latent inflates ~2.5x over 8
+    # sampling steps, and a 6-minute render clips 2-3% of samples. Building the raw
+    # dit.onnx with BuilderFlag.BF16 — what shipped before 2026-07 — has exactly
+    # that defect. Precomputing the tables on the host removes the angle arithmetic
+    # from the graph entirely; the baked table VALUES live in [-1,1] where bf16 is
+    # perfectly adequate (measured: latent std 0.9161 vs fp32's 0.9162).
+    #
+    # bf16 needs no fp32 RMSNorm islands (its exponent range covers the variance
+    # that would overflow fp16), so the trunk is uniform and TRT's FMHA fuser fires:
+    # 96 fused MHA nodes. Measured teacher-forced velocity cos vs the fp32 engine
+    # 0.9993/0.9990/0.9983 at L=256/1292/4092 on sm_120 (0.9987/0.9990/0.9923 on
+    # sm_90), and 380 s clipping 3.112% -> 0.014%. It is ~4-7% faster than
+    # fp16-mixed but NOT fp32-exact, and it is not seed-reproducible against it.
+    #
+    # The 5.8 GB fp32 sidecar is shared with dit.onnx — no second weight copy.
     "sa3-m-bf16": {
-        # 5.8 GB external-data sidecar (fp32 weights) travels alongside.
-        "onnx_hf":      ["sa3-m/dit.onnx", "sa3-m/dit.onnx.data"],
+        "onnx_hf":      ["sa3-m/dit_bf16.onnx", "sa3-m/dit.onnx.data"],
         "trt_local":    "sa3-m/dit_bf16.trt",
-        "flags":        {"BF16"},
+        "flags":        {"BF16", "OBEY_PRECISION_CONSTRAINTS"},
         "network":      "EXPLICIT_BATCH",
         "workspace_gb": 16,
         "profile":      _DIT_PROFILE,
         "plugin":       False,
+        # The two Fourier chains take runtime inputs, so they cannot be baked and
+        # still need a (tiny, ~0.1%) fp32 island. See _pin_fourier_fp32.
+        "pin_fourier_fp32": True,
     },
     # ── FP32 variants ────────────────────────────────────────────────────
     # DiT FP32: read the unsurgered FP32 ONNX directly (dit.onnx), build
@@ -285,6 +308,70 @@ def _upcast_onnx_to_fp32(input_onnx: str, output_onnx: str) -> str:
     return output_onnx
 
 
+def _pin_fourier_fp32(network, trt) -> int:
+    """Pin the seconds_total / timestep Fourier angle chains to FP32 compute.
+
+    Needed only by the bf16 recipe, and only for these two chains. Both compute
+    cos/sin of an angle that reaches ~62,000 and ~55,000 radians respectively
+    (seconds_total is s/384 * seconds_freqs, with seconds_freqs maxing at 2*pi*10000).
+    bf16 has 8 significand bits, so its ULP passes 2*pi above ~2048 rad — one
+    quantisation step becomes more than a full rotation and the feature is destroyed.
+    Unlike RoPE these are functions of RUNTIME INPUTS, so they cannot be baked into
+    constants and fp32 is the only option. The tensors are scalars and [1,128]
+    vectors, so the island costs ~0.1%.
+
+    Selection is STRUCTURAL, not by name. The input graph has already had RoPE's trig
+    replaced by baked constants, so every Cos/Sin still present *is* one of these two
+    chains — which stays true across re-exports, where a name regex would not. Then
+    pin the whole ancestor closure, because one bf16 op anywhere upstream ruins the
+    angle just as thoroughly as one at the trig itself. (An earlier name-based pin
+    silently missed ONNX `/Clip`: the parser expands it into two *unnamed* ElementWise
+    layers that no regex can match, and the resulting engine was a no-op fix.)
+
+    CONSTANT layers are skipped: one holding Int64 weights rejects a FLOAT precision
+    outright, and TRT materialises float constants at whatever precision the pinned
+    consumer demands anyway.
+    """
+    layers = [network.get_layer(i) for i in range(network.num_layers)]
+    sinks = [ly for ly in layers
+             if ly.type == trt.LayerType.UNARY and
+             any(s in ly.name for s in ("Cos", "Sin"))]
+    if not sinks:
+        raise RuntimeError(
+            "no Cos/Sin layers found — expected the two Fourier chains. Is this the "
+            "RoPE-baked ONNX (build_dit_bf16.py)? Building the raw dit.onnx as bf16 "
+            "reintroduces the long-sequence RoPE defect.")
+
+    by_out = {}
+    for ly in layers:
+        for j in range(ly.num_outputs):
+            by_out[ly.get_output(j).name] = ly
+    seen, stack = {id(s): s for s in sinks}, list(sinks)
+    while stack:
+        ly = stack.pop()
+        for j in range(ly.num_inputs):
+            t = ly.get_input(j)
+            if t is None:
+                continue
+            up = by_out.get(t.name)
+            if up is not None and id(up) not in seen:
+                seen[id(up)] = up
+                stack.append(up)
+
+    FLOATY = (trt.DataType.FLOAT, trt.DataType.HALF, trt.DataType.BF16)
+    n = 0
+    for ly in seen.values():
+        if ly.type == trt.LayerType.CONSTANT:
+            continue
+        if not any(ly.get_output(j).dtype in FLOATY for j in range(ly.num_outputs)):
+            continue
+        ly.precision = trt.DataType.FLOAT
+        n += 1
+    print(f"  fourier fp32 island: {len(sinks)} trig sinks -> {len(seen)} ancestors, "
+          f"{n} pinned", flush=True)
+    return n
+
+
 def _ensure_onnx(rel_paths):
     """Pull the ONNX (and any .data sidecar) from HF; cache on disk."""
     try:
@@ -339,8 +426,10 @@ def build_one(name: str) -> str:
 
     cfg = builder.create_builder_config()
     cfg.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, recipe["workspace_gb"] << 30)
-    if "BF16" in recipe["flags"]:
-        cfg.set_flag(trt.BuilderFlag.BF16)
+    for flag in sorted(recipe["flags"]):
+        cfg.set_flag(getattr(trt.BuilderFlag, flag))
+    if recipe.get("pin_fourier_fp32"):
+        _pin_fourier_fp32(network, trt)
 
     if recipe["profile"]:
         profile = builder.create_optimization_profile()

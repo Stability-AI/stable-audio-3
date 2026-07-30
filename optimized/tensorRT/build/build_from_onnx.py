@@ -417,6 +417,18 @@ def build_one(name: str) -> str:
         net_flags = 1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
     else:
         net_flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    if recipe["plugin"]:
+        # The SAME-L SWA plugin registers BOTH an aot_impl (PTX compiled into the
+        # engine) and an impl (Triton via a Python callback). TRT refuses to create
+        # the plugin unless the network states which it prefers:
+        #   "Plugin 'samel::diff_attn_swa' has both AOT and JIT implementations.
+        #    PREFER_AOT_PYTHON_PLUGINS or PREFER_JIT_PYTHON_PLUGINS should be
+        #    specified."
+        # Prefer AOT: it is what makes the engine CUDA-graph-capturable. With the JIT
+        # path TRT re-enters Python per enqueue, and on sm_120 the resulting engine is
+        # not stream capturable — the decode was silently dropped from the mega-graph
+        # and every render returned the warmup decode of zero latents.
+        net_flags |= 1 << int(trt.NetworkDefinitionCreationFlag.PREFER_AOT_PYTHON_PLUGINS)
     network = builder.create_network(net_flags)
     parser = trt.OnnxParser(network, logger)
     if not parser.parse_from_file(onnx_path):

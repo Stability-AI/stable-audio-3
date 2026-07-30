@@ -45,14 +45,20 @@ Graph facts (verified against the real ONNX, not assumed)
       timestep Fourier features. Those are NOT RoPE and are left alone; sites are
       selected by reachability from /transformer/Einsum, not by op type.
 
+This is the shared RoPE-baking producer for BOTH medium RoPE-baked tiers — it only
+touches the RoPE angle chain, so it is agnostic to what else the graph carries:
+  bf16 : --input dit.onnx        (raw fp32; inv_freq is EXTERNAL)
+  fp8  : --input dit_fp8lin.onnx (fp8 E4M3 Q/DQ already on the Linears; inv_freq INLINE)
+Downstream compile: build_from_onnx.py sa3-m-bf16 / sa3-m-fp8.
+
 usage:
-    python make_rope_baked_onnx.py \
-        --input  /weka2/cj/clod/sa3s/stable-audio-3-optimized/onnx/sa3-m/dit.onnx \
-        --output onnx/sa3-m/dit_ropebaked.onnx [--max-t 4160]
+    python build_dit_bf16.py \
+        --input  /path/to/onnx/sa3-m/dit.onnx \
+        --output onnx/sa3-m/dit_bf16.onnx [--max-t 4160]
 
 The input's 5.8 GB weights are NEVER loaded or rewritten: initializers keep their
 external-data references and the output .onnx is written beside a link to the
-original `dit.onnx.data`.
+original `<input>.onnx.data` sidecar.
 """
 import argparse
 import os
@@ -150,7 +156,11 @@ def main():
     # ── 1. the real inv_freq ────────────────────────────────────────────────
     if INV_FREQ not in inits:
         raise SystemExit(f"initializer {INV_FREQ} not found")
-    inv_freq = read_external(inits[INV_FREQ], str(src.parent))
+    _ivf = inits[INV_FREQ]
+    if _ivf.data_location == TensorProto.EXTERNAL:
+        inv_freq = read_external(_ivf, str(src.parent))   # external in fp32 dit.onnx
+    else:
+        inv_freq = numpy_helper.to_array(_ivf)            # inline in the fp8-linear ONNX
     n_half = inv_freq.size
     print(f"\ninv_freq: {n_half} values, dtype={inv_freq.dtype}, "
           f"[0]={inv_freq[0]!r}, [-1]={inv_freq[-1]!r}", flush=True)

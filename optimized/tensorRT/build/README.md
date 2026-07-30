@@ -162,6 +162,46 @@ git commit -m "Refresh canonical ONNX"
 git push
 ```
 
+## Medium `fp8` — the max-speed RoPE-baked engine
+
+On top of the `fp16mixed` default and the selectable `bf16`, the medium DiT ships an **`fp8`**
+engine (`dit_fp8.trt`, `--precision fp8`): fp8 E4M3 on the 176 linear GEMMs + 96 bf16 fused
+FMHA + the **same baked fp32 RoPE constant table** as bf16. Measured on H200 it is ~1.3×
+faster than `fp16mixed` at every length (1.40× / 1.32× / 1.34× @L129/1292/4092, also ahead of
+bf16) and clean at long sequence (latent std 0.86, 0.000% clip at 6-min), so it stays clean
+exactly where bf16 clips. It is a speed tier over the default, **not** a fidelity upgrade
+(single-step velocity cos vs fp32 ~0.92–0.97 < fp16mixed's ~1.0; the 8-step render stays
+coherent). See the runtime README's precision section for positioning.
+
+**Consumer (per-arch rebuild).** The `.trt` is `sm_90`-specific; `sm_89` / `sm_120` / `sm_100`
+are a rebuild away (run on the target GPU):
+
+```bash
+python build_from_onnx.py sa3-m-fp8     # pulls dit_fp8.onnx (+ dit_fp8lin.onnx.data) from HF
+```
+
+`sa3-m-fp8` is the `sa3-m-bf16` recipe **plus `BuilderFlag.FP8`**: weakly-typed
+`EXPLICIT_BATCH` + `BF16` + `FP8` + `OBEY_PRECISION_CONSTRAINTS`, reusing the same
+`_pin_fourier_fp32` island (on the RoPE-baked ONNX the only `Cos`/`Sin` left are the two
+runtime Fourier chains). The fp8 E4M3 Quantize/Dequantize pairs ride in the ONNX, so TRT fires
+fp8 tensor-core GEMMs on the Linears while attention stays bf16 fused-MHA. Identity of the
+shipped engine — **176 fp8 GEMMs + 96 bf16 fused MHA + fp32 RoPE constant** — verify with
+`python ../scripts/verify_fp8_rope.py <engine>.trt` (needs a DETAILED-verbosity build, as the
+shipped engine is; a plain consumer rebuild renders identically but is not introspectable).
+
+**Producer (refresh the ONNX).** RoPE-baking is the SAME step as bf16 — `build_dit_bf16.py` is
+the shared baker (it handles both an external `inv_freq`, as in the fp32 `dit.onnx`, and an
+inline one, as in the fp8-linear ONNX):
+
+```bash
+python build_dit_bf16.py --input dit_fp8lin.onnx --output dit_fp8.onnx --max-t 4160
+```
+
+`--max-t` (4160 = profile max 4096 + 64 global tokens) sizes the baked table; rendering past
+L=4096 would need a larger `--max-t` **and** a matching TRT profile — the runtime rejects
+L>4096 up front, coinciding with the SAME-L decoder's own cap, so it is not a new end-to-end
+limit.
+
 ## File map
 
 | File | Role | Flow |
@@ -170,6 +210,8 @@ git push
 | `build_from_onnx.py` | One target → download ONNX from HF + compile to TRT. **For the SA3 DiTs, pulls `dit_fp16mixed.onnx` (the pre-processed island-wrapped graph)** so the consumer just needs to invoke `STRONGLY_TYPED` compilation — no `onnx-graphsurgeon` required | consumer |
 | `build_dit_profile.py` | Build a DiT with custom `(min, opt, max)` profile shapes (experimental — short-form / fixed-shape variants). Operates on either ONNX flavor. | consumer |
 | `build_dit_fp16mixed.py` | **Producer-side** ONNX surgery: takes the canonical FP32 `dit.onnx`, finds RMSNorm chains + attention `Softmax` + RoPE region, wraps each in `Cast(FP32) ↔ Cast(FP16)` islands, converts non-island weights to FP16, then bounds the RoPE island before QK^T (`bound_attention_core()`, `--no-bound-attn` to skip) so the attention core runs FP16 and TRT's FMHA fuser fires — 96/96 attentions on the medium DiT, 4.3× at L=4096. Writes both the modified `dit_fp16mixed.onnx` AND the TRT engine, which **must** be `STRONGLY_TYPED` (weakly-typed + `BuilderFlag.FP16` re-casts the FP32 islands and silently degrades to naive FP16). Only re-run when the model retrains or the island recipe changes. Requires `onnx` + `onnx-graphsurgeon`. | producer |
+| `build_dit_bf16.py` | **Producer-side** shared RoPE-baker for the medium `bf16` AND `fp8` engines: precomputes RoPE's cos/sin in fp64 on the host, freezes them as fp32 constant tables (`--max-t`), rewires the 96 trig sites and lets DCE delete the runtime angle chain — so the trunk runs bf16/fp8 without the long-angle drift. Weights are never loaded (keeps the input's `.data` sidecar). Handles both external `inv_freq` (fp32 `dit.onnx`) and inline (fp8-linear ONNX). Consumer compile: `build_from_onnx.py sa3-m-bf16` / `sa3-m-fp8`. Requires `onnx`. | producer |
+| `../scripts/verify_fp8_rope.py` | EngineInspector identity check for the fp8 engine (176 fp8 GEMMs + 96 bf16 fused MHA + fp32 RoPE constant). Needs a DETAILED-verbosity build. | consumer |
 | `build_t5gemma.py` | Trace + export T5Gemma encoder ONNX + build TRT | producer |
 | `build_same_s_decoder.py` | Trace + export SAME-S decoder ONNX + build TRT | producer |
 | `build_same_s_encoder.py` | Trace + export SAME-S encoder ONNX + build TRT | producer |

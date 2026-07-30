@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
 """Build a SA3 DiT TRT engine in FP16-mixed precision: FP16 trunk with FP32
-islands around RMSNorm, attention Softmax, and (by default) the rotary
-position embedding regions that PyTorch marks @autocast(enabled=False).
+islands around RMSNorm and (by default) the rotary position embedding
+*generation* that PyTorch marks @autocast(enabled=False). The attention core
+(QK^T -> Softmax -> P.V) runs FP16 so TRT's FMHA fuser can fire — step 6 below.
 
 Background:
-- BF16 engine compounds quantization error over 8 sampling steps (cos drifts
-  from 0.99 single-step to ~0.81 final-latent vs PyTorch FP32).
+- The BF16 engine drifts at long sequence, and the cause is narrower than
+  "bf16 accumulates error over the 8 sampling steps": a per-op ablation showed
+  bf16 arithmetic everywhere else in the DiT is clean (GEMMs, RMSNorm, the
+  differential-attention subtraction, even the cos/sin tables). The single
+  culprit is the RoPE rotation ANGLE, t * inv_freq, which reaches ~4155 rad at
+  L=4092 — where bf16's spacing is 32 rad, five whole rotations — so cos/sin of
+  it is uncorrelated with the true value and position information for the
+  fast-rotating dims is destroyed. The axis that separates a good engine from a
+  bad one is therefore "fp32 angle island present", not fp16-vs-bf16.
 - Naive FP16 (just BuilderFlag.FP16) catastrophically diverges: TRT promotes
-  RMSNorm's Pow/ReduceMean/Sqrt and attention's Softmax to FP16, which
-  overflows (variance > 65504 and softmax denominator collapses).
+  RMSNorm's Pow/ReduceMean/Sqrt to FP16, which overflows (variance > 65504).
+  The Softmax is a different story — see bound_attention_core(): FP16 softmax
+  is fine, and an FP32 one costs 4.3x at L=4096 for nothing.
 - MLX gets away with FP16 because it casts those subgraphs to FP32 internally.
 
 This script reproduces that recipe on the ONNX side:
 
   1. Identify FP32 "islands":
        - Every RMSNorm chain (Pow -> ReduceMean -> Add -> Sqrt -> Div -> Mul -> Mul)
-       - Every Softmax
+       - Every Softmax (transient — step 6 hands the attention core back to FP16)
        - (mode=rope, default) Every region reachable from a Cast(to=FP32) that
          leads to Cos/Sin or Einsum — i.e. the rotary position embedding
          (@autocast(enabled=False) in PyTorch source)
@@ -29,8 +38,18 @@ This script reproduces that recipe on the ONNX side:
   5. Post-process: walk the graph inserting autocast nodes wherever two
      operands of a Mul/MatMul/Add/etc disagree on dtype (this handles the
      boundary between FP32 t5_hidden input and FP16 trunk).
-  6. Build a TRT engine with NetworkDefinitionCreationFlag.STRONGLY_TYPED
+  6. bound_attention_core(): terminate the RoPE island before QK^T so the
+     attention core (QK^T -> Softmax -> P.V) runs FP16 and TRT's FMHA fuser can
+     fire. Mirrors `apply_rotary_pos_emb`'s closing `t.to(out_dtype)`, which the
+     island passes above do not reproduce. WITHOUT this step the whole O(L^2)
+     attention core stays FP32: 0 fused MHA nodes and 4.3x slower at L=4096, for
+     no accuracy gain (teacher-forced cos vs FP32 is 1.0000 WITH the pass and
+     0.9998 without). See the function docstring. Disable with --no-bound-attn
+     only to reproduce the pre-2026-07 engines.
+  7. Build a TRT engine with NetworkDefinitionCreationFlag.STRONGLY_TYPED
      so TRT respects the per-tensor dtypes exactly (no auto-promotion).
+     STRONGLY_TYPED is mandatory, not stylistic: weakly-typed + BuilderFlag.FP16
+     lets TRT re-cast the FP32 RMSNorm islands and reintroduces the overflow.
 
 Inputs/outputs stay FP32 so the runtime can swap engines transparently.
 
@@ -463,20 +482,195 @@ def wrap_islands_with_casts(model, blocked_names):
     return model
 
 
-def fix_dtype_mismatches(model, blocked_names):
-    """Walk the graph and insert Cast nodes wherever two operands of the
-    same node disagree on dtype. We use a forward dtype propagation
-    starting from graph inputs and initializers, computing the dtype of
-    each tensor as it would appear at runtime. For binary/multi-input ops
-    (MatMul, Add, Mul, Div, Sub, Pow, Where, etc.) we ensure all operands
-    share the same dtype — if they differ, the lower-precision one is
-    upcast (we prefer upcasting to FP32 over downcasting to FP16 to avoid
-    silent precision loss). The exception: when the consuming node is in
-    `blocked_names`, all its inputs must be FP32 (no downcast); when the
-    consuming node is NOT blocked, we follow the majority of operand
-    dtypes.
+def bound_attention_core(model):
+    """Terminate the RoPE island before QK^T so the attention core runs FP16.
+
+    Why this pass exists
+    --------------------
+    find_fp32_islands() blocks every Softmax (section C) *and* the RoPE region.
+    Because RoPE emits q/k in FP32 and nothing casts them back,
+    fix_dtype_mismatches then keeps the QK^T MatMul in FP32 to match its operands.
+    Net effect: the entire O(L^2) attention core — QK^T, the scale Mul, and Softmax
+    — runs FP32, and TensorRT's FMHA fuser cannot fire on it. Measured on the
+    medium DiT: **0 fused MHA nodes and 4.3x slower at L=4096** than it needs to be.
+
+    Neither FP32 region is actually required:
+
+      * PyTorch does not keep the attention core in FP32. `apply_rotary_pos_emb`
+        ends with `t, t_unrotated = t.to(out_dtype), t_unrotated.to(out_dtype)` —
+        it computes in FP32 and casts *back* to the autocast dtype — and attention
+        is then `F.scaled_dot_product_attention(q, k, v)`, a fused kernel taking
+        FP16 inputs. The FP32 softmax island has no counterpart in the source.
+      * TRT's FMHA kernels accumulate softmax in FP32 internally, so the explicit
+        FP32 softmax buys nothing the kernel does not already do.
+
+    So for each attention this rewrites
+
+        Mul(fp32) -> MatMul(fp32,fp32) -> Cast(fp32)[no-op] -> Softmax(fp32) -> Cast(fp16) -> MatMul(P.V)
+    to
+        Mul(fp32) -> Cast(fp16) x2 -> MatMul(fp16) ->            Softmax(fp16) ->            MatMul(P.V)
+
+    mirroring the source's cast-back. The RMSNorm islands are untouched: those
+    guard variance *overflow* (FP16's 5-bit exponent), a different failure mode
+    from precision, and they are still required.
+
+    Verified on sa3-m: 96/96 attentions converted, 96 fused MHA nodes at FP16,
+    teacher-forced velocity cos 1.0000 vs the FP32 engine at L=256/1292/4092
+    (the unbounded graph matches it at 256/1292 but drops to 0.9998 at 4092), and
+    4.3x faster at L=4096.
+
+    Scope: only the medium DiT has the unbounded island. In sa3-sm-music /
+    sa3-sm-sfx the RoPE island already terminates before QK^T (verified: their
+    QK^T operands are FP16, so their published engines fuse 40/40 MHA), and what
+    the pass converts there is the Softmax island alone — a real change to those
+    graphs, but not the fix this exists for. Their published ONNX/engines predate
+    the pass; --no-bound-attn skips it and reproduces the graph they were built
+    from.
+
+    NOTE the resulting graph must be built STRONGLY_TYPED. Building it weakly-typed
+    with BuilderFlag.FP16 lets TRT re-cast the FP32 RMSNorm islands too, which is
+    the naive-FP16 overflow this recipe exists to prevent (measured: teacher-forced
+    cos collapses to 0.88).
+    """
+    from collections import defaultdict
+    from onnx import TensorProto, helper
+
+    g = model.graph
+    producer = {}
+    consumers = defaultdict(list)
+    for n in g.node:
+        for o in n.output:
+            producer[o] = n
+        for i in n.input:
+            if i:
+                consumers[i].append(n)
+    graph_outputs = {o.name for o in g.output}
+
+    def cast_to(node):
+        for a in node.attribute:
+            if a.name == "to":
+                return a.i
+        return None
+
+    drop, rename, new_casts = set(), {}, []
+    converted, converted_softmax = 0, []
+    skipped = defaultdict(int)
+
+    for sm in [n for n in g.node if n.op_type == "Softmax"]:
+        pre = producer.get(sm.input[0])
+        if pre is None or pre.op_type != "Cast" or cast_to(pre) != TensorProto.FLOAT:
+            skipped["no_fp32_cast_before_softmax"] += 1
+            continue
+        if len(consumers[sm.input[0]]) != 1:
+            skipped["pre_cast_output_shared"] += 1
+            continue
+        qk = producer.get(pre.input[0])
+        if qk is None or qk.op_type != "MatMul":
+            skipped["upstream_not_matmul"] += 1
+            continue
+        posts = consumers[sm.output[0]]
+        if not posts or any(p.op_type != "Cast" or cast_to(p) != TensorProto.FLOAT16
+                            for p in posts):
+            skipped["no_fp16_cast_after_softmax"] += 1
+            continue
+        if sm.output[0] in graph_outputs or any(p.output[0] in graph_outputs for p in posts):
+            skipped["touches_graph_output"] += 1
+            continue
+        if len(consumers[qk.output[0]]) != 1:
+            skipped["qk_output_shared"] += 1
+            continue
+
+        for idx, src in enumerate(list(qk.input)):
+            out_name = f"{src}__attnfp16_{converted}_{idx}"
+            new_casts.append(helper.make_node(
+                "Cast", [src], [out_name], to=TensorProto.FLOAT16,
+                name=f"{src}__attnfp16_cast_{converted}_{idx}"))
+            qk.input[idx] = out_name
+        sm.input[0] = qk.output[0]
+        drop.add(id(pre))
+        for p in posts:
+            rename[p.output[0]] = sm.output[0]
+            drop.add(id(p))
+        converted += 1
+        converted_softmax.append(sm)
+
+    print(f"  bound_attention_core: {converted} attention(s) -> FP16 core")
+    if skipped:
+        print(f"    skipped: {dict(skipped)}")
+    if converted == 0:
+        raise RuntimeError("bound_attention_core converted nothing — the island "
+                           "passes upstream must have changed shape")
+
+    def resolve(name):
+        seen = set()
+        while name in rename and name not in seen:
+            seen.add(name)
+            name = rename[name]
+        return name
+
+    kept = [n for n in g.node if id(n) not in drop]
+    for n in kept:
+        for i, t in enumerate(n.input):
+            r = resolve(t)
+            if r != t:
+                n.input[i] = r
+
+    # Each new Cast must precede its consumer to keep the graph topologically sorted.
+    cast_by_output = {c.output[0]: c for c in new_casts}
+    ordered = []
+    for n in kept:
+        for t in n.input:
+            c = cast_by_output.pop(t, None)
+            if c is not None:
+                ordered.append(c)
+        ordered.append(n)
+    if cast_by_output:
+        raise RuntimeError(f"{len(cast_by_output)} inserted casts could not be placed")
+    del g.node[:]
+    g.node.extend(ordered)
+
+    # Retype/drop stale value_info: QK^T and Softmax outputs are FP16 now, and the
+    # spliced Cast outputs no longer exist. A stale FP32 declaration on an FP16
+    # tensor makes STRONGLY_TYPED reject the graph. Only the attentions we actually
+    # converted move — a skipped Softmax keeps its FP32 declaration.
+    retype = set()
+    for sm in converted_softmax:
+        retype.add(sm.output[0])
+        retype.add(sm.input[0])     # rewired above to the QK^T MatMul output
+    dead = set(rename)
+    kept_vi = []
+    for vi in g.value_info:
+        if vi.name in dead:
+            continue
+        if vi.name in retype and vi.type.tensor_type.elem_type == TensorProto.FLOAT:
+            vi.type.tensor_type.elem_type = TensorProto.FLOAT16
+        kept_vi.append(vi)
+    del g.value_info[:]
+    g.value_info.extend(kept_vi)
+    return model
+
+
+def fix_dtype_mismatches(model, blocked_names, low_dt=None):
+    """Insert Cast nodes wherever two operands of an op disagree on float dtype.
+
+    Forward dtype propagation from graph inputs and initializers, computing each
+    tensor's dtype as it would appear at runtime. For binary/multi-input ops
+    (MatMul, Add, Mul, Div, Sub, Pow, Where, ...) all float operands are aligned
+    onto one dtype: FP32 when the consuming node is in `blocked_names` (an FP32
+    island — never downcast those), otherwise the trunk dtype, and the mismatched
+    operands get a Cast.
+
+    `low_dt` is that trunk dtype: FLOAT16 for the fp16-mixed recipe (the default
+    when None) or BFLOAT16 for a bf16 trunk. Both recipes need the same graph-wide
+    reconciliation — a bf16 trunk with fp32 islands hits exactly the same class of
+    mismatch (`ElementWiseOperation DIV must have same input types`,
+    `IMatrixMultiplyLayer must have same input types`) — so this pass is shared
+    rather than duplicated.
     """
     from onnx import TensorProto, helper
+
+    if low_dt is None:
+        low_dt = TensorProto.FLOAT16    # default trunk dtype: the fp16-mixed recipe
 
     init_dtype = {init.name: init.data_type for init in model.graph.initializer}
     graph_input_dtype = {gi.name: gi.type.tensor_type.elem_type for gi in model.graph.input}
@@ -566,17 +760,17 @@ def fix_dtype_mismatches(model, blocked_names):
             if not inp:
                 continue
             dt = get_dt(inp)
-            if dt in (TensorProto.FLOAT, TensorProto.FLOAT16):
+            if dt in (TensorProto.FLOAT, low_dt):
                 float_input_dts.append((inp, dt))
         if node.op_type in SHARED_FLOAT_DT_OPS and len(float_input_dts) > 1:
             unique_dts = set(dt for _, dt in float_input_dts)
             if len(unique_dts) > 1:
                 # Mismatch — need to align. Rule: if blocked node, force FP32.
-                # Otherwise prefer FP16 (the trunk dtype).
+                # Otherwise prefer low_dt (the trunk dtype, FP16 by default).
                 if node.name in blocked_names:
                     target = TensorProto.FLOAT
                 else:
-                    target = TensorProto.FLOAT16
+                    target = low_dt
                 for inp, dt in float_input_dts:
                     if dt == target:
                         continue
@@ -601,7 +795,7 @@ def fix_dtype_mismatches(model, blocked_names):
                 if not inp:
                     continue
                 dt = get_dt(inp)
-                if dt in (TensorProto.FLOAT, TensorProto.FLOAT16):
+                if dt in (TensorProto.FLOAT, low_dt):
                     for o in node.output:
                         set_dt(o, dt)
                     break
@@ -807,7 +1001,7 @@ def manual_convert_to_fp16(model, blocked_names):
     return model
 
 
-def convert_to_fp16mixed(input_onnx, output_onnx, mode="minimal"):
+def convert_to_fp16mixed(input_onnx, output_onnx, mode="minimal", bound_attn=True):
     """Load FP32 ONNX, identify FP32 islands, convert everything else to
     FP16, and save."""
     import onnx
@@ -863,6 +1057,11 @@ def convert_to_fp16mixed(input_onnx, output_onnx, mode="minimal"):
     # FP16 tensor, or where Cast(to=FP32) outputs reach FP16 consumers, etc.
     print(f"  fixing dtype mismatches with autocast insertion...")
     fp16_model = fix_dtype_mismatches(fp16_model, blocked_names)
+
+    # The island passes above leave the whole O(L^2) attention core in FP32 —
+    # see bound_attention_core() for why that is wrong and what it costs.
+    if bound_attn:
+        fp16_model = bound_attention_core(fp16_model)
 
     print(f"  saving to {output_onnx}")
     # Try a plain save first; if the protobuf exceeds 2GB, fall back to
@@ -955,6 +1154,12 @@ def main():
                     help="FP32 island coverage: minimal=RMSNorm+Softmax only, "
                          "rope=+RoPE freq/apply_rotary, full=every Cast(FP32) "
                          "downstream region from the original ONNX.")
+    ap.add_argument("--no-bound-attn", action="store_true",
+                    help="Skip bound_attention_core(). NOT recommended: leaving the "
+                         "RoPE island unbounded keeps QK^T + Softmax in FP32, which "
+                         "blocks TRT's FMHA fuser (0 fused MHA nodes, 4.3x slower at "
+                         "L=4096) for no accuracy gain. Only for reproducing the "
+                         "pre-2026-07 engines.")
     ap.add_argument("--skip-convert", action="store_true",
                     help="Skip ONNX conversion (reuse existing --onnx file)")
     ap.add_argument("--skip-build", action="store_true",
@@ -963,7 +1168,8 @@ def main():
 
     if not args.skip_convert:
         print(f"━━━ Convert FP32 ONNX -> FP16-mixed ONNX (mode={args.mode}) ━━━")
-        convert_to_fp16mixed(args.input, args.onnx, mode=args.mode)
+        convert_to_fp16mixed(args.input, args.onnx, mode=args.mode,
+                             bound_attn=not args.no_bound_attn)
 
     if not args.skip_build:
         print("\n━━━ Build TRT engine ━━━")

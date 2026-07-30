@@ -34,6 +34,11 @@ from _arch import detect_arch, arch_dir  # noqa: E402
 HF_REPO = "stabilityai/stable-audio-3-optimized"
 HF_ONNX_PREFIX = "onnx"  # files at HF_REPO/onnx/<engine_subdir>/<file>.onnx
 
+# Architectures where the JIT (Triton) plugin path produces a non-stream-capturable
+# engine, so the AOT PTX path must be used instead. Everywhere else JIT is preferred
+# because it is measurably faster. See the plugin-preference block in build_one().
+_AOT_PLUGIN_ARCHES = {"sm_120"}
+
 T5_TOKENS = 256
 T5_HIDDEN_DIM = 768
 SAMPLES_PER_LATENT = 4096
@@ -419,16 +424,35 @@ def build_one(name: str) -> str:
         net_flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
     if recipe["plugin"]:
         # The SAME-L SWA plugin registers BOTH an aot_impl (PTX compiled into the
-        # engine) and an impl (Triton via a Python callback). TRT refuses to create
-        # the plugin unless the network states which it prefers:
+        # engine) and an impl (Triton via a Python callback). TRT refuses to create the
+        # plugin unless the network states which it prefers:
         #   "Plugin 'samel::diff_attn_swa' has both AOT and JIT implementations.
-        #    PREFER_AOT_PYTHON_PLUGINS or PREFER_JIT_PYTHON_PLUGINS should be
-        #    specified."
-        # Prefer AOT: it is what makes the engine CUDA-graph-capturable. With the JIT
-        # path TRT re-enters Python per enqueue, and on sm_120 the resulting engine is
-        # not stream capturable — the decode was silently dropped from the mega-graph
-        # and every render returned the warmup decode of zero latents.
-        net_flags |= 1 << int(trt.NetworkDefinitionCreationFlag.PREFER_AOT_PYTHON_PLUGINS)
+        #    PREFER_AOT_PYTHON_PLUGINS or PREFER_JIT_PYTHON_PLUGINS should be specified."
+        #
+        # The choice is per-arch because neither wins outright, measured on the SAME-L
+        # decoder at L=1292:
+        #
+        #   sm_120  JIT engine is NOT stream-capturable. enqueueV3 returns False under
+        #           capture, the decode is silently dropped from the mega-graph, and
+        #           every render returns the warmup decode of zero latents (a constant
+        #           wash, identical across seeds, exit code 0). AOT is the only correct
+        #           option here, and it restores the mega-graph fast path.
+        #   sm_90   JIT captures fine AND is 24% faster (55.0 ms vs AOT's best 68.2 ms).
+        #           The gap is algorithmic, not tuning: the Triton kernel block-tiles
+        #           queries sharing K/V in SRAM and uses tl.dot for tensor cores, while
+        #           the PTX kernel is one warp per query, scalar FP32, no K/V reuse.
+        #           Sweeping its only knob (warps_per_block) across 1..16 moves it 7%
+        #           and never closes the gap. So AOT would be a pure 24% loss here.
+        if detect_arch() in _AOT_PLUGIN_ARCHES:
+            net_flags |= 1 << int(
+                trt.NetworkDefinitionCreationFlag.PREFER_AOT_PYTHON_PLUGINS)
+            print(f"  plugin impl: AOT (required on {detect_arch()} for graph capture)",
+                  flush=True)
+        else:
+            net_flags |= 1 << int(
+                trt.NetworkDefinitionCreationFlag.PREFER_JIT_PYTHON_PLUGINS)
+            print(f"  plugin impl: JIT (captures on {detect_arch()} and is faster)",
+                  flush=True)
     network = builder.create_network(net_flags)
     parser = trt.OnnxParser(network, logger)
     if not parser.parse_from_file(onnx_path):

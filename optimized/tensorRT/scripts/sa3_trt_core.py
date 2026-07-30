@@ -414,6 +414,36 @@ class TRTRunner:
         torch.cuda.empty_cache()
 
 
+def _run_engine(runner: "TRTRunner", ctx, what: str) -> None:
+    """Enqueue TRT on the runner's private stream, correctly ordered against the caller.
+
+    Every input buffer these helpers bind is produced on the CURRENT stream — a
+    `.to(dtype)` cast, a `.contiguous()` copy, a `.cuda()` transfer, or the caller's
+    own compute — while TRT is enqueued on `runner.stream`. CUDA gives no ordering
+    between two streams unless you ask for it, so without the `wait_stream()` below
+    the engine may start reading those buffers before the producing work has
+    finished. That is a data race, and its failure mode here is silent: the engine
+    consumes whatever happens to be in memory and returns a plausible-looking
+    tensor, so a partially-written latent decodes to subtly (or completely) wrong
+    audio with no error anywhere.
+
+    The trailing host-side `synchronize()` is what makes the OUTPUT safe to read.
+    It also means the caching allocator cannot recycle either buffer while the
+    engine is still using it — both stay referenced by the calling frame until
+    after the sync returns — so `record_stream()` is not needed on top.
+
+    The return value of `execute_async_v3` is checked because a failed enqueue
+    otherwise leaves the output buffer untouched, which reads downstream as
+    digital silence rather than as an error.
+    """
+    runner.stream.wait_stream(torch.cuda.current_stream())
+    if not ctx.execute_async_v3(runner.stream.cuda_stream):
+        raise RuntimeError(
+            f"{what}: TRT execute_async_v3 failed to enqueue. The output buffer is "
+            f"unwritten — treat any audio produced from it as invalid.")
+    runner.stream.synchronize()
+
+
 # ─── TRT call helpers (one per engine type) ──────────────────────────────
 def t5gemma_encode(runner: TRTRunner, tokenizer, prompt: str):
     """Run T5Gemma TRT. Returns (embeds (1, 256, 768), mask (1, 256))."""
@@ -429,7 +459,7 @@ def t5gemma_encode(runner: TRTRunner, tokenizer, prompt: str):
     ctx.set_tensor_address("input_ids", ids.data_ptr())
     ctx.set_tensor_address("attention_mask", mask.data_ptr())
     ctx.set_tensor_address("hidden_states", out.data_ptr())
-    ctx.execute_async_v3(runner.stream.cuda_stream); runner.stream.synchronize()
+    _run_engine(runner, ctx, "t5gemma_encode")
     return out.float(), mask
 
 
@@ -454,7 +484,7 @@ def encoder_encode(runner: TRTRunner, audio: torch.Tensor) -> torch.Tensor:
     out = torch.empty(out_shape, dtype=out_dt, device="cuda")
     ctx.set_tensor_address("audio", a.data_ptr())
     ctx.set_tensor_address("latent", out.data_ptr())
-    ctx.execute_async_v3(runner.stream.cuda_stream); runner.stream.synchronize()
+    _run_engine(runner, ctx, "encoder_encode")
     return out.float()
 
 
@@ -557,7 +587,7 @@ def decoder_decode(runner: TRTRunner, latents: torch.Tensor) -> torch.Tensor:
     out = torch.empty(out_shape, dtype=out_dt, device="cuda")
     ctx.set_tensor_address("latent", lat.data_ptr())
     ctx.set_tensor_address(out_name, out.data_ptr())
-    ctx.execute_async_v3(runner.stream.cuda_stream); runner.stream.synchronize()
+    _run_engine(runner, ctx, "decoder_decode")
     if out.dtype in (torch.float16, torch.bfloat16, torch.float32):
         return out.float()
     return out

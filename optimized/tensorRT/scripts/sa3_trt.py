@@ -45,7 +45,7 @@ from sa3_trt_core import (
     SAMPLE_RATE, SAMPLES_PER_LATENT, IO_CHANNELS, T5_MAX_LEN, COND_DIM,
     DIT_CHOICES, DECODER_PATHS, ENCODER_PATHS,
     DIT_ENGINE_FILES, DECODER_FILES, ENCODER_FILES, SHARED_FILES,
-    HF_REPO_ID, ARCH,
+    HF_REPO_ID, ARCH, DECODER_MIN_L,
     # Helpers:
     _import_heavy, _ensure_files, _init_nvml, _stage_vram, _my_vram_bytes,
     _STAGE_VRAMS, _silence_fd, _fmt_mem,
@@ -438,6 +438,10 @@ class SA3Inference:
     # not just the CLI.
     DIT_MIN_L = 1
     DIT_MAX_L = 4096
+    # The decoders' own floor is DECODER_MIN_L (32) from sa3_trt_core — the DiT's
+    # profile starts at 1, so nothing used to enforce it and a short render passed
+    # validation, ran the DiT happily, then died or fell silent inside the decoder
+    # instead of being rejected up front.
 
     def __init__(self, dit: str, decoder: str, *,
                  precision: str | None = None,
@@ -588,6 +592,13 @@ class SA3Inference:
         # Hard length cap (see DIT_MAX_L). Reject cleanly here so the library path
         # fails with a clear message rather than a cryptic TRT profile error deep
         # in graph build. For fp8 this is a real correctness limit (baked RoPE table).
+        if T_lat < DECODER_MIN_L:
+            min_s = DECODER_MIN_L * SAMPLES_PER_LATENT / SAMPLE_RATE
+            raise ValueError(
+                f"T_lat={T_lat} is below the {self.decoder} decoder's profile minimum of "
+                f"{DECODER_MIN_L} (~{min_s:.2f}s). The DiT accepts it but the decoder "
+                f"refuses the shape, so it is rejected here instead of failing obscurely "
+                f"further in.")
         if not (self.DIT_MIN_L <= T_lat <= self.DIT_MAX_L):
             max_s = self.DIT_MAX_L * SAMPLES_PER_LATENT / SAMPLE_RATE
             reason = ("the fp8 baked RoPE table (sized to L=4096; a longer render needs a "
@@ -774,6 +785,14 @@ def main():
     target_dur = T_lat * SAMPLES_PER_LATENT / SAMPLE_RATE
 
     DIT_MIN_L, DIT_MAX_L = 1, 4096
+    if T_lat < DECODER_MIN_L:
+        min_s = DECODER_MIN_L * SAMPLES_PER_LATENT / SAMPLE_RATE
+        sys.exit(f"error: --seconds {args.seconds} gives T_lat={T_lat}, below the "
+                 f"{args.decoder} decoder's minimum of {DECODER_MIN_L} latents "
+                 f"(~{min_s:.2f}s). The DiT would accept it, but the decoder's "
+                 f"optimization profile starts at {DECODER_MIN_L}; it would refuse the "
+                 f"shape and the render would come back empty rather than erroring. "
+                 f"Use --seconds {min_s:.2f} or more.")
     if T_lat < DIT_MIN_L or T_lat > DIT_MAX_L:
         max_s = DIT_MAX_L * SAMPLES_PER_LATENT / SAMPLE_RATE
         why = ("the fp8 baked RoPE table (sized to L=4096; a longer render needs a re-bake — "

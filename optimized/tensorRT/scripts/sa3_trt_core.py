@@ -206,6 +206,15 @@ _DIT_PRECISIONS = {
 DIT_DEFAULT_PRECISION = {"sm-music": "fp16mixed", "sm-sfx": "fp16mixed",
                          "medium": "fp16mixed"}
 _DIT_SUBDIR = {"sm-music": "sa3-sm-music", "sm-sfx": "sa3-sm-sfx", "medium": "sa3-m"}
+# Both SAME decoders' latent profiles start at L=32 (verified against the engines:
+# min=(1,256,32) for same-l and same-s; the DiT's starts at 1). Below 32,
+# set_input_shape() REFUSES the shape — it returns False and TRT logs
+# "does not satisfy any optimization profiles" — after which get_tensor_shape("pcm")
+# resolves to (1, -1, 2). No caller checks that return value, so instead of a clear
+# message the failure surfaces downstream as a bogus allocation or silence.
+DECODER_MIN_L = 32
+
+
 DECODER_ENGINE_FILENAME = {
     "same-l": {
         # bf16/fp8 are DiT-only recipes → decoder reuses its canonical fp16-mixed engine.
@@ -1218,6 +1227,12 @@ def main():
     if T_lat > DIT_MAX_L:
         sys.exit(f"error: T_lat={T_lat} (= {args.seconds}s) is above the DiT's trained "
                  f"maximum length ({DIT_MAX_L} ≈ {DIT_MAX_L*SAMPLES_PER_LATENT/SAMPLE_RATE:.1f}s).")
+    if T_lat < DECODER_MIN_L:
+        sys.exit(f"error: T_lat={T_lat} (= {args.seconds}s) is below the {args.decoder} "
+                 f"decoder's profile minimum ({DECODER_MIN_L} ≈ "
+                 f"{DECODER_MIN_L*SAMPLES_PER_LATENT/SAMPLE_RATE:.2f}s). The DiT accepts it, "
+                 f"but the decoder would refuse the shape and the render would come back "
+                 f"empty rather than erroring.")
     if T_lat < DIT_TRAINED_MIN_L and not args.quiet:
         print(f"  warning: T_lat={T_lat} (= {args.seconds}s) is below the DiT's trained "
               f"minimum ({DIT_TRAINED_MIN_L} ≈ {DIT_TRAINED_MIN_L*SAMPLES_PER_LATENT/SAMPLE_RATE:.1f}s). "

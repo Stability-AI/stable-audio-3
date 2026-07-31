@@ -137,21 +137,28 @@ Omit `--dit` / `--decoder` for an interactive arrow-key picker. Relative
   before QK^T fixed that (**4.3× faster at L=4096**), which retired the reason to
   prefer `bf16`. Engines built before 2026-07 are the slow variant; rebuild with
   `build_from_onnx.py sa3-m`.
-- **`fp8`** — *medium only; the max-speed clean tier.* fp8 E4M3 on the 176 linear
-  GEMMs + bf16 fused FMHA (96 nodes) + a **baked fp32 RoPE constant table** (position
+- **`fp8`** — *medium only; the max-speed clean tier, calibrated.* fp8 E4M3 on the 176
+  linear GEMMs + bf16 fused FMHA (96 nodes) + a **baked fp32 RoPE constant table** (position
   cos/sin computed host-side at build and frozen as a graph constant — no in-graph trig,
   so the island is precision-policy-robust and cross-runtime-stable). **~1.3× faster than
   `fp16mixed` at every length** (H200, same-run round-robin: 1.40× @L129 / 1.32× @L1292 /
   1.34× @L4092 — also ahead of `bf16`) and **clean at long sequence** (latent std 0.86 vs
   eager 0.95, **0.000% clip** at 2-min and 6-min), so it stays clean exactly where `bf16`
-  clips. It is a **speed tier over an already-good default, not a fidelity upgrade**:
-  single-step velocity cos vs the FP32 engine is ~0.92–0.97 (below fp16mixed's ~1.0) but
-  the 8-step render stays coherent. **Capped at L≤4096** — the baked table is sized to the
-  profile max, which is *also* the SAME-L decoder's own cap, so this is not a new
-  end-to-end limit; longer renders are rejected (a re-bake would be needed). **Not
-  seed-reproducible vs fp16-mixed.** Built weakly-typed `EXPLICIT_BATCH` + `BF16` + `FP8` +
-  `OBEY_PRECISION_CONSTRAINTS` (rebuild: `build_from_onnx.py sa3-m-fp8`; producer:
-  `build/make_rope_baked_onnx.py`, identity check: `scripts/verify_fp8_rope.py`).
+  clips. The fp8 scales are **calibrated on real conditioning** (per-tensor activation amax +
+  per-channel weight scales from @ryanontheinside's #47, captured via `make_calib.py`) — a
+  **speed-free** change (31.2 vs the earlier uncalibrated 30.8 ms/fwd) that lifts worst-step
+  velocity-cos vs fp32 on adversarial seeds **0.52/0.57/0.64 → 0.92/0.94/0.92** (steps 1–7
+  match the fully-calibrated reference within ~0.001). It remains a **speed tier over an
+  already-good default, not a fidelity upgrade over it**: single-step velocity cos ~0.92–0.94
+  (below fp16mixed's ~1.0) but the 8-step render stays coherent — it just no longer collapses
+  at the highest-noise first step the way the uncalibrated engine did. **Capped at L≤4096** —
+  the baked table is sized to the profile max, which is *also* the SAME-L decoder's own cap,
+  so this is not a new end-to-end limit; longer renders are rejected (a re-bake would be
+  needed). **Not seed-reproducible vs fp16-mixed.** Built weakly-typed `EXPLICIT_BATCH` +
+  `BF16` + `FP8` + `OBEY_PRECISION_CONSTRAINTS` (rebuild: `build_from_onnx.py sa3-m-fp8`;
+  producer: `build/build_dit_bf16.py` RoPE-baker + `build/transplant_scales.py` calibrated-scale
+  transplant; identity check: `scripts/verify_fp8_rope.py`; calibration by @ryanontheinside,
+  [#47](https://github.com/Stability-AI/stable-audio-3/pull/47)).
 - **`bf16`** — *medium only.* Same `dit.onnx` as fp32, built with `BuilderFlag.BF16`;
   a uniform bf16 trunk also lets the FMHA fuser fire, and it is ~3% faster than
   `fp16mixed`. **But it drifts at long sequence**: weakly-typed BF16 lets TRT

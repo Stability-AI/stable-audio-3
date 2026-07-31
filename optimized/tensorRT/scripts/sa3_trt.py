@@ -7,9 +7,12 @@ PCM tensor, eliminating per-stage Python / CUDA submission overhead.
 
 Mega-graph path requirements:
   --cfg 1.0 (the default)
+  --init-noise-level 1.0 (the default)
   no --inpaint-range
   no --init-audio
-The script falls back to sa3_trt.py's eager pipeline for anything else.
+Anything else delegates to sa3_trt_core.main()'s eager pipeline. That handoff happens
+BEFORE this module loads any engine — canon.main() loads its own set, so loading here
+first left two full sets resident and doubled peak VRAM (see _delegate_to_eager).
 
 Usage: same CLI as sa3_trt.py. Optional --no-mega-graph forces the eager
 path even for the fast case (useful for ablation).
@@ -53,6 +56,66 @@ from sa3_trt_core import (
     build_pingpong_schedule, sample_flow_pingpong,
     save_wav, read_wav,
 )
+
+
+_WRAPPER_ONLY_FLAGS = ("--mega-graph", "--no-mega-graph")
+
+
+def _delegate_to_eager(args) -> None:
+    """Hand off to canon.main() for any configuration the mega-graph cannot serve.
+
+    MUST be called before this module loads a single engine. canon.main() loads its
+    own T5 + DiT + decoder, so loading them here first left two full sets resident —
+    this frame keeps the first set referenced for as long as canon.main() runs. That
+    doubled peak VRAM (measured 26.7-26.8 GB against 14.7 GB for medium + same-l) and
+    on a 32 GB card it OOM'd *every* eager configuration: --cfg != 1,
+    audio-to-audio, inpaint, --init-noise-level != 1, and --no-mega-graph. It is also
+    the "malloc_consolidate(): invalid chunk size" abort that had been recorded
+    against medium + same-l + cfg>1 — the trigger was never CFG itself, only that
+    asking for CFG routes you here.
+
+    canon.main() re-parses sys.argv from scratch, so anything this wrapper already
+    resolved has to be pinned into argv or it gets re-derived differently. --seed is
+    the one that silently corrupts results: prompt_user_if_missing() picks a RANDOM
+    seed when the user omits it and the banner has already printed that value, so
+    letting canon draw its own meant the render did not match the seed we reported
+    and could not be reproduced from it.
+    """
+    print()
+    print(dim("  Mega-graph path unavailable for this configuration; "
+              "delegating to sa3_trt_core.main()..."))
+    argv = [a for a in sys.argv if a not in _WRAPPER_ONLY_FLAGS]
+    for flag, val in (("--dit", args.dit), ("--decoder", args.decoder),
+                      ("--precision", args.precision), ("--seed", args.seed)):
+        if val is not None and flag not in argv:
+            argv += [flag, str(val)]
+    sys.argv = argv
+    canon.main()
+
+
+def _enqueue(ctx, stream, what: str) -> None:
+    """execute_async_v3 with its return value CHECKED.
+
+    Bare `execute_async_v3(...)` is dangerous specifically under graph capture: a
+    refusal is reported only through the return value, nothing is recorded into the
+    graph, and no exception is raised. Replay then re-reads whatever the stage's
+    output buffer held from the pre-capture warmup, so the stage silently vanishes
+    from the pipeline while every call still looks like it succeeded.
+
+    That is exactly how the SAME-L decoder failed on sm_120: its Triton-JIT engine
+    was not stream-capturable there, so the captured graph held T5 and all 8 DiT
+    steps but no decode, and every render returned the warmup decode of zero latents
+    — a constant wash of noise, byte-identical across seeds and prompts, exit code 0.
+    The cause is fixed (the plugin is ahead-of-time compiled now), but the *class* of
+    failure is not: any future non-capturable stage would fail the same silent way.
+    """
+    if not ctx.execute_async_v3(stream.cuda_stream):
+        raise RuntimeError(
+            f"{what}: TRT refused to enqueue. Under CUDA-graph capture this omits the "
+            f"stage silently, so any resulting audio is invalid rather than merely "
+            f"slow. If this is a SAME-L engine on a new architecture, it is most "
+            f"likely not stream-capturable — see 'Choosing the SAME-L attention "
+            f"kernel' in build/README.md, or rerun with --no-mega-graph.")
 
 
 # ─── Full-pipeline CUDA-graph runner ─────────────────────────────────────
@@ -235,7 +298,7 @@ class FullPipelineGraph:
                 # that the engine state evolution is the same — what matters
                 # for downstream determinism is that EACH engine's call count
                 # and rough input pattern matches canonical).
-                self.t5_runner.context.execute_async_v3(capture_stream.cuda_stream)
+                _enqueue(self.t5_runner.context, capture_stream, "t5 (mega-graph)")
                 # DiT single step with zero inputs (matches canon's warmup
                 # `dit.step(_w_x, _w_t, _w_h, _w_m, 30.0, _w_l)`).
                 self.dit._t_buf[0] = 0.5
@@ -244,23 +307,23 @@ class FullPipelineGraph:
                 self.dit._t5_mask_buf.copy_(zero_m)
                 self.dit._local_add_cond_buf.copy_(zero_l)
                 self.dit._sec_buf[0] = 30.0
-                self.dit.runner.context.execute_async_v3(capture_stream.cuda_stream)
+                _enqueue(self.dit.runner.context, capture_stream, "dit (mega-graph)")
                 # Decoder with zero latents (matches canon's _w_lat = zeros).
                 self.decoder_in_buf.copy_(zero_latents)
-                self.dec_runner.context.execute_async_v3(capture_stream.cuda_stream)
+                _enqueue(self.dec_runner.context, capture_stream, "decoder (mega-graph)")
             # Then canon runs ONE full sampling pass (8 DiT calls, no decoder).
             # Mirror that here so the DiT context's state also matches.
             self.dit._x_buf.copy_(zero_x)
             for i in range(ns):
                 self.dit._t_buf[0] = float(sigmas[i])
-                self.dit.runner.context.execute_async_v3(capture_stream.cuda_stream)
+                _enqueue(self.dit.runner.context, capture_stream, "dit (mega-graph)")
             # Then canon's GraphPingpongSampler.build() does 2 more 8-step
             # passes of the DiT (still no decoder). Mirror that too.
             for _w in range(2):
                 self.dit._x_buf.copy_(zero_x)
                 for i in range(ns):
                     self.dit._t_buf[0] = float(sigmas[i])
-                    self.dit.runner.context.execute_async_v3(capture_stream.cuda_stream)
+                    _enqueue(self.dit.runner.context, capture_stream, "dit (mega-graph)")
                     v = self.dit._vel_buf.float()
                     denoised = self.dit._x_buf - self._sigma_curr_bufs[i] * v
                     if i < ns - 1:
@@ -287,7 +350,7 @@ class FullPipelineGraph:
         with canon.torch.cuda.stream(capture_stream):
             with canon.torch.cuda.graph(self._graph, stream=capture_stream):
                 # Stage 1: T5
-                self.t5_runner.context.execute_async_v3(capture_stream.cuda_stream)
+                _enqueue(self.t5_runner.context, capture_stream, "t5 (mega-graph)")
                 # Cast attn_mask → fp32 → dit's t5_mask_buf
                 self.dit._t5_mask_buf.copy_(self.attn_mask_buf.float())
                 # T5 hidden (fp32) → dit's t5_hidden_buf
@@ -297,7 +360,7 @@ class FullPipelineGraph:
                 # Stage 3: DiT loop
                 for i in range(ns):
                     self.dit._t_buf[0] = self._sigma_curr_bufs[i]
-                    self.dit.runner.context.execute_async_v3(capture_stream.cuda_stream)
+                    _enqueue(self.dit.runner.context, capture_stream, "dit (mega-graph)")
                     v = self.dit._vel_buf.float()
                     denoised = self.dit._x_buf - self._sigma_curr_bufs[i] * v
                     if i < ns - 1:
@@ -311,7 +374,7 @@ class FullPipelineGraph:
                         self.latents_out_buf.copy_(new_x)
                 # Stage 4: Decoder
                 self.decoder_in_buf.copy_(self.latents_out_buf)
-                self.dec_runner.context.execute_async_v3(capture_stream.cuda_stream)
+                _enqueue(self.dec_runner.context, capture_stream, "decoder (mega-graph)")
                 # Stage 5a: narrow + cast int32 → int16 (or legacy fp32 → int16)
                 if self._dec_out_name == "pcm":
                     # Belt-and-suspenders int16 clamp. New engines (from the
@@ -785,6 +848,13 @@ def main():
     print(f"  {k('T_lat')}  {T_lat} {dim(f'({target_dur:.2f}s → trimmed to {args.seconds}s)')}")
     print()
 
+    # Everything below this point allocates. If the mega-graph cannot serve this
+    # configuration, hand off NOW — before the lazy-download, the heavy imports and
+    # above all the engine load — so only one set of engines is ever resident.
+    if not use_mega:
+        _delegate_to_eager(args)
+        return
+
     # Lazy-download
     needed = canon.get_engine_files(args.dit, args.decoder, args.precision,
                                       with_encoder=bool(args.init_audio))
@@ -892,28 +962,6 @@ def main():
         rule()
         print(f"  {bold(green('▸ saved'))}  {bold(cyan(out_display))}   {dim(f'({out_path.resolve()})')}")
         return
-
-    # ── Eager fallback path: re-run sa3_trt.main() ──
-    # We've consumed CLI args; the cleanest thing is to spawn the canonical
-    # main() — but it parses its own args, so we'd have to manipulate sys.argv.
-    # Practical: re-invoke canon main with the same argv.
-    print()
-    print(dim("  Mega-graph path unavailable for this configuration; delegating to sa3_trt.main()..."))
-    # canon's main parses sys.argv directly; we leave sys.argv intact (already
-    # contains all the same flags — the only flag we added is --mega-graph
-    # which canon will reject. Strip it.)
-    new_argv = []
-    skip_next = False
-    for a in sys.argv:
-        if skip_next:
-            skip_next = False
-            continue
-        if a in ("--mega-graph", "--no-mega-graph"):
-            continue
-        new_argv.append(a)
-    sys.argv = new_argv
-    # canon already had _import_heavy()'d so canon.torch is set.
-    canon.main()
 
 
 if __name__ == "__main__":

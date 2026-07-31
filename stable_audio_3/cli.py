@@ -13,17 +13,24 @@ import torch
 import torchaudio
 
 from stable_audio_3 import StableAudioModel
-from stable_audio_3.audio_output import protect_audio_peak
+from stable_audio_3.audio_output import dbfs_to_amplitude, protect_audio_peak
 
 
-def _save_output(audio: torch.Tensor, sample_rate: int, output: str, batch_size: int):
+def _save_output(
+    audio: torch.Tensor,
+    sample_rate: int,
+    output: str,
+    batch_size: int,
+    peak_ceiling_dbfs: float = 0.0,
+):
     """Save generated audio tensor(s) to disk."""
+    peak_ceiling = dbfs_to_amplitude(peak_ceiling_dbfs)
     base, ext = os.path.splitext(output)
     if not ext:
         ext = ".wav"
     for i in range(batch_size):
         path = f"{base}_{i}{ext}" if batch_size > 1 else f"{base}{ext}"
-        output_audio = protect_audio_peak(audio[i].cpu())
+        output_audio = protect_audio_peak(audio[i].cpu(), ceiling=peak_ceiling)
         torchaudio.save(path, output_audio, sample_rate)
         print(f"Saved: {path}")
 
@@ -98,6 +105,12 @@ def main():
         "--output",
         default="output.wav",
         help="Output file path (default: output.wav)",
+    )
+    parser.add_argument(
+        "--peak-ceiling-dbfs",
+        type=float,
+        default=0.0,
+        help="Output sample-peak ceiling in dBFS, at or below 0 (default: 0)",
     )
 
     # Audio-to-Audio
@@ -175,6 +188,10 @@ def main():
     )
 
     args = parser.parse_args()
+    try:
+        dbfs_to_amplitude(args.peak_ceiling_dbfs)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # --- Validate inpaint args ---
     if (args.inpaint_starts is None) != (args.inpaint_ends is None):
@@ -287,9 +304,16 @@ def main():
         inpaint_mask_start_seconds=inpaint_start,
         inpaint_mask_end_seconds=inpaint_end,
         chunked_decode=chunked_decode,
+        output_peak_ceiling_dbfs=args.peak_ceiling_dbfs,
     )
 
-    _save_output(audio, model.model.sample_rate, args.output, batch_size)
+    _save_output(
+        audio,
+        model.model.sample_rate,
+        args.output,
+        batch_size,
+        peak_ceiling_dbfs=args.peak_ceiling_dbfs,
+    )
 
 
 if __name__ == "__main__":

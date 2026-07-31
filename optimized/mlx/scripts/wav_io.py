@@ -8,4 +8,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT / "stable_audio_3"))
 
-from audio_output import protect_audio_peak, save_wav  # noqa: E402, F401
+from audio_output import (  # noqa: E402, F401
+    dbfs_to_amplitude,
+    protect_audio_peak,
+    save_wav,
+)

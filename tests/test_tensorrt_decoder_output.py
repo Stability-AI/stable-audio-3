@@ -3,6 +3,7 @@ import pytest
 
 from optimized.tensorRT.build.decoder_output import (
     UNBOUNDED_PCM_OUTPUT,
+    force_unbounded_pcm_tail_fp32,
     remove_output_hard_clip,
     rewrite_decoder_onnx,
 )
@@ -69,6 +70,21 @@ def test_decoder_rewrite_writes_loadable_onnx(tmp_path):
 
     rewritten = onnx.load(output)
     assert rewritten.graph.output[0].name == UNBOUNDED_PCM_OUTPUT
+    multiply = next(node for node in rewritten.graph.node if node.op_type == "Mul")
+    signal_producer = next(
+        node for node in rewritten.graph.node if multiply.input[0] in node.output
+    )
+    assert signal_producer.op_type == "Cast"
+    assert (
+        next(attr.i for attr in signal_producer.attribute if attr.name == "to")
+        == TensorProto.FLOAT
+    )
+    scale = next(
+        initializer
+        for initializer in rewritten.graph.initializer
+        if initializer.name == "peak_protect_pcm16_scale_fp32"
+    )
+    assert numpy_helper.to_array(scale).item() == 32767.0
     onnx.checker.check_model(rewritten)
 
 
@@ -76,6 +92,7 @@ def test_decoder_rewrite_preserves_out_of_range_sample_ratios():
     onnxruntime = pytest.importorskip("onnxruntime")
     model = _decoder_tail_model()
     remove_output_hard_clip(model)
+    force_unbounded_pcm_tail_fp32(model)
     session = onnxruntime.InferenceSession(
         model.SerializeToString(), providers=["CPUExecutionProvider"]
     )
@@ -90,3 +107,48 @@ def test_decoder_rewrite_preserves_out_of_range_sample_ratios():
     assert pcm[0, -2, 0] < pcm[0, -1, 0]
     ratio = pcm[0, -2, 0] / pcm[0, -1, 0]
     assert ratio == pytest.approx(1.25 / 1.75, abs=1e-4)
+
+
+def test_decoder_rewrite_refuses_an_unrelated_upstream_clip():
+    model = _decoder_tail_model()
+    zero = numpy_helper.from_array(np.array(0.0, dtype=np.float32), "zero")
+    model.graph.initializer.append(zero)
+    multiply = next(node for node in model.graph.node if node.op_type == "Mul")
+    multiply.input[0] = "processed"
+    clip_index = next(
+        index for index, node in enumerate(model.graph.node) if node.op_type == "Clip"
+    )
+    model.graph.node.insert(
+        clip_index + 1,
+        helper.make_node("Add", ["clipped", "zero"], ["processed"]),
+    )
+
+    with pytest.raises(RuntimeError, match="not fed directly"):
+        remove_output_hard_clip(model)
+
+
+def test_fp16_mixed_tail_is_promoted_before_unbounded_scale():
+    onnxruntime = pytest.importorskip("onnxruntime")
+    model = _decoder_tail_model()
+    remove_output_hard_clip(model)
+    model.graph.input[0].type.tensor_type.elem_type = TensorProto.FLOAT16
+    scale = next(item for item in model.graph.initializer if item.name == "scale")
+    scale.CopyFrom(
+        numpy_helper.from_array(np.array(32768.0, dtype=np.float16), "scale")
+    )
+
+    assert force_unbounded_pcm_tail_fp32(model) == 1
+    assert force_unbounded_pcm_tail_fp32(model) == 0
+    onnx.checker.check_model(model)
+    session = onnxruntime.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    audio = np.array(
+        [[[0.0, 2.0, 2.5, 3.0], [0.0, -2.0, -2.5, -3.0]]],
+        dtype=np.float16,
+    )
+
+    pcm = session.run([UNBOUNDED_PCM_OUTPUT], {"audio": audio})[0]
+
+    assert pcm[0, -1, 0] == 3 * 32767
+    assert pcm[0, -1, 1] == -3 * 32767

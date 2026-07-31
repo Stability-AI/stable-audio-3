@@ -57,7 +57,7 @@ from build_dit_fp16mixed import (
     fix_dtype_mismatches,
     manual_convert_to_fp16,
 )
-from decoder_output import remove_output_hard_clip
+from decoder_output import force_unbounded_pcm_tail_fp32, remove_output_hard_clip
 
 
 # SAME-S decoder profile — same as the canonical BF16 engine.
@@ -531,6 +531,11 @@ def convert_to_fp16mixed(input_onnx, output_onnx, mode="minimal"):
 
     # Retain compatibility with input graphs that have other Clip nodes.
     fp16_model = fix_extra_dtype_mismatches(fp16_model)
+
+    # Removing the output Clip makes the PCM scale genuinely unbounded. Keep
+    # that small postprocess tail in FP32 so values above ~2 cannot overflow
+    # FP16 before runtime peak protection sees them.
+    force_unbounded_pcm_tail_fp32(fp16_model)
 
     print(f"  saving to {output_onnx}")
     try:

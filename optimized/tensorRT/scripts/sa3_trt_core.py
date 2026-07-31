@@ -25,9 +25,11 @@ sys.path.insert(0, str(PROJECT_ROOT / "stable_audio_3"))
 from audio_output import (
     PCM16_CEILING,
     audio_peak,
+    dbfs_to_amplitude,
     protect_audio_peak,
     report_peak_protection,
     save_wav,
+    zero_audio_padding_,
 )
 
 # torch + tensorrt are imported LAZILY in main() (after CLI parsing) so that
@@ -1198,9 +1200,15 @@ def main():
                     help=f"Output WAV path. Relative paths are saved under {OUTPUT_DIR}/; "
                          f"absolute paths are used as-is. Always 16-bit PCM stereo @ 44.1 kHz, "
                          f"trimmed to --seconds.")
+    ap.add_argument("--peak-ceiling-dbfs", type=float, default=0.0,
+                    help="Output sample-peak ceiling in dBFS, at or below 0 (default: 0).")
     args = ap.parse_args()
     if args.steps < 1:
         ap.error(f"--steps must be ≥ 1 (got {args.steps})")
+    try:
+        peak_ceiling = dbfs_to_amplitude(args.peak_ceiling_dbfs)
+    except ValueError as exc:
+        ap.error(str(exc))
 
     # --quiet: stub out stage/sub prints, VRAM probes, and the sampling progress
     # bar so we can measure pure inference cost without instrumentation overhead.
@@ -1633,7 +1641,10 @@ def main():
         pcm_gpu = audio[0]                                      # (T_full, 2) int32
         if pcm_gpu.shape[0] > requested_samples:
             pcm_gpu = pcm_gpu[:requested_samples]
-        pcm_gpu = protect_audio_peak(pcm_gpu, ceiling=PCM16_CEILING).to(torch.int16)
+        pcm_gpu = protect_audio_peak(
+            pcm_gpu,
+            ceiling=PCM16_CEILING * peak_ceiling,
+        ).to(torch.int16)
         n = pcm_gpu.shape[0]
         if _pinned_pcm is not None:
             # Non-blocking DMA straight into the pre-allocated pinned host
@@ -1649,7 +1660,7 @@ def main():
         audio_gpu = audio[0]                                    # (2, T_full) fp32
         if audio_gpu.shape[-1] > requested_samples:
             audio_gpu = audio_gpu[..., :requested_samples]
-        audio_gpu = protect_audio_peak(audio_gpu)
+        audio_gpu = protect_audio_peak(audio_gpu, ceiling=peak_ceiling)
         pcm_gpu = (audio_gpu * PCM16_CEILING).to(torch.int16).T.contiguous()  # (T, 2)
         pcm = pcm_gpu.cpu().numpy()
     t_gpu2cpu = (time.time() - t0) * 1000

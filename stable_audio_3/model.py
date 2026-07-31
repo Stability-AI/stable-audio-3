@@ -4,7 +4,7 @@ import torch
 import typing as tp
 from torch.nn.functional import interpolate
 
-from stable_audio_3.audio_output import protect_audio_peak
+from stable_audio_3.audio_output import OutputPeakPolicy, apply_output_peak_policy
 from stable_audio_3.inference.audio_utils import numpy_audio_to_tensor, prepare_audio
 from stable_audio_3.inference.sampling import sample_diffusion
 from stable_audio_3.loading_utils import load_autoencoder, load_diffusion_cond
@@ -106,6 +106,8 @@ class StableAudioModel:
         dist_shift=None,
         return_latents: bool = False,
         chunked_decode: tp.Optional[bool] = None,
+        output_peak_policy: OutputPeakPolicy = "attenuate",
+        output_peak_ceiling_dbfs: float = 0.0,
         **sampler_kwargs,
     ) -> torch.Tensor:
         """
@@ -146,6 +148,11 @@ class StableAudioModel:
             return_latents: Whether to return the latents used for generation instead of the decoded audio.
             chunked_decode: Whether to decode latents in overlapping chunks to reduce peak VRAM. True forces
                 chunked decoding on, False forces it off, None (default) uses the value set in the model config.
+            output_peak_policy: ``"attenuate"`` preserves sample ratios while fitting
+                output under the configured ceiling. ``"raw"`` returns the unbounded
+                decoded waveform for callers that handle mastering themselves.
+            output_peak_ceiling_dbfs: Sample-peak ceiling in dBFS when
+                ``output_peak_policy="attenuate"``. Must be finite and <= 0.
             **sampler_kwargs: Additional keyword arguments to pass to the sampler.
         """
 
@@ -360,7 +367,12 @@ class StableAudioModel:
                     )
 
         if not return_latents:
-            result = protect_audio_peak(result, batch_dim=0)
+            result = apply_output_peak_policy(
+                result,
+                output_peak_policy,
+                ceiling_dbfs=output_peak_ceiling_dbfs,
+                batch_dim=0,
+            )
 
         return result
 

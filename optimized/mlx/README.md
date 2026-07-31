@@ -283,6 +283,7 @@ are interchangeable in either direction.
 | `--lora`              | —        | A `.safetensors` LoRA adapter (SA3-native/underfit or PEFT) with optional `strength=S` and `steps=MIN-MAX` tokens; repeat the flag to stack adapters. Full-range adapters merge at load; step-gated ones re-merge in place at step boundaries. Pickle `.ckpt/.pt` is refused. Base must match `--dit` |
 | `--lora-strength`     | 1.0      | Default strength for adapters without their own `strength=`; 0 = bit-exact bypass, >1 amplifies |
 | `--free-models`       | on       | Progressive model freeing; `--no-free-models` keeps them resident     |
+| `--peak-ceiling-dbfs` | 0        | Sample-peak ceiling in dBFS; use `-1` for additional encoding headroom |
 | `--out`               | out.wav  | Relative → `output/<file>`; absolute → as-is. 16-bit PCM stereo @ 44.1 kHz, trimmed to exactly `--seconds` |
 | `--play`              | off      | After writing, play via `afplay`; Ctrl-C stops both processes         |
 

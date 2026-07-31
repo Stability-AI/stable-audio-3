@@ -30,7 +30,7 @@ from models.defs.sa3_pipeline import (
     load_conditioner_from_npz,
 )
 from models.defs.t5gemma_mlx import T5Gemma
-from wav_io import save_wav
+from wav_io import dbfs_to_amplitude, save_wav
 from weights import ensure_local, is_present
 
 SAMPLE_RATE = 44100
@@ -450,6 +450,8 @@ def main():
                          "directory (auto-created); absolute paths are used as-is. "
                          "Always written as 16-bit PCM stereo at 44.1 kHz, trimmed to "
                          "exactly --seconds. If omitted, auto-named from the prompt and seed.")
+    ap.add_argument("--peak-ceiling-dbfs", type=float, default=0.0,
+                    help="Output sample-peak ceiling in dBFS, at or below 0 (default: 0).")
     ap.add_argument("--play", action="store_true",
                     help="After writing the WAV, play it through the default output device "
                          "via the macOS `afplay` binary. Blocking — the script exits when "
@@ -458,6 +460,10 @@ def main():
     args = ap.parse_args()
     if args.steps < 1:
         ap.error(f"--steps must be ≥ 1 (got {args.steps})")
+    try:
+        dbfs_to_amplitude(args.peak_ceiling_dbfs)
+    except ValueError as exc:
+        ap.error(str(exc))
 
     # Parse --lora groups into specs (fail fast, before any model loads).
     args.lora_specs = None
@@ -826,7 +832,11 @@ def main():
     requested_samples = int(round(args.seconds * SAMPLE_RATE))
     if audio_np.shape[-1] > requested_samples:
         audio_np = audio_np[..., :requested_samples]
-    save_wav(args.out, audio_np)
+    save_wav(
+        args.out,
+        audio_np,
+        peak_ceiling_dbfs=args.peak_ceiling_dbfs,
+    )
     stage("[5/5]", "Unpatch + write WAV", (time.time()-t0)*1000, peak_b=_stage_peak_b("Unpatch + WAV"))
     peak = float(np.abs(audio_np).max()); rms = float(np.sqrt((audio_np**2).mean()))
     sub(f"audio {audio_np.shape}   peak {peak:.3f}   rms {rms:.3f}")

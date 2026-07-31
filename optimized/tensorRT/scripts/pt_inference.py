@@ -22,7 +22,11 @@ import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT / "stable_audio_3"))
-from audio_output import PCM16_CEILING, protect_audio_peak  # noqa: E402
+from audio_output import (  # noqa: E402
+    PCM16_CEILING,
+    dbfs_to_amplitude,
+    protect_audio_peak,
+)
 
 TRT_REPO = Path("/weka2/cj/clod/sa3s/stable-audio-3/optimized/tensorRT")
 SCRIPTS_DIR = TRT_REPO / "scripts"
@@ -215,6 +219,7 @@ class PTInference:
                   cfg: float = 1.0,
                   init_audio_path: Optional[str] = None,
                   inpaint_range: Optional[tuple] = None,
+                  peak_ceiling_dbfs: float = 0.0,
                   ) -> tuple[np.ndarray, dict]:
         if cfg != 1.0:
             raise NotImplementedError("CFG not yet wired through PTInference")
@@ -296,7 +301,10 @@ class PTInference:
             # cannot attenuate the requested clip.
             actual_samples = int(round(seconds * SAMPLE_RATE))
             audio_fp32 = audio_fp32[..., :actual_samples]
-            audio_fp32 = protect_audio_peak(audio_fp32)
+            audio_fp32 = protect_audio_peak(
+                audio_fp32,
+                ceiling=dbfs_to_amplitude(peak_ceiling_dbfs),
+            )
             pcm_torch = (audio_fp32 * PCM16_CEILING).to(torch.int16)
             pcm = pcm_torch.squeeze(0).T.contiguous().cpu().numpy()
 

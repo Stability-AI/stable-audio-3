@@ -142,6 +142,11 @@ audio = model.generate(
 )
 ```
 
+Generated audio uses no-boost peak attenuation by default. Set
+`output_peak_ceiling_dbfs=-1.0` for additional headroom, or use
+`output_peak_policy="raw"` when a downstream mastering pipeline needs the
+unbounded decoded waveform.
+
 **Audio-to-Audio** — Edit an existing recording using a prompt to steer style and mood:
 
 ```python

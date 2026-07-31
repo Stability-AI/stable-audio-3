@@ -129,6 +129,7 @@ def test_text_to_audio_defaults(mock_model):
     assert kwargs["init_audio"] is None
     assert kwargs["inpaint_audio"] is None
     assert kwargs["chunked_decode"] is None
+    assert kwargs["output_peak_ceiling_dbfs"] == 0.0
 
 
 def test_generation_flags(mock_model):
@@ -188,6 +189,35 @@ def test_output_attenuates_out_of_range_audio(
     assert saved_audio.abs().max() == 1.0
     ratio = (saved_audio[0, 1] / saved_audio[0, 2]).item()
     assert ratio == pytest.approx(1.25 / 1.75)
+
+
+def test_peak_ceiling_flag_is_shared_by_generation_and_save(
+    mock_model, mock_torchaudio_save, tmp_path
+):
+    mock_model.generate.return_value = torch.tensor(
+        [[[0.0, 1.0], [0.0, -1.0]]], dtype=torch.float32
+    )
+
+    with pytest.warns(RuntimeWarning, match="0.501 PCM ceiling"):
+        _run(
+            [
+                "-p",
+                "test",
+                "--peak-ceiling-dbfs",
+                "-6",
+                "-o",
+                str(tmp_path / "out.wav"),
+            ]
+        )
+
+    assert mock_model.generate.call_args.kwargs["output_peak_ceiling_dbfs"] == -6.0
+    saved_audio = mock_torchaudio_save.call_args.args[1]
+    assert saved_audio.abs().max() == pytest.approx(10 ** (-6 / 20))
+
+
+def test_peak_ceiling_rejects_positive_dbfs(mock_model):
+    with pytest.raises(SystemExit):
+        _run(["-p", "test", "--peak-ceiling-dbfs", "0.1"])
 
 
 def test_output_batch_naming(mock_torchaudio_save, tmp_path):

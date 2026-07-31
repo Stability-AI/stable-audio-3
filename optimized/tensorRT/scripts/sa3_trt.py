@@ -127,13 +127,15 @@ class FullPipelineGraph:
     """
 
     def __init__(self, t5_runner: TRTRunner, dit: DiTRunner, dec_runner: TRTRunner,
-                 L: int, steps: int, requested_samples: int):
+                 L: int, steps: int, requested_samples: int,
+                 peak_ceiling: float = 1.0):
         self.t5_runner = t5_runner
         self.dit = dit
         self.dec_runner = dec_runner
         self.L = L
         self.steps = steps
         self.requested_samples = requested_samples
+        self.peak_ceiling = peak_ceiling
         # Will be allocated in build().
         self.input_ids_buf = None       # (1, 256) int64, device
         self.attn_mask_buf = None       # (1, 256) int64, device
@@ -148,6 +150,7 @@ class FullPipelineGraph:
         self.pcm_int16_buf = None       # (T_lat*4096, 2) int16, device
         self.pinned_host_pcm = None     # (T_lat*4096, 2) int16, pinned host
         self.pinned_host_peak = None    # scalar float32, pinned host
+        self.valid_sample_mask = None   # (T,) bool, updated before each replay
         self._peak_ceiling = None
         self.local_add_cond_buf = None  # (1, 257, L) fp32, device (kept zero)
         self._graph = None
@@ -264,6 +267,9 @@ class FullPipelineGraph:
                                                   pin_memory=True)
         self.pinned_host_peak = canon.torch.empty((), dtype=canon.torch.float32,
                                                    pin_memory=True)
+        self.valid_sample_mask = canon.torch.ones(
+            T_full, dtype=canon.torch.bool, device="cuda"
+        )
 
         # ── Warmup: replicate canonical's warmup sequence exactly so that the
         #    decoder context's internal state at the time of the captured call
@@ -371,10 +377,15 @@ class FullPipelineGraph:
                 # Stage 5a: narrow + cast int32 → int16 (or legacy fp32 → int16)
                 if self._dec_out_name in ("pcm_unbounded", "pcm"):
                     source = self.pcm_int32_buf[0, :self.requested_samples]
+                    canon.zero_audio_padding_(
+                        source,
+                        self.valid_sample_mask[:self.requested_samples],
+                        sample_dim=0,
+                    )
                     peak = canon.audio_peak(source).float()
                     protected = canon.protect_audio_peak(
                         source,
-                        ceiling=canon.PCM16_CEILING,
+                        ceiling=canon.PCM16_CEILING * self.peak_ceiling,
                         peak=peak,
                         validate_nonfinite=False,
                         emit_warning=False,
@@ -382,14 +393,20 @@ class FullPipelineGraph:
                     self.pcm_int16_buf[:self.requested_samples].copy_(
                         protected.to(canon.torch.int16)
                     )
-                    self._peak_ceiling = canon.PCM16_CEILING
+                    self._peak_ceiling = canon.PCM16_CEILING * self.peak_ceiling
                 else:
                     source = self._audio_legacy_buf[
                         0, :, :self.requested_samples
                     ]
+                    canon.zero_audio_padding_(
+                        source,
+                        self.valid_sample_mask[:self.requested_samples],
+                        sample_dim=1,
+                    )
                     peak = canon.audio_peak(source).float()
                     protected = canon.protect_audio_peak(
                         source,
+                        ceiling=self.peak_ceiling,
                         peak=peak,
                         validate_nonfinite=False,
                         emit_warning=False,
@@ -399,7 +416,7 @@ class FullPipelineGraph:
                         .to(canon.torch.int16)
                         .T
                     )
-                    self._peak_ceiling = 1.0
+                    self._peak_ceiling = self.peak_ceiling
                 self.pinned_host_peak.copy_(peak, non_blocking=True)
                 # Stage 5b: DtoH (captured non_blocking copy into pinned host)
                 self.pinned_host_pcm[:self.requested_samples].copy_(
@@ -414,7 +431,7 @@ class FullPipelineGraph:
         seed: int — used to seed the in-loop noise + the initial latent randn.
         seconds: float — duration condition. Written into dit._sec_buf before replay.
 
-        Returns: numpy.ndarray (requested_samples, 2) int16 — a view into the
+        Returns: numpy.ndarray (round(seconds * SAMPLE_RATE), 2) int16 — a view into the
         pinned host buffer (zero-copy; valid until next run() overwrites it).
         """
         assert self._built, "call build() first"
@@ -424,6 +441,14 @@ class FullPipelineGraph:
         # All host writes must happen on the SAME stream the graph replays on,
         # otherwise the replay races the input copies.
         with torch.cuda.stream(stream):
+            actual_samples = int(round(seconds * SAMPLE_RATE))
+            if not 0 <= actual_samples <= self.requested_samples:
+                raise ValueError(
+                    f"requested {actual_samples} samples but graph capacity is "
+                    f"{self.requested_samples}"
+                )
+            self.valid_sample_mask[:actual_samples].fill_(True)
+            self.valid_sample_mask[actual_samples:].fill_(False)
             # Update T5 input buffers via HtoD copy (captured by the graph
             # as raw device buffers — but the HtoD copy itself runs here,
             # OUTSIDE the graph, before replay).
@@ -451,7 +476,7 @@ class FullPipelineGraph:
             stacklevel=3,
         )
         # pinned_host_pcm has been written by the DtoH; return a view.
-        return self.pinned_host_pcm[:self.requested_samples].numpy()
+        return self.pinned_host_pcm[:actual_samples].numpy()
 
 
 # ─── Reusable inference class (CLI + gradio share this) ─────────────────
@@ -491,7 +516,8 @@ class SA3Inference:
                  default_seconds: float = 30.0,
                  models_dir: Path | None = None,
                  with_encoder: bool = False,
-                 quiet: bool = False):
+                 quiet: bool = False,
+                 peak_ceiling_dbfs: float = 0.0):
         """Load engines + build a warmup graph.
 
         Args:
@@ -516,6 +542,7 @@ class SA3Inference:
             with_encoder:   also load the audio encoder TRT engine (needed for
                             future audio-to-audio / inpaint modes)
             quiet:          suppress per-stage print() output from canon helpers
+            peak_ceiling_dbfs: sample-peak ceiling in dBFS, at or below 0
         """
         if dit not in DIT_CHOICES:
             raise ValueError(f"unknown dit={dit!r}; valid: {list(DIT_CHOICES)}")
@@ -561,6 +588,7 @@ class SA3Inference:
         self.precision = precision
         self.with_encoder = with_encoder
         self.quiet = quiet
+        self.peak_ceiling = canon.dbfs_to_amplitude(peak_ceiling_dbfs)
 
         # 1. Lazy-download any missing engines (precision-aware).
         needed = canon.get_engine_files(dit, decoder, precision, with_encoder=with_encoder)
@@ -664,7 +692,7 @@ class SA3Inference:
         # serves any seconds within that T_lat's range.
         max_samples = T_lat * SAMPLES_PER_LATENT
         graph = FullPipelineGraph(self.runners["t5"], self.dit, self.runners["dec"],
-                                   T_lat, steps, max_samples)
+                                   T_lat, steps, max_samples, self.peak_ceiling)
         graph.build(sigmas, seconds, sigma_max)
         canon.torch.cuda.synchronize()
 
@@ -785,12 +813,18 @@ def main():
     ap.add_argument("--pinned-copy", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--out", default="out.wav")
+    ap.add_argument("--peak-ceiling-dbfs", type=float, default=0.0,
+                    help="Output sample-peak ceiling in dBFS, at or below 0 (default: 0).")
     ap.add_argument("--mega-graph", action=argparse.BooleanOptionalAction, default=True,
                     help="Capture the entire pipeline in one CUDA graph (T5+DiT+decoder+narrow+DtoH). "
                          "On by default. Falls back to eager path for cfg≠1.0, inpaint, or audio-to-audio.")
     args = ap.parse_args()
     if args.steps < 1:
         ap.error(f"--steps must be ≥ 1 (got {args.steps})")
+    try:
+        peak_ceiling = canon.dbfs_to_amplitude(args.peak_ceiling_dbfs)
+    except ValueError as exc:
+        ap.error(str(exc))
 
     # Mute display in quiet mode — match sa3_trt's behavior.
     if args.quiet:
@@ -945,7 +979,7 @@ def main():
         # The graph copies the full pinned-host buffer up to requested_samples;
         # the WAV save reads the same buffer.
         mega = FullPipelineGraph(runners["t5"], dit, runners["dec"],
-                                  T_lat, args.steps, requested_samples)
+                                  T_lat, args.steps, requested_samples, peak_ceiling)
         mega.build(sigmas, args.seconds, sigma_max)
         torch.cuda.synchronize()
         sub(f"{dim(f'warmup + capture')} {(time.time()-t0)*1000:.0f} ms")

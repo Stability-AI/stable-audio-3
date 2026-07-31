@@ -10,8 +10,11 @@ from optimized.mlx.scripts.wav_io import protect_audio_peak as protect_numpy_pea
 from optimized.mlx.scripts.wav_io import save_wav
 from stable_audio_3.audio_output import (
     PCM16_CEILING,
+    apply_output_peak_policy,
     audio_peak,
+    dbfs_to_amplitude,
     protect_audio_peak,
+    zero_audio_padding_,
 )
 from stable_audio_3.model import StableAudioModel
 
@@ -51,6 +54,23 @@ def test_torch_peak_protection_supports_unbounded_int32_pcm():
     assert ratio == pytest.approx(40959 / 57342, abs=1e-4)
 
 
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+def test_integer_peak_protection_handles_minimum_int32(backend):
+    minimum = np.iinfo(np.int32).min
+    if backend == "numpy":
+        audio = np.array([0, minimum], dtype=np.int32)
+    else:
+        audio = torch.tensor([0, minimum], dtype=torch.int32)
+
+    protected = protect_audio_peak(
+        audio,
+        ceiling=PCM16_CEILING,
+        emit_warning=False,
+    )
+
+    assert float(audio_peak(protected)) == pytest.approx(PCM16_CEILING)
+
+
 def test_torch_peak_protection_has_capture_safe_branchless_mode():
     audio = torch.tensor([0.0, 1.25, 1.75])
     peak = audio_peak(audio)
@@ -74,6 +94,54 @@ def test_numpy_peak_protection_does_not_boost_quiet_audio():
     protected = protect_numpy_peak(audio)
 
     assert protected is audio
+
+
+def test_output_peak_policy_can_return_validated_raw_audio():
+    audio = torch.tensor([0.0, 1.75])
+
+    assert apply_output_peak_policy(audio, "raw") is audio
+    with pytest.raises(RuntimeError, match="non-finite"):
+        apply_output_peak_policy(torch.tensor([torch.nan]), "raw")
+
+
+def test_dbfs_ceiling_adds_headroom_without_boosting():
+    ceiling = dbfs_to_amplitude(-1.0)
+    loud = np.array([0.0, 2.0], dtype=np.float32)
+    quiet = np.array([0.0, ceiling / 2], dtype=np.float32)
+
+    protected = apply_output_peak_policy(
+        loud,
+        ceiling_dbfs=-1.0,
+        emit_warning=False,
+    )
+
+    assert np.abs(protected).max() == pytest.approx(ceiling)
+    assert (
+        apply_output_peak_policy(
+            quiet,
+            ceiling_dbfs=-1.0,
+            emit_warning=False,
+        )
+        is quiet
+    )
+
+
+@pytest.mark.parametrize("ceiling_dbfs", [0.1, float("inf"), float("nan")])
+def test_dbfs_ceiling_rejects_invalid_values(ceiling_dbfs):
+    with pytest.raises(ValueError, match="ceiling_dbfs"):
+        dbfs_to_amplitude(ceiling_dbfs)
+
+
+@pytest.mark.parametrize("sample_dim", [0, 1])
+def test_zero_audio_padding_excludes_invalid_tail(sample_dim):
+    audio = torch.tensor([[0.5, 0.25], [10.0, 10.0]])
+    if sample_dim == 1:
+        audio = audio.T.contiguous()
+    valid = torch.tensor([True, False])
+
+    zero_audio_padding_(audio, valid, sample_dim=sample_dim)
+
+    assert float(audio.abs().max()) == pytest.approx(0.5)
 
 
 def test_mlx_wav_serializer_attenuates_instead_of_clipping(tmp_path):
@@ -136,3 +204,21 @@ def test_generate_trims_decoder_padding_before_peak_protection(discarded_tail):
         )
 
     assert torch.equal(result, decoded[..., :2])
+
+
+def test_generate_can_return_raw_unbounded_audio():
+    model = StableAudioModel.__new__(StableAudioModel)
+    model.model = _FakePipeline()
+    model.device = "cpu"
+    decoded = torch.tensor([[[0.5, 1.75], [-0.25, -1.25]]])
+
+    with patch("stable_audio_3.model.sample_diffusion", return_value=decoded):
+        result = model.generate(
+            conditioning_tensors={},
+            duration=2,
+            sample_size=2,
+            batch_size=1,
+            output_peak_policy="raw",
+        )
+
+    assert torch.equal(result, decoded)

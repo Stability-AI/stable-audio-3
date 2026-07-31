@@ -254,6 +254,7 @@ Rebuild the decoder through `build/build.py`; updated engines expose
 | `--quiet`            | off         | Suppress per-stage prints + NVML probes — saves ~4 ms                          |
 | `--pinned-copy`      | on          | Pinned host buffer + non_blocking DtoH for Stage 5                             |
 | `--free-models`      | off         | Free TRT engine memory after each stage's last use                             |
+| `--peak-ceiling-dbfs` | 0          | Sample-peak ceiling in dBFS; use `-1` for additional encoding headroom         |
 | `--out`              | out.wav     | Relative → `output/<file>`; absolute → as-is. 16-bit PCM stereo @ 44.1 kHz     |
 
 ## Files

@@ -210,29 +210,43 @@ TARGETS = {
         # still need a (tiny, ~0.1%) fp32 island. See _pin_fourier_fp32.
         "pin_fourier_fp32": True,
     },
-    # SA3 medium DiT in fp8 — SELECTABLE, medium-only, the MAX-SPEED clean tier.
-    # Identical recipe to sa3-m-bf16 (same RoPE-baked ONNX flow from build_dit_bf16.py,
-    # same EXPLICIT_BATCH + OBEY + Fourier fp32 island) PLUS BuilderFlag.FP8: the ONNX
-    # carries fp8 E4M3 Quantize/Dequantize pairs on the 176 Linear GEMMs, so TRT fires
-    # fp8 tensor-core GEMMs there while the 96 attention blocks stay bf16 fused-MHA
-    # (_gemm_mha_v2) and the RoPE cos/sin ride as baked fp32 constants. Measured on
-    # H200 (same-run round-robin): ~1.3x faster than fp16-mixed at every length
-    # (1.40x@L129 / 1.32x@L1292 / 1.34x@L4092, also ahead of bf16) and clean at long
-    # sequence (latent std 0.86 vs eager 0.95, 0.000% clip @6-min) — the baked RoPE
-    # dodges bf16's long-angle drift, so it stays clean where bf16 clips. It is a SPEED
-    # tier over the fp16-mixed default, NOT a fidelity upgrade (single-step velocity cos
-    # vs the fp32 engine ~0.92-0.97 < fp16mixed's ~1.0; the 8-step render stays
-    # coherent). Identity of the shipped engine: 176 fp8 GEMMs + 96 bf16 fused MHA +
-    # fp32 RoPE constant — check with scripts/verify_fp8_rope.py. Same _DIT_PROFILE
+    # SA3 medium DiT in fp8 — SELECTABLE, medium-only, the MAX-SPEED clean tier,
+    # now CALIBRATED. Identical recipe to sa3-m-bf16 (same RoPE-baked ONNX flow from
+    # build_dit_bf16.py, same EXPLICIT_BATCH + OBEY + Fourier fp32 island) PLUS
+    # BuilderFlag.FP8: the ONNX carries fp8 E4M3 Quantize/Dequantize pairs on the 176
+    # Linear GEMMs, so TRT fires fp8 tensor-core GEMMs there while the 96 attention
+    # blocks stay bf16 fused-MHA (_gemm_mha_v2) and the RoPE cos/sin ride as baked fp32
+    # constants. Measured on H200 (same-run round-robin): ~1.3x faster than fp16-mixed
+    # at every length (1.40x@L129 / 1.32x@L1292 / 1.34x@L4092, also ahead of bf16) and
+    # clean at long sequence (latent std 0.86 vs eager 0.95, 0.000% clip @6-min) — the
+    # baked RoPE dodges bf16's long-angle drift, so it stays clean where bf16 clips.
+    #
+    # CALIBRATED SCALES (2026-07-31): the published dit_fp8.onnx now carries the
+    # real-conditioning calibrated activation + per-channel weight scales from
+    # @ryanontheinside's fp8 work (#47), grafted onto this bakedmin structure by
+    # build/transplant_scales.py. Calibration is speed-free (31.2 vs the uncalibrated
+    # 30.8 ms/fwd, within run noise) and lifts worst-step velocity-cos vs fp32 from
+    # 0.52/0.57/0.64 to 0.92/0.94/0.92 on adversarial seeds; sampling steps 1-7 match
+    # the fully-calibrated #47 reference within ~0.001. It is still a SPEED tier over the
+    # fp16-mixed default rather than a fidelity upgrade over it (single-step velocity cos
+    # ~0.92-0.94 < fp16mixed's ~1.0), but it no longer collapses at the highest-noise
+    # first step the way the uncalibrated engine did. #47's fp16-attention variant buys
+    # the last ~0.03 of step-0 fidelity for +2 ms/fwd; this tier keeps bf16 attention for
+    # the speed. Identity of the shipped engine: 176 fp8 GEMMs + 96 bf16 fused MHA +
+    # baked fp32 RoPE constant — check with scripts/verify_fp8_rope.py. Same _DIT_PROFILE
     # (batch=1, L in [1,4096]) → identical CLI/feature surface. medium-only, not
     # seed-reproducible vs fp16mixed.
     #
-    # Producer: the fp8-linear ONNX (fp8 QDQ inserted; inv_freq inline) is RoPE-baked
-    # by build_dit_bf16.py, the SAME baker as the bf16 tier (it handles inline OR
-    # external inv_freq). The baked cos/sin tables are sized to profile max L=4096;
-    # renders past 4096 (the SAME-L decoder's own cap → rejected by sa3_trt) would need
-    # a re-bake (--max-t). The .onnx keeps its external-data reference to
-    # `dit_fp8lin.onnx.data`, so that exact sidecar name is what ships alongside.
+    # Producer: the fp8-linear ONNX (fp8 QDQ inserted; inv_freq inline) is RoPE-baked by
+    # build_dit_bf16.py, the SAME baker as the bf16 tier (it handles inline OR external
+    # inv_freq), then build/transplant_scales.py swaps in #47's calibrated scale VALUES
+    # (the 5.8 GB fp32 weights are untouched — TRT re-quantizes them at build). A
+    # from-scratch recalibration (model retrain) regenerates those scales with #47's full
+    # pipeline: make_calib.py (real-conditioning capture, in this repo) -> build_dit_fp8.py
+    # (max-PTQ + per-channel scales, lives in #47). The baked cos/sin tables are sized to
+    # profile max L=4096; renders past 4096 (the SAME-L decoder's own cap → rejected by
+    # sa3_trt) would need a re-bake (--max-t). The .onnx keeps its external-data reference
+    # to `dit_fp8lin.onnx.data`, so that exact sidecar name is what ships alongside.
     "sa3-m-fp8": {
         "onnx_hf":      ["sa3-m/dit_fp8.onnx", "sa3-m/dit_fp8lin.onnx.data"],
         "trt_local":    "sa3-m/dit_fp8.trt",

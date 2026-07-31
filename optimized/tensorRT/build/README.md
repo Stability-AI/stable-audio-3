@@ -251,45 +251,78 @@ git commit -m "Refresh canonical ONNX"
 git push
 ```
 
-## Medium `fp8` — the max-speed RoPE-baked engine
+## Medium `fp8` — the max-speed RoPE-baked engine, calibrated
 
 On top of the `fp16mixed` default and the selectable `bf16`, the medium DiT ships an **`fp8`**
 engine (`dit_fp8.trt`, `--precision fp8`): fp8 E4M3 on the 176 linear GEMMs + 96 bf16 fused
 FMHA + the **same baked fp32 RoPE constant table** as bf16. Measured on H200 it is ~1.3×
 faster than `fp16mixed` at every length (1.40× / 1.32× / 1.34× @L129/1292/4092, also ahead of
 bf16) and clean at long sequence (latent std 0.86, 0.000% clip at 6-min), so it stays clean
-exactly where bf16 clips. It is a speed tier over the default, **not** a fidelity upgrade
-(single-step velocity cos vs fp32 ~0.92–0.97 < fp16mixed's ~1.0; the 8-step render stays
-coherent). See the runtime README's precision section for positioning.
+exactly where bf16 clips.
+
+The fp8 scales are **calibrated on real conditioning** (updated 2026-07-31). The scale VALUES —
+per-tensor activation amax + per-channel weight scales — come from @ryanontheinside's fp8 work
+([#47](https://github.com/Stability-AI/stable-audio-3/pull/47)): captured with his `make_calib.py`
+and grafted onto this baked / bf16-fused structure by `transplant_scales.py`. Calibration is
+**speed-free** (31.2 vs the earlier uncalibrated 30.8 ms/fwd, inside run noise) and lifts
+worst-case per-step fidelity — worst-step velocity-cos vs fp32 on adversarial seeds goes
+**0.52/0.57/0.64 → 0.92/0.94/0.92**, with sampling steps 1–7 tracking the fully-calibrated #47
+reference within ~0.001. It is still a **speed tier over the `fp16mixed` default, not a fidelity
+upgrade over it** (single-step velocity cos ~0.92–0.94 < fp16mixed's ~1.0; the 8-step render
+stays coherent), but it no longer collapses at the highest-noise first step the way the
+uncalibrated engine did. See the runtime README's precision section for positioning.
 
 **Consumer (per-arch rebuild).** The `.trt` is `sm_90`-specific; `sm_89` / `sm_120` / `sm_100`
 are a rebuild away (run on the target GPU):
 
 ```bash
-python build_from_onnx.py sa3-m-fp8     # pulls dit_fp8.onnx (+ dit_fp8lin.onnx.data) from HF
+python build_from_onnx.py sa3-m-fp8     # pulls the calibrated dit_fp8.onnx (+ dit_fp8lin.onnx.data) from HF
 ```
 
 `sa3-m-fp8` is the `sa3-m-bf16` recipe **plus `BuilderFlag.FP8`**: weakly-typed
 `EXPLICIT_BATCH` + `BF16` + `FP8` + `OBEY_PRECISION_CONSTRAINTS`, reusing the same
 `_pin_fourier_fp32` island (on the RoPE-baked ONNX the only `Cos`/`Sin` left are the two
-runtime Fourier chains). The fp8 E4M3 Quantize/Dequantize pairs ride in the ONNX, so TRT fires
-fp8 tensor-core GEMMs on the Linears while attention stays bf16 fused-MHA. Identity of the
-shipped engine — **176 fp8 GEMMs + 96 bf16 fused MHA + fp32 RoPE constant** — verify with
+runtime Fourier chains). The fp8 E4M3 Quantize/Dequantize pairs — carrying the calibrated
+scales — ride in the ONNX, so TRT fires fp8 tensor-core GEMMs on the Linears while attention
+stays bf16 fused-MHA. The build recipe is **unchanged by calibration**: calibration lives in the
+ONNX scale values, not the builder flags. Identity of the shipped engine — **176 fp8 GEMMs +
+96 bf16 fused MHA + baked fp32 RoPE constant** — verify with
 `python ../scripts/verify_fp8_rope.py <engine>.trt` (needs a DETAILED-verbosity build, as the
 shipped engine is; a plain consumer rebuild renders identically but is not introspectable).
 
-**Producer (refresh the ONNX).** RoPE-baking is the SAME step as bf16 — `build_dit_bf16.py` is
-the shared baker (it handles both an external `inv_freq`, as in the fp32 `dit.onnx`, and an
-inline one, as in the fp8-linear ONNX):
+**Producer (refresh the ONNX).** Two independent pieces: RoPE-baking (structure) and
+calibration (scale values).
+
+RoPE-baking is the SAME step as bf16 — `build_dit_bf16.py` is the shared baker (it handles both
+an external `inv_freq`, as in the fp32 `dit.onnx`, and an inline one, as in the fp8-linear ONNX):
 
 ```bash
-python build_dit_bf16.py --input dit_fp8lin.onnx --output dit_fp8.onnx --max-t 4160
+python build_dit_bf16.py --input dit_fp8lin.onnx --output dit_fp8lin_ropebaked.onnx --max-t 4160
 ```
 
 `--max-t` (4160 = profile max 4096 + 64 global tokens) sizes the baked table; rendering past
 L=4096 would need a larger `--max-t` **and** a matching TRT profile — the runtime rejects
 L>4096 up front, coinciding with the SAME-L decoder's own cap, so it is not a new end-to-end
 limit.
+
+Then graft the calibrated fp8 scales onto the baked graph with `transplant_scales.py`. It matches
+every quantized Linear by weight-initializer name and swaps only the scale VALUES (per-tensor
+activation amax + per-channel weight scales); the 5.8 GB fp32 weights are untouched and TRT
+re-quantizes them at build:
+
+```bash
+python transplant_scales.py \
+    --ours-onnx  dit_fp8lin_ropebaked.onnx \
+    --calib-onnx <build_dit_fp8.py output>/dit_fp8_calib.onnx \
+    --out        dit_fp8.onnx           # publish this as onnx/sa3-m/dit_fp8.onnx
+```
+
+The calibrated `--calib-onnx` comes from @ryanontheinside's fp8 pipeline
+([#47](https://github.com/Stability-AI/stable-audio-3/pull/47)). A **from-scratch recalibration**
+(only needed on a model retrain) reruns `make_calib.py` (real-conditioning capture, in this
+repo) → `build_dit_fp8.py` (max-PTQ + per-channel weight scales; that builder lives in #47, not
+merged here). Everyday consumers never recalibrate — they pull the published calibrated
+`dit_fp8.onnx`.
 
 ## File map
 
@@ -300,7 +333,9 @@ limit.
 | `build_dit_profile.py` | Build a DiT with custom `(min, opt, max)` profile shapes (experimental — short-form / fixed-shape variants). Operates on either ONNX flavor. | consumer |
 | `build_dit_fp16mixed.py` | **Producer-side** ONNX surgery: takes the canonical FP32 `dit.onnx`, finds RMSNorm chains + attention `Softmax` + RoPE region, wraps each in `Cast(FP32) ↔ Cast(FP16)` islands, converts non-island weights to FP16, then bounds the RoPE island before QK^T (`bound_attention_core()`, `--no-bound-attn` to skip) so the attention core runs FP16 and TRT's FMHA fuser fires — 96/96 attentions on the medium DiT, 4.3× at L=4096. Writes both the modified `dit_fp16mixed.onnx` AND the TRT engine, which **must** be `STRONGLY_TYPED` (weakly-typed + `BuilderFlag.FP16` re-casts the FP32 islands and silently degrades to naive FP16). Only re-run when the model retrains or the island recipe changes. Requires `onnx` + `onnx-graphsurgeon`. | producer |
 | `build_dit_bf16.py` | **Producer-side** shared RoPE-baker for the medium `bf16` AND `fp8` engines: precomputes RoPE's cos/sin in fp64 on the host, freezes them as fp32 constant tables (`--max-t`), rewires the 96 trig sites and lets DCE delete the runtime angle chain — so the trunk runs bf16/fp8 without the long-angle drift. Weights are never loaded (keeps the input's `.data` sidecar). Handles both external `inv_freq` (fp32 `dit.onnx`) and inline (fp8-linear ONNX). Consumer compile: `build_from_onnx.py sa3-m-bf16` / `sa3-m-fp8`. Requires `onnx`. | producer |
-| `../scripts/verify_fp8_rope.py` | EngineInspector identity check for the fp8 engine (176 fp8 GEMMs + 96 bf16 fused MHA + fp32 RoPE constant). Needs a DETAILED-verbosity build. | consumer |
+| `make_calib.py` | **Producer-side** FP8 calibration capture: drives the model's own pingpong `generate()` and records the six DiT engine inputs at every sampling step into a `.npz` (real-conditioning, deployment-matched prompts). Feeds `build_dit_fp8.py` (#47). Only re-run for a from-scratch recalibration on a model retrain. Calibration tooling by @ryanontheinside (#47). Requires `torch` + `stable_audio_3`. | producer |
+| `transplant_scales.py` | **Producer-side** fp8 scale transplant: grafts #47's calibrated activation + per-channel weight scales onto the RoPE-baked bakedmin ONNX (matches Linears by weight-initializer name, swaps only the scale VALUES; weights untouched). This is what makes the shipped `dit_fp8.onnx` calibrated while keeping bakedmin's bf16 fused-MHA speed. Scale values / calibration by @ryanontheinside (#47). Requires `onnx`. | producer |
+| `../scripts/verify_fp8_rope.py` | EngineInspector identity check for the fp8 engine (176 fp8 GEMMs + 96 bf16 fused MHA + baked fp32 RoPE constant). Needs a DETAILED-verbosity build. | consumer |
 | `build_t5gemma.py` | Trace + export T5Gemma encoder ONNX + build TRT | producer |
 | `build_same_s_decoder.py` | Trace + export SAME-S decoder ONNX + build TRT | producer |
 | `build_same_s_encoder.py` | Trace + export SAME-S encoder ONNX + build TRT | producer |

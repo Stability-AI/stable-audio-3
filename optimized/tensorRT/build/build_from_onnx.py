@@ -8,6 +8,17 @@ stabilityai/stable-audio-3-optimized/onnx/.
 To rebuild engines for a new GPU arch (sm_100, sm_120, ...) you run this on
 that GPU and TRT bakes the arch into the engine.
 
+SAME-L attention kernel: the SWA plugin ships two implementations and the choice is
+baked into the engine at build time. AOT (default) compiles a block-tiled tensor-core
+PTX kernel in, so nothing re-enters Python at inference and the engine can be captured
+into a CUDA graph. JIT dispatches to Triton through a Python callback on every enqueue.
+If you are bringing up a new architecture and the decoder produces a constant wash of
+noise, or silence, read "Choosing the SAME-L attention kernel" in build/README.md before
+anything else — that is the signature of a non-capturable engine inside the mega-graph.
+
+    SA3_SWA_PLUGIN=aot|jit   which implementation the engine uses (default aot)
+    SA3_SWA_AOT=mma|ptx      which AOT kernel, if AOT (default mma)
+
 Usage:
     python build_from_onnx.py t5gemma
     python build_from_onnx.py same-s-encoder
@@ -33,11 +44,6 @@ from _arch import detect_arch, arch_dir  # noqa: E402
 
 HF_REPO = "stabilityai/stable-audio-3-optimized"
 HF_ONNX_PREFIX = "onnx"  # files at HF_REPO/onnx/<engine_subdir>/<file>.onnx
-
-# Architectures where the JIT (Triton) plugin path produces a non-stream-capturable
-# engine, so the AOT PTX path must be used instead. Everywhere else JIT is preferred
-# because it is measurably faster. See the plugin-preference block in build_one().
-_AOT_PLUGIN_ARCHES = {"sm_120"}
 
 T5_TOKENS = 256
 T5_HIDDEN_DIM = 768
@@ -464,30 +470,22 @@ def build_one(name: str) -> str:
         #   "Plugin 'samel::diff_attn_swa' has both AOT and JIT implementations.
         #    PREFER_AOT_PYTHON_PLUGINS or PREFER_JIT_PYTHON_PLUGINS should be specified."
         #
-        # The choice is per-arch because neither wins outright, measured on the SAME-L
-        # decoder at L=1292:
-        #
-        #   sm_120  JIT engine is NOT stream-capturable. enqueueV3 returns False under
-        #           capture, the decode is silently dropped from the mega-graph, and
-        #           every render returns the warmup decode of zero latents (a constant
-        #           wash, identical across seeds, exit code 0). AOT is the only correct
-        #           option here, and it restores the mega-graph fast path.
-        #   sm_90   JIT captures fine AND is 24% faster (55.0 ms vs AOT's best 68.2 ms).
-        #           The gap is algorithmic, not tuning: the Triton kernel block-tiles
-        #           queries sharing K/V in SRAM and uses tl.dot for tensor cores, while
-        #           the PTX kernel is one warp per query, scalar FP32, no K/V reuse.
-        #           Sweeping its only knob (warps_per_block) across 1..16 moves it 7%
-        #           and never closes the gap. So AOT would be a pure 24% loss here.
-        if detect_arch() in _AOT_PLUGIN_ARCHES:
+        # Two implementations of the SAME-L SWA plugin exist and the engine bakes in
+        # whichever this build prefers. Default AOT; override with SA3_SWA_PLUGIN=jit.
+        # See "Choosing the SAME-L attention kernel" in build/README.md.
+        want = os.environ.get("SA3_SWA_PLUGIN", "aot").lower()
+        if want not in ("aot", "jit"):
+            sys.exit(f"SA3_SWA_PLUGIN must be 'aot' or 'jit', got {want!r}")
+        if want == "aot":
             net_flags |= 1 << int(
                 trt.NetworkDefinitionCreationFlag.PREFER_AOT_PYTHON_PLUGINS)
-            print(f"  plugin impl: AOT (required on {detect_arch()} for graph capture)",
-                  flush=True)
+            print("  plugin impl: AOT — graph-capturable, no Python in the enqueue "
+                  "path (SA3_SWA_PLUGIN=jit to switch)", flush=True)
         else:
             net_flags |= 1 << int(
                 trt.NetworkDefinitionCreationFlag.PREFER_JIT_PYTHON_PLUGINS)
-            print(f"  plugin impl: JIT (captures on {detect_arch()} and is faster)",
-                  flush=True)
+            print("  plugin impl: JIT — Triton at runtime. NOT stream-capturable on "
+                  "sm_120; verify before shipping (see build/README.md)", flush=True)
     network = builder.create_network(net_flags)
     parser = trt.OnnxParser(network, logger)
     if not parser.parse_from_file(onnx_path):

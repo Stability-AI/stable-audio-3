@@ -175,6 +175,21 @@ Omit `--dit` / `--decoder` for an interactive arrow-key picker. Relative
 The TRT DiT engines are static batch=1 (the ONNX bakes batch=1), so CFG runs as a
 sequential cond+uncond dual-pass at batch=1 for every precision.
 
+### SAME-L attention kernel
+
+`--decoder same-l` uses a custom sliding-window-attention plugin. Prebuilt engines embed
+an ahead-of-time PTX kernel, so nothing re-enters Python during inference and the engine
+goes inside the full-pipeline CUDA graph. This matters on **sm_120**, where the older
+JIT-dispatched build is not stream-capturable: the decode is silently dropped from the
+graph and every render comes back as the same wash of noise, with exit code 0.
+
+If you see byte-identical output across seeds, you are on an affected engine. Re-pull it
+(the published `sm_120` engines were rebuilt 2026-07-31), or run with `--no-mega-graph` to
+bypass capture. The `sm_90` engines are unaffected and still ship the JIT kernel, which is
+why **Triton is required at inference on sm_90 but not on sm_120**. Building your own is
+covered under "Choosing the SAME-L attention kernel" in
+[`build/README.md`](build/README.md).
+
 ## Speed & memory
 
 Measured on **H100 SXM 80 GB** at `--steps 8` (rf-denoiser sweet spot).

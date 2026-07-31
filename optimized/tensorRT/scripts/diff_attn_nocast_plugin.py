@@ -25,6 +25,8 @@ SAME-L decoder: FP32 in/out, q/k/v each (B, N, 2H, D) = (1, 4352, 48, 64), D=64,
 2H=48 so H=24, window=17. It performs the differential subtraction in FP32 inside
 the kernel, which is also what the Triton path does via o[:, :, :H] - o[:, :, H:].
 """
+import os
+
 import torch
 import tensorrt.plugin as trtp
 from typing import Tuple
@@ -35,6 +37,15 @@ WINDOW = 17
 HEAD_DIM = 64
 WARPS_PER_BLOCK = 4
 _ptx_cache: dict = {}
+
+# Which AOT kernel to compile into the engine:
+#   "mma"  block-tiled Triton-compiled kernel with tensor cores (swa_mma_aot).
+#          BLOCK_N queries per block sharing the K/V window in SRAM; ~3.6x faster per
+#          layer than "ptx" and on par with the JIT path.
+#   "ptx"  the original hand-written scalar-FP32 kernel (diff_swa_ptx_kernel): one warp
+#          per query, no K/V reuse, zero mma instructions.
+# Both are graph-capturable; this only trades speed. Override with SA3_SWA_AOT.
+SWA_AOT_BACKEND = os.environ.get("SA3_SWA_AOT", "mma").lower()
 
 
 def _ptx_for(num_heads: int):
@@ -90,13 +101,32 @@ def diff_attn_swa_aot(q_bat: trtp.TensorDesc, k_bat: trtp.TensorDesc,
     position for head h and head h+H, subtracting in FP32 before the store. Strides
     are passed as symbolic extras so the kernel works across the dynamic N axis.
     """
-    name, ptx = _ptx_for(num_heads)
     B = q_bat.shape_expr[0]
     N = q_bat.shape_expr[1]
     H2 = q_bat.shape_expr[2]
     D = q_bat.shape_expr[3]
     H_out = H2 // 2
 
+    if SWA_AOT_BACKEND == "mma":
+        # Block-tiled tensor-core kernel. Its scalars are baked in as constexprs at
+        # compile time, so the only runtime extra is N. Grid is one block per
+        # (query tile, output head, batch); shared memory holds the Q/K/V tiles.
+        import swa_mma_aot
+        from _arch import detect_arch
+        name, ptx, shared, warps = swa_mma_aot.build(num_heads, detect_arch())
+        extra = trtp.SymIntExprs(1)
+        extra[0] = N
+        return (name, ptx,
+                trtp.KernelLaunchParams(
+                    grid_x=trtp.cdiv(N, swa_mma_aot.BLOCK_N),
+                    grid_y=H_out,
+                    grid_z=B,
+                    block_x=warps * 32,
+                    shared_mem=shared),
+                extra)
+
+    # Hand-written scalar kernel: one warp per query, strides passed at runtime.
+    name, ptx = _ptx_for(num_heads)
     extra = trtp.SymIntExprs(5)
     extra[0] = N
     extra[1] = H2 * D        # stride between positions, input

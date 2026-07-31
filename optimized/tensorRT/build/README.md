@@ -81,6 +81,80 @@ python build_from_onnx.py all-both              # canonical + FP32
 
 That's it — no `stable-audio-tools`, no `transformers`, no model checkpoints.
 
+## Choosing the SAME-L attention kernel
+
+The SAME-L encoder/decoder use a custom sliding-window-attention plugin
+(`samel::diff_attn_swa`). It ships **two implementations**, and which one the engine uses
+is decided at build time and baked into the `.trt`. If you are bringing up an
+architecture we have not published engines for, this is the one knob you may have to
+touch.
+
+```bash
+SA3_SWA_PLUGIN=aot   # default. PTX kernel compiled into the engine.
+SA3_SWA_PLUGIN=jit   # Triton dispatched through a Python callback per enqueue.
+SA3_SWA_AOT=mma      # default AOT kernel: block-tiled, tensor cores.
+SA3_SWA_AOT=ptx      # fallback AOT kernel: scalar FP32, one warp per query.
+```
+
+| | AOT (`mma`) | JIT |
+|---|---|---|
+| CUDA-graph capturable | **yes** | yes on sm_90, **no on sm_120** |
+| Python/Triton callbacks per decode | **0** | 12 (one per attention layer) |
+| Needs torch + Triton at inference | no | **yes** |
+| Engine size | +0.1% | baseline |
+| Build-time deps | Triton | Triton |
+
+### Why AOT is the default
+
+**Correctness on sm_120.** A JIT engine is not stream-capturable there: `enqueueV3`
+returns `False` under capture, TRT reports *"this TRT engine is not stream capturable"*,
+and the stage is **silently omitted** from the graph. The decoder then returns the
+pre-capture warmup decode of zero latents — a constant wash of noise, byte-identical
+across seeds and prompts, with **exit code 0**. It captures fine on sm_90, but
+re-entering Python inside a captured region is fragile rather than supported, so do not
+assume a new architecture will tolerate it.
+
+**Robustness.** AOT removes 12 GIL acquisitions per decode, which matters for
+concurrent serving, and removes the runtime Triton dependency entirely.
+
+### Measured (SAME-L decode, ms, median of 7 on an idle GPU)
+
+| sm_120 · RTX PRO 4500 | L=256 | L=1024 | L=1292 | L=2048 | L=4096 |
+|---|---|---|---|---|---|
+| JIT | 55.1 | 227.2 | 289.1 | 457.7 | 920.2 |
+| AOT `ptx` | 62.5 | 251.2 | 318.7 | 502.8 | 1008.8 |
+| **AOT `mma`** | 55.4 | **223.6** | **283.7** | **448.4** | **899.3** |
+
+| sm_90 · H200 | L=256 | L=1024 | L=1292 | L=2048 | L=4096 |
+|---|---|---|---|---|---|
+| JIT | 12.4 | 47.0 | 61.1 | 98.5 | 194.4 |
+| AOT `ptx` | 12.7 | 47.3 | 60.7 | 96.6 | 195.5 |
+| **AOT `mma`** | 12.4 | 48.4 | 62.6 | 100.0 | 196.8 |
+
+Accuracy against the FP32 decoder at L=1292 on sm_120: AOT `mma` **51.45 dB**, JIT
+51.43, AOT `ptx` 51.11 — the MMA kernel is the most accurate of the three.
+
+So `mma` is at parity with JIT on both architectures (a few percent either way, faster
+at long sequence on sm_120) while being capturable. `ptx` costs ~10% on sm_120 and is
+kept only as a fallback if the MMA kernel will not build on some future target.
+
+### If you are bringing up a new architecture
+
+1. Build with the defaults and **check the decoder output is not constant** — render two
+   different seeds and compare. Identical output is the non-capturable-engine signature
+   described above, not a sampling quirk.
+2. If the AOT build fails, try `SA3_SWA_AOT=ptx` (simpler kernel, no shared-memory or
+   tensor-core requirements), then `SA3_SWA_PLUGIN=jit` as a last resort — and if you
+   land on `jit`, verify capture explicitly rather than trusting it.
+3. Two AOT constraints that bite on new targets:
+   - The MMA kernel needs **40 KB of shared memory**. `BLOCK_N=64` would need 64 KB,
+     over the 48 KB static limit, and fails at enqueue with *"Failed to enqueue status
+     -1"*. If a target has less shared memory, lower `BLOCK_N` in
+     `scripts/triton_diff_swa_mma.py` — but keep `BLOCK_KV >= BLOCK_N + 2*WINDOW`, or the
+     K/V tile stops covering the window and attention contributions are silently dropped.
+   - The PTX `.target` is rewritten to the plain `sm_XX` (Triton emits `sm_XXa`, which
+     TRT's loader rejects). The `m16n8k8` TF32 `mma` used here needs sm_80+.
+
 ## Publishing TRT engines to HuggingFace
 
 After building all 8 engines for a new `<arch>`, push them to HF so others on the same GPU don't need to rebuild:

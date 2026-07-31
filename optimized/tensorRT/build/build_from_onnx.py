@@ -8,6 +8,17 @@ stabilityai/stable-audio-3-optimized/onnx/.
 To rebuild engines for a new GPU arch (sm_100, sm_120, ...) you run this on
 that GPU and TRT bakes the arch into the engine.
 
+SAME-L attention kernel: the SWA plugin ships two implementations and the choice is
+baked into the engine at build time. AOT (default) compiles a block-tiled tensor-core
+PTX kernel in, so nothing re-enters Python at inference and the engine can be captured
+into a CUDA graph. JIT dispatches to Triton through a Python callback on every enqueue.
+If you are bringing up a new architecture and the decoder produces a constant wash of
+noise, or silence, read "Choosing the SAME-L attention kernel" in build/README.md before
+anything else — that is the signature of a non-capturable engine inside the mega-graph.
+
+    SA3_SWA_PLUGIN=aot|jit   which implementation the engine uses (default aot)
+    SA3_SWA_AOT=mma|ptx      which AOT kernel, if AOT (default mma)
+
 Usage:
     python build_from_onnx.py t5gemma
     python build_from_onnx.py same-s-encoder
@@ -459,26 +470,22 @@ def build_one(name: str) -> str:
         #   "Plugin 'samel::diff_attn_swa' has both AOT and JIT implementations.
         #    PREFER_AOT_PYTHON_PLUGINS or PREFER_JIT_PYTHON_PLUGINS should be specified."
         #
-        # Always AOT. With the block-tiled MMA kernel (swa_mma_aot) AOT is within a
-        # few percent of JIT on both architectures, and it is the only correct option
-        # on sm_120, where a JIT engine is not stream-capturable — enqueueV3 returns
-        # False under capture, the decode is silently dropped from the mega-graph, and
-        # every render returns the warmup decode of zero latents.
-        #
-        # AOT is also the more robust runtime: the JIT path re-enters Python 12 times
-        # per decode (once per attention layer), each acquiring the GIL and dispatching
-        # into Triton. AOT does none of that — the kernel is compiled into the engine —
-        # and it costs +0.1% engine size.
-        #
-        # An earlier revision made this per-arch on the strength of a claimed 24%
-        # AOT penalty on sm_90. That measurement was wrong (CUDA events recorded on the
-        # default stream while the work ran on the runner's private stream); re-measured
-        # correctly the hand-written kernel is ~equal to JIT on sm_90, and the MMA kernel
-        # is ~equal on both. Set SA3_SWA_AOT=ptx to fall back to the hand-written kernel.
-        net_flags |= 1 << int(
-            trt.NetworkDefinitionCreationFlag.PREFER_AOT_PYTHON_PLUGINS)
-        print("  plugin impl: AOT (graph-capturable, no Python in the enqueue path)",
-              flush=True)
+        # Two implementations of the SAME-L SWA plugin exist and the engine bakes in
+        # whichever this build prefers. Default AOT; override with SA3_SWA_PLUGIN=jit.
+        # See "Choosing the SAME-L attention kernel" in build/README.md.
+        want = os.environ.get("SA3_SWA_PLUGIN", "aot").lower()
+        if want not in ("aot", "jit"):
+            sys.exit(f"SA3_SWA_PLUGIN must be 'aot' or 'jit', got {want!r}")
+        if want == "aot":
+            net_flags |= 1 << int(
+                trt.NetworkDefinitionCreationFlag.PREFER_AOT_PYTHON_PLUGINS)
+            print("  plugin impl: AOT — graph-capturable, no Python in the enqueue "
+                  "path (SA3_SWA_PLUGIN=jit to switch)", flush=True)
+        else:
+            net_flags |= 1 << int(
+                trt.NetworkDefinitionCreationFlag.PREFER_JIT_PYTHON_PLUGINS)
+            print("  plugin impl: JIT — Triton at runtime. NOT stream-capturable on "
+                  "sm_120; verify before shipping (see build/README.md)", flush=True)
     network = builder.create_network(net_flags)
     parser = trt.OnnxParser(network, logger)
     if not parser.parse_from_file(onnx_path):

@@ -59,10 +59,14 @@ TARGETS = [
     {"label": "same-s decoder",
      "command": _from_onnx("same-s-decoder"),
      "outputs": ["same-s/dec_dynamic_bf16.trt"]},
-    {"label": "same-l encoder (Triton SWA plugin, FP16-mixed)",
+    # SAME-L uses the custom SWA plugin. Its kernel implementation is chosen at build
+    # time via SA3_SWA_PLUGIN / SA3_SWA_AOT and baked into the engine — the default (AOT
+    # block-tiled MMA) is graph-capturable and needs no Python at inference. See
+    # "Choosing the SAME-L attention kernel" in README.md before overriding.
+    {"label": "same-l encoder (SWA plugin — AOT MMA kernel, graph-capturable)",
      "command": _from_onnx("same-l-encoder"),
      "outputs": ["same-l/enc_dynamic_triton_swa.trt"]},
-    {"label": "same-l decoder (Triton SWA plugin, FP16-mixed)",
+    {"label": "same-l decoder (SWA plugin — AOT MMA kernel, graph-capturable)",
      "command": _from_onnx("same-l-decoder"),
      "outputs": ["same-l/dec_dynamic_triton_swa.trt"]},
     # DiT engines now build from pre-processed FP16-mixed ONNX on HF;

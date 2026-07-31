@@ -126,7 +126,7 @@ Omit `--dit` / `--decoder` for an interactive arrow-key picker. Relative
 | `medium`         | `fp16mixed` | FMHA-fused (96 fused attention nodes) **and** fp32-accurate at every length |
 | `sm-music`/`sm-sfx` | `fp16mixed` | standard attention — already fuses in fp16-mixed           |
 
-`--precision` also takes `fp8` and `bf16` (both medium only) and `fp32` explicitly:
+`--precision` also takes `fp8` (all DiTs), `bf16` (medium only) and `fp32` explicitly:
 
 - **`fp16mixed`** — canonical: FP16 trunk, FP32 islands around RMSNorm and RoPE
   generation, and an FP16 attention core (QK^T → Softmax → P·V) so TRT's FMHA fuser
@@ -137,7 +137,8 @@ Omit `--dit` / `--decoder` for an interactive arrow-key picker. Relative
   before QK^T fixed that (**4.3× faster at L=4096**), which retired the reason to
   prefer `bf16`. Engines built before 2026-07 are the slow variant; rebuild with
   `build_from_onnx.py sa3-m`.
-- **`fp8`** — *medium only; the max-speed clean tier, calibrated.* fp8 E4M3 on the 176
+- **`fp8`** — *medium: the max-speed clean tier, calibrated; sm-music/sm-sfx: a clean
+  weight-halving tier (see the end of this bullet).* On **medium**: fp8 E4M3 on the 176
   linear GEMMs + bf16 fused FMHA (96 nodes) + a **baked fp32 RoPE constant table** (position
   cos/sin computed host-side at build and frozen as a graph constant — no in-graph trig,
   so the island is precision-policy-robust and cross-runtime-stable). **~1.3× faster than
@@ -159,6 +160,14 @@ Omit `--dit` / `--decoder` for an interactive arrow-key picker. Relative
   producer: `build/build_dit_bf16.py` RoPE-baker + `build/transplant_scales.py` calibrated-scale
   transplant; identity check: `scripts/verify_fp8_rope.py`; calibration by @ryanontheinside,
   [#47](https://github.com/Stability-AI/stable-audio-3/pull/47)).
+  <br>On **sm-music / sm-sfx** fp8 is a **different, simpler recipe** — fp8 E4M3 grafted onto
+  the linear GEMMs of the fp16mixed graph (attention stays fp16-fused, fp32 islands untouched;
+  no baked RoPE — these DiTs never had bf16's long-angle problem). It's a **clean weight-halving
+  tier** (engine 479 vs 936 MB, velocity-cos **~0.99** vs eager, clip% at/below fp16mixed) that
+  is only **marginally faster (~1.1×)**: a small DiT's ~5 ms forward at batch 1 is overhead-bound,
+  so fp8's GEMM savings barely show. Default stays fp16mixed. Rebuild: `build_from_onnx.py
+  sa3-sm-music-fp8` / `sa3-sm-sfx-fp8`; producer: `build/make_dit_fp8_smalldit.py`. Not
+  seed-reproducible vs fp16mixed.
 - **`bf16`** — *medium only.* Same `dit.onnx` as fp32, built with `BuilderFlag.BF16`;
   a uniform bf16 trunk also lets the FMHA fuser fire, and it is ~3% faster than
   `fp16mixed`. **But it drifts at long sequence**: weakly-typed BF16 lets TRT

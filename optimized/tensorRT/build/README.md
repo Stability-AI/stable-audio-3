@@ -324,6 +324,39 @@ repo) → `build_dit_fp8.py` (max-PTQ + per-channel weight scales; that builder 
 merged here). Everyday consumers never recalibrate — they pull the published calibrated
 `dit_fp8.onnx`.
 
+## Small-DiT `fp8` — sm-music / sm-sfx (a different, simpler recipe)
+
+`sm-music` and `sm-sfx` also ship a selectable **`fp8`** engine (`--precision fp8`), but it is
+**not** the medium's baked-RoPE recipe — those DiTs use standard (non-differential) attention and
+never had the bf16 long-angle RoPE problem, so there is nothing to bake. Their fp8 is a straight
+**graft of fp8 E4M3 Q/DQ onto the linear GEMMs of the known-good `dit_fp16mixed.onnx`** — attention
+stays fp16-fused and the fp32 RMSNorm/RoPE islands are left exactly as the fp16mixed producer made
+them. Built `STRONGLY_TYPED` (`build_from_onnx.py sa3-sm-music-fp8` / `sa3-sm-sfx-fp8`); the QDQ
+carry the precision. Identity: 186 fp8 GEMMs + fp16 fused attention + the fp16mixed fp32 islands.
+
+Positioning is honest: this is a **clean weight-halving tier** (engine 479 vs 936 MB, velocity-cos
+~0.99 vs eager, clip% at or below fp16mixed), only **marginally faster** (~1.10–1.17×) — a small
+DiT's ~5 ms forward at batch 1 is overhead-bound, so fp8's GEMM-math savings barely show. Default
+stays `fp16mixed`; fp8 is for when the smaller engine / weight footprint helps. Not seed-reproducible
+vs fp16mixed.
+
+> ⚠ Do **not** produce these with `build_dit_fp8.py` (#47's ModelOpt path): on the small graphs its
+> island-flatten + reapply does not restore the fp32 islands correctly and the engine collapses to
+> velocity-cos ~0.69 with clipping (the GEMMs are fine — it's the islands). Grafting onto the
+> fp16mixed ONNX keeps the islands correct by construction.
+
+**Producer (refresh the ONNX).** `make_dit_fp8_smalldit.py` calibrates per-linear activation scales
+from the eager model (own-domain few-shot prompts + one full render) and grafts the fp8 Q/DQ. Two
+fp16-trunk specifics vs the medium inserter: Q/DQ scales are **FLOAT16** (fp16 trunk → DQ must output
+fp16) and floored at 1e-4 (fp16 underflows tiny scales to 0, which TRT rejects):
+
+```bash
+python make_dit_fp8_smalldit.py \
+    --model-config <ckpt>/model_config.json --checkpoint <ckpt>/model.safetensors \
+    --fp16mixed-onnx onnx/sa3-sm-music/dit_fp16mixed.onnx \
+    --domain Music --out onnx/sa3-sm-music/dit_fp8.onnx      # --domain SFX for sm-sfx
+```
+
 ## File map
 
 | File | Role | Flow |

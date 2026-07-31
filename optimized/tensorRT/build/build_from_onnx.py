@@ -142,6 +142,35 @@ TARGETS = {
         "profile":      _DIT_PROFILE,
         "plugin":       False,
     },
+    # SA3 small DiTs in fp8 — SELECTABLE (default stays fp16mixed). fp8 E4M3 on the
+    # 186 linear GEMMs, attention left fp16-fused and the fp32 RMSNorm/RoPE islands
+    # intact — an fp8-QDQ graft onto the fp16mixed graph (build/make_dit_fp8_smalldit.py),
+    # NOT the medium's baked-RoPE recipe (these DiTs never had the bf16 long-angle
+    # problem). Built STRONGLY_TYPED: the QDQ nodes carry fp8; TRT fires fp8 tensor-core
+    # GEMMs on the linears while the fp16 FMHA fuser still runs the attention. Same
+    # _DIT_PROFILE (batch=1, dynamic L∈[1,4096]) → identical CLI/feature surface.
+    # This is a CLEAN WEIGHT-HALVING tier (479 vs 936 MB, velocity-cos ~0.99 vs eager,
+    # clip% at/below fp16mixed), only marginally faster (~1.1×): the small DiTs' ~5 ms
+    # forward is overhead-bound at batch 1, so fp8's GEMM savings barely show. sm-* fp8
+    # is NOT seed-reproducible vs fp16mixed.
+    "sa3-sm-music-fp8": {
+        "onnx_hf":      ["sa3-sm-music/dit_fp8.onnx", "sa3-sm-music/dit_fp8.onnx.data"],
+        "trt_local":    "sa3-sm-music/dit_fp8.trt",
+        "flags":        set(),         # STRONGLY_TYPED + the fp8 QDQ carry the precision
+        "network":      "STRONGLY_TYPED",
+        "workspace_gb": 16,
+        "profile":      _DIT_PROFILE,
+        "plugin":       False,
+    },
+    "sa3-sm-sfx-fp8": {
+        "onnx_hf":      ["sa3-sm-sfx/dit_fp8.onnx", "sa3-sm-sfx/dit_fp8.onnx.data"],
+        "trt_local":    "sa3-sm-sfx/dit_fp8.trt",
+        "flags":        set(),
+        "network":      "STRONGLY_TYPED",
+        "workspace_gb": 16,
+        "profile":      _DIT_PROFILE,
+        "plugin":       False,
+    },
     "sa3-m": {
         # 2.9 GB external-data sidecar travels alongside.
         "onnx_hf":      ["sa3-m/dit_fp16mixed.onnx", "sa3-m/dit_fp16mixed.onnx.data"],

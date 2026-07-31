@@ -184,8 +184,10 @@ JIT-dispatched build is not stream-capturable: the decode is silently dropped fr
 graph and every render comes back as the same wash of noise, with exit code 0.
 
 If you see byte-identical output across seeds, you are on an affected engine. Re-pull it
-(the published files were rebuilt 2026-07-31), or run with `--no-mega-graph` to bypass
-capture. Building your own is covered under "Choosing the SAME-L attention kernel" in
+(the published `sm_120` engines were rebuilt 2026-07-31), or run with `--no-mega-graph` to
+bypass capture. The `sm_90` engines are unaffected and still ship the JIT kernel, which is
+why **Triton is required at inference on sm_90 but not on sm_120**. Building your own is
+covered under "Choosing the SAME-L attention kernel" in
 [`build/README.md`](build/README.md).
 
 ## Speed & memory

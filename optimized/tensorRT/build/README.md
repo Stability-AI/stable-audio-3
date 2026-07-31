@@ -104,6 +104,21 @@ SA3_SWA_AOT=ptx      # fallback AOT kernel: scalar FP32, one warp per query.
 | Engine size | +0.1% | baseline |
 | Build-time deps | Triton | Triton |
 
+### What the published engines use
+
+| published engines | kernel |
+|---|---|
+| `sm_120/same-l/` | AOT (block-tiled MMA) — required, see below |
+| `sm_90/same-l/` | JIT — predates the AOT kernel, captures fine on Hopper, and AOT measured no faster there, so they were left alone |
+
+Building `same-l` for sm_90 today gives you AOT rather than the published JIT engine. That
+is fine — the two are at parity in speed and AOT is the more robust of the pair — but it
+does mean your local engine will not be byte-identical to the downloaded one.
+
+The runtime registers both implementations, so a JIT engine and an AOT engine both load
+and run whatever GPU you are on. Verified: the published sm_90 JIT engine produces
+byte-identical output before and after the AOT implementation was added.
+
 ### Why AOT is the default
 
 **Correctness on sm_120.** A JIT engine is not stream-capturable there: `enqueueV3`

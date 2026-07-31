@@ -163,7 +163,16 @@ ENCODER_PATHS = {
 #                decoder clips 2–3% of samples on a 6-min render. Fine at short
 #                lengths (clean at L=256); prefer fp16mixed for anything long.
 #                Also not seed-reproducible vs fp16mixed.
-#   fp8        — medium ONLY, MAX-SPEED clean tier. fp8 E4M3 on the 176 linear
+#   fp8        — all DiTs, fp8 E4M3 on the linear GEMMs (attention + RoPE kept
+#                higher precision). On MEDIUM it's a max-speed clean tier (~1.3×
+#                over fp16mixed) via the recipe described below. On sm-music /
+#                sm-sfx it is a CLEAN WEIGHT-HALVING tier (engine 479 vs 936 MB),
+#                only marginally faster (~1.10–1.17×): those DiTs' ~5 ms forward is
+#                overhead-bound at batch 1, so fp8's GEMM-math savings barely show.
+#                Their fp8 is an fp8-QDQ graft onto the fp16mixed graph (fp8 linears
+#                + fp16 fused attention + the fp16mixed fp32 islands, STRONGLY_TYPED),
+#                velocity-cos ~0.99 vs eager, clip% at/below fp16mixed. medium recipe:
+#                MAX-SPEED clean tier. fp8 E4M3 on the 176 linear
 #                GEMMs + bf16 fused FMHA (96 nodes) + a BAKED fp32 RoPE constant
 #                table: position cos/sin are computed host-side at build time and
 #                frozen as a graph Constant (no in-graph trig), so the island is
@@ -190,14 +199,16 @@ ENCODER_PATHS = {
 # canonical decoder engine. Encoders are FP16-mixed only.
 DIT_ENGINE_FILENAME = {
     "bf16":      "dit_bf16.trt",        # medium only; drifts at long sequence
-    "fp8":       "dit_fp8.trt",         # medium only; max-speed clean tier (fp8 lin + baked RoPE)
+    "fp8":       "dit_fp8.trt",         # all DiTs; fp8 linears (medium: +baked RoPE; small: graft on fp16mixed)
     "fp16mixed": "dit_fp16mixed.trt",
     "fp32":      "dit_fp32.trt",
 }
-# DiT precisions actually built per model. bf16 and fp8 are medium-only.
+# DiT precisions actually built per model. bf16 is medium-only; fp8 is available
+# for all three (medium via baked-RoPE/bf16-attn; sm-music/sm-sfx via an fp8-QDQ
+# graft onto their fp16mixed graph — fp8 linears + fp16 fused attn + fp32 islands).
 _DIT_PRECISIONS = {
-    "sm-music": ("fp16mixed", "fp32"),
-    "sm-sfx":   ("fp16mixed", "fp32"),
+    "sm-music": ("fp16mixed", "fp8", "fp32"),
+    "sm-sfx":   ("fp16mixed", "fp8", "fp32"),
     "medium":   ("bf16", "fp8", "fp16mixed", "fp32"),
 }
 # Per-DiT default precision — fp16mixed everywhere. Medium moved off bf16 once
@@ -256,11 +267,8 @@ def get_dit_engine_path(dit_name: str, precision: str = None) -> Path:
             f"precision='bf16' is only available for --dit medium (FMHA-fused); "
             f"{dit_name} uses standard attention and already fuses in fp16mixed. "
             f"Valid for {dit_name}: {_DIT_PRECISIONS.get(dit_name)}")
-    if precision == "fp8" and dit_name != "medium":
-        raise ValueError(
-            f"precision='fp8' is only available for --dit medium (fp8 linears + "
-            f"bf16 fused FMHA + baked fp32 RoPE); {dit_name} ships fp16mixed only. "
-            f"Valid for {dit_name}: {_DIT_PRECISIONS.get(dit_name)}")
+    # fp8 is available for all three DiTs (medium: baked-RoPE + bf16 attn; sm-music/
+    # sm-sfx: fp8-QDQ graft on their fp16mixed graph). Only bf16 stays medium-only.
     return ARCH_DIR / _DIT_SUBDIR[dit_name] / DIT_ENGINE_FILENAME[precision]
 
 
@@ -1133,10 +1141,11 @@ def main():
                     help="DiT engine precision (default is 'fp16mixed' for every model). "
                          "'fp16mixed' = FP16 trunk + FP32 RMSNorm/RoPE islands with an FMHA-fused "
                          "FP16 attention core (canonical; fp32-accurate at every length). "
-                         "'fp8' (MEDIUM ONLY) = the max-speed clean tier: fp8 linears + bf16 fused "
-                         "FMHA + a baked fp32 RoPE constant table, ~1.3× faster than fp16mixed at "
-                         "every length and clean at long sequence (std 0.86, 0.000%% clip @6-min); "
-                         "capped at L<=4096 (the baked table = the SAME-L decoder's own cap). "
+                         "'fp8' = fp8 E4M3 linears (attention + RoPE kept higher precision). On MEDIUM "
+                         "it's a max-speed clean tier (bf16 fused FMHA + baked fp32 RoPE, ~1.3× faster, "
+                         "clean at long sequence, capped at L<=4096). On sm-music/sm-sfx it's a clean "
+                         "weight-halving tier (479 vs 936 MB engine, velocity-cos ~0.99 vs eager) that is "
+                         "only marginally faster (~1.1×; their small forward is overhead-bound at batch 1). "
                          "'bf16' (MEDIUM ONLY) = ~3%% faster still, but it evaluates RoPE's angle "
                          "in bf16 and drifts at long sequence (clips 2-3%% of samples on a 6-min "
                          "render); fine for short clips, not seed-reproducible vs fp16mixed. "

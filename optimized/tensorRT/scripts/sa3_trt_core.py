@@ -470,6 +470,32 @@ def _run_engine(runner: "TRTRunner", ctx, what: str) -> None:
     runner.stream.synchronize()
 
 
+
+def _enqueue_captured(ctx, stream, what: str) -> None:
+    """execute_async_v3 for a CAPTURE region, with its return value checked.
+
+    _run_engine's wait_stream/synchronize pair cannot be used under stream capture —
+    a host-side sync would abort the capture — so this is the stripped-down variant:
+    launch on the given stream, and raise if TRT refuses.
+
+    Checking matters more here than anywhere else. Outside capture a failed enqueue
+    leaves the output buffer unwritten, which at least reads as silence. Inside
+    capture nothing is recorded into the graph at all, no exception is raised, and
+    every later replay re-reads whatever that buffer held from the pre-capture
+    warmup — so the stage silently vanishes from the pipeline while each call still
+    looks like it succeeded. That is how the SAME-L decoder failed on sm_120: its
+    engine was not stream-capturable there, so the graph held T5 and all 8 DiT steps
+    but no decode, and every render returned the warmup decode of zero latents — a
+    constant wash, byte-identical across seeds and prompts, with exit code 0.
+    """
+    if not ctx.execute_async_v3(stream.cuda_stream):
+        raise RuntimeError(
+            f"{what}: TRT refused to enqueue. Under CUDA-graph capture this omits the "
+            f"stage silently, so any resulting audio is invalid rather than merely "
+            f"slow. If this is a SAME-L engine on a new architecture it is most likely "
+            f"not stream-capturable — see 'Choosing the SAME-L attention kernel' in "
+            f"build/README.md, or rerun with --no-mega-graph.")
+
 # ─── TRT call helpers (one per engine type) ──────────────────────────────
 def t5gemma_encode(runner: TRTRunner, tokenizer, prompt: str):
     """Run T5Gemma TRT. Returns (embeds (1, 256, 768), mask (1, 256))."""
@@ -728,7 +754,7 @@ class DiTRunner:
         next step_captured overwrites it).
         """
         assert self._persistent_bound, "call bind_persistent() before step_captured()"
-        self.runner.context.execute_async_v3(stream.cuda_stream)
+        _enqueue_captured(self.runner.context, stream, "dit (captured step)")
         return self._vel_buf
 
 
@@ -876,7 +902,8 @@ class GraphPingpongSampler:
                 dit._x_buf.zero_()
                 for i in range(ns):
                     dit._t_buf[0] = float(sigmas[i])
-                    dit.runner.context.execute_async_v3(capture_stream.cuda_stream)
+                    _enqueue_captured(dit.runner.context, capture_stream,
+                                      "dit (pingpong warmup)")
                     v = dit._vel_buf.float()
                     denoised = dit._x_buf - self._sigma_curr_bufs[i] * v
                     if i < ns - 1:
@@ -903,7 +930,8 @@ class GraphPingpongSampler:
                     # Use a 0-D copy_ so this becomes a graph kernel.
                     dit._t_buf[0] = self._sigma_curr_bufs[i]
                     # Launch TRT.
-                    dit.runner.context.execute_async_v3(capture_stream.cuda_stream)
+                    _enqueue_captured(dit.runner.context, capture_stream,
+                                      "dit (pingpong graph)")
                     v = dit._vel_buf.float()
                     denoised = dit._x_buf - self._sigma_curr_bufs[i] * v
                     if i < ns - 1:

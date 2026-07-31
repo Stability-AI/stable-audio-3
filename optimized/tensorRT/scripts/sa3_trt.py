@@ -55,6 +55,8 @@ from sa3_trt_core import (
     t5gemma_encode, encoder_encode, decoder_decode,
     build_pingpong_schedule, sample_flow_pingpong,
     save_wav, read_wav,
+    # Checked enqueue for capture regions — shared so both graphs behave alike.
+    _enqueue_captured as _enqueue,
 )
 
 
@@ -91,31 +93,6 @@ def _delegate_to_eager(args) -> None:
             argv += [flag, str(val)]
     sys.argv = argv
     canon.main()
-
-
-def _enqueue(ctx, stream, what: str) -> None:
-    """execute_async_v3 with its return value CHECKED.
-
-    Bare `execute_async_v3(...)` is dangerous specifically under graph capture: a
-    refusal is reported only through the return value, nothing is recorded into the
-    graph, and no exception is raised. Replay then re-reads whatever the stage's
-    output buffer held from the pre-capture warmup, so the stage silently vanishes
-    from the pipeline while every call still looks like it succeeded.
-
-    That is exactly how the SAME-L decoder failed on sm_120: its Triton-JIT engine
-    was not stream-capturable there, so the captured graph held T5 and all 8 DiT
-    steps but no decode, and every render returned the warmup decode of zero latents
-    — a constant wash of noise, byte-identical across seeds and prompts, exit code 0.
-    The cause is fixed (the plugin is ahead-of-time compiled now), but the *class* of
-    failure is not: any future non-capturable stage would fail the same silent way.
-    """
-    if not ctx.execute_async_v3(stream.cuda_stream):
-        raise RuntimeError(
-            f"{what}: TRT refused to enqueue. Under CUDA-graph capture this omits the "
-            f"stage silently, so any resulting audio is invalid rather than merely "
-            f"slow. If this is a SAME-L engine on a new architecture, it is most "
-            f"likely not stream-capturable — see 'Choosing the SAME-L attention "
-            f"kernel' in build/README.md, or rerun with --no-mega-graph.")
 
 
 # ─── Full-pipeline CUDA-graph runner ─────────────────────────────────────

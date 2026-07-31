@@ -32,7 +32,7 @@ The canonical CLI invokes one inference per process, so users never see
 the drift in practice.
 """
 from __future__ import annotations
-import argparse, math, os, random, sys, threading, time, wave
+import argparse, math, os, random, sys, threading, time, warnings, wave
 from pathlib import Path
 import numpy as np
 
@@ -147,6 +147,8 @@ class FullPipelineGraph:
         self.pcm_int32_buf = None       # (1, T_lat*4096, 2) int32, device
         self.pcm_int16_buf = None       # (T_lat*4096, 2) int16, device
         self.pinned_host_pcm = None     # (T_lat*4096, 2) int16, pinned host
+        self.pinned_host_peak = None    # scalar float32, pinned host
+        self._peak_ceiling = None
         self.local_add_cond_buf = None  # (1, 257, L) fp32, device (kept zero)
         self._graph = None
         self._built = False
@@ -223,12 +225,24 @@ class FullPipelineGraph:
         dec_in_dt = self.dec_runner.in_dtype["latent"]
         self.decoder_in_buf = canon.torch.empty(1, IO_CHANNELS, L, dtype=dec_in_dt, device="cuda")
         # Auto-detect output flavor like decoder_decode does.
-        if "pcm" in self.dec_runner.out_dtype:
-            self._dec_out_name = "pcm"
-            pcm_dt = self.dec_runner.out_dtype["pcm"]
+        if "pcm_unbounded" in self.dec_runner.out_dtype:
+            self._dec_out_name = "pcm_unbounded"
+            pcm_dt = self.dec_runner.out_dtype[self._dec_out_name]
             self.pcm_int32_buf = canon.torch.empty(1, T_full, 2, dtype=pcm_dt, device="cuda")
             dec_ctx.set_tensor_address("latent", self.decoder_in_buf.data_ptr())
-            dec_ctx.set_tensor_address("pcm", self.pcm_int32_buf.data_ptr())
+            dec_ctx.set_tensor_address(self._dec_out_name, self.pcm_int32_buf.data_ptr())
+        elif "pcm" in self.dec_runner.out_dtype:
+            self._dec_out_name = "pcm"
+            warnings.warn(
+                "legacy TensorRT decoder engine has baked hard clipping; rebuild the "
+                "decoder engine to get the pcm_unbounded output and preserve peak ratios",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            pcm_dt = self.dec_runner.out_dtype[self._dec_out_name]
+            self.pcm_int32_buf = canon.torch.empty(1, T_full, 2, dtype=pcm_dt, device="cuda")
+            dec_ctx.set_tensor_address("latent", self.decoder_in_buf.data_ptr())
+            dec_ctx.set_tensor_address(self._dec_out_name, self.pcm_int32_buf.data_ptr())
         else:
             # Legacy fp output — graph-capture supported but the postprocess
             # path is different. Not the production target.
@@ -248,6 +262,8 @@ class FullPipelineGraph:
         # this T_lat. The captured DMA copies from device to here.
         self.pinned_host_pcm = canon.torch.empty(T_full, 2, dtype=canon.torch.int16,
                                                   pin_memory=True)
+        self.pinned_host_peak = canon.torch.empty((), dtype=canon.torch.float32,
+                                                   pin_memory=True)
 
         # ── Warmup: replicate canonical's warmup sequence exactly so that the
         #    decoder context's internal state at the time of the captured call
@@ -353,17 +369,38 @@ class FullPipelineGraph:
                 self.decoder_in_buf.copy_(self.latents_out_buf)
                 _enqueue(self.dec_runner.context, capture_stream, "decoder (mega-graph)")
                 # Stage 5a: narrow + cast int32 → int16 (or legacy fp32 → int16)
-                if self._dec_out_name == "pcm":
-                    # Belt-and-suspenders int16 clamp. New engines (from the
-                    # FP32 clip+scale fix in the ONNX producer) already bound
-                    # the int32 output to ±32767, so this is a no-op for them.
-                    # Kept for backwards-compat with any older engine still in
-                    # use, which has BF16 trunk rounding 32767 → 32768 and
-                    # wrapping on int16 downcast (audible clicks).
-                    self.pcm_int16_buf.copy_(self.pcm_int32_buf[0].clamp(-32767, 32767))
+                if self._dec_out_name in ("pcm_unbounded", "pcm"):
+                    source = self.pcm_int32_buf[0, :self.requested_samples]
+                    peak = canon.audio_peak(source).float()
+                    protected = canon.protect_audio_peak(
+                        source,
+                        ceiling=canon.PCM16_CEILING,
+                        peak=peak,
+                        validate_nonfinite=False,
+                        emit_warning=False,
+                    )
+                    self.pcm_int16_buf[:self.requested_samples].copy_(
+                        protected.to(canon.torch.int16)
+                    )
+                    self._peak_ceiling = canon.PCM16_CEILING
                 else:
-                    a = self._audio_legacy_buf[0].clamp(-1.0, 1.0) * 32767.0
-                    self.pcm_int16_buf.copy_(a.to(canon.torch.int16).T)
+                    source = self._audio_legacy_buf[
+                        0, :, :self.requested_samples
+                    ]
+                    peak = canon.audio_peak(source).float()
+                    protected = canon.protect_audio_peak(
+                        source,
+                        peak=peak,
+                        validate_nonfinite=False,
+                        emit_warning=False,
+                    )
+                    self.pcm_int16_buf[:self.requested_samples].copy_(
+                        (protected * canon.PCM16_CEILING)
+                        .to(canon.torch.int16)
+                        .T
+                    )
+                    self._peak_ceiling = 1.0
+                self.pinned_host_peak.copy_(peak, non_blocking=True)
                 # Stage 5b: DtoH (captured non_blocking copy into pinned host)
                 self.pinned_host_pcm[:self.requested_samples].copy_(
                     self.pcm_int16_buf[:self.requested_samples], non_blocking=True)
@@ -408,6 +445,11 @@ class FullPipelineGraph:
             # Replay the full pipeline.
             self._graph.replay()
         stream.synchronize()
+        canon.report_peak_protection(
+            float(self.pinned_host_peak.item()),
+            ceiling=self._peak_ceiling,
+            stacklevel=3,
+        )
         # pinned_host_pcm has been written by the DtoH; return a view.
         return self.pinned_host_pcm[:self.requested_samples].numpy()
 

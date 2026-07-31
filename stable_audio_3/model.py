@@ -4,7 +4,8 @@ import torch
 import typing as tp
 from torch.nn.functional import interpolate
 
-from stable_audio_3.inference.audio_utils import prepare_audio, numpy_audio_to_tensor
+from stable_audio_3.audio_output import protect_audio_peak
+from stable_audio_3.inference.audio_utils import numpy_audio_to_tensor, prepare_audio
 from stable_audio_3.inference.sampling import sample_diffusion
 from stable_audio_3.loading_utils import load_autoencoder, load_diffusion_cond
 from stable_audio_3.model_configs import ae_models, all_models
@@ -342,7 +343,7 @@ class StableAudioModel:
         )
 
         if not return_latents:
-            result = result.to(torch.float32).clamp(-1, 1)
+            result = result.to(torch.float32)
 
         if not return_latents and truncate_output_to_duration:
             if isinstance(duration, (int, float)):
@@ -357,6 +358,9 @@ class StableAudioModel:
                     print(
                         "Warning: Cannot truncate output to a single duration when passing a list of different durations"
                     )
+
+        if not return_latents:
+            result = protect_audio_peak(result, batch_dim=0)
 
         return result
 

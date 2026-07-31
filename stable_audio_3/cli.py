@@ -13,6 +13,7 @@ import torch
 import torchaudio
 
 from stable_audio_3 import StableAudioModel
+from stable_audio_3.audio_output import protect_audio_peak
 
 
 def _save_output(audio: torch.Tensor, sample_rate: int, output: str, batch_size: int):
@@ -22,7 +23,8 @@ def _save_output(audio: torch.Tensor, sample_rate: int, output: str, batch_size:
         ext = ".wav"
     for i in range(batch_size):
         path = f"{base}_{i}{ext}" if batch_size > 1 else f"{base}{ext}"
-        torchaudio.save(path, audio[i].cpu(), sample_rate)
+        output_audio = protect_audio_peak(audio[i].cpu())
+        torchaudio.save(path, output_audio, sample_rate)
         print(f"Saved: {path}")
 
 

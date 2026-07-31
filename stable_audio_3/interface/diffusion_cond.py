@@ -10,6 +10,7 @@ import os, time, math
 
 from einops import rearrange
 
+from stable_audio_3.audio_output import PCM16_CEILING, protect_audio_peak
 from stable_audio_3.interface.aeiou import audio_spectrogram_image
 from stable_audio_3.inference.distribution_shift import LogSNRShift, FluxDistributionShift, DistributionShift, IdentityDistributionShift
 from stable_audio_3.models.lora import has_lora
@@ -142,7 +143,10 @@ def generate_cond(
             if stable_audio_3_model.model.pretransform is not None:
                 denoised = stable_audio_3_model.model.pretransform.decode(denoised)
             denoised = rearrange(denoised, "b d n -> d (b n)")
-            denoised = denoised.clamp(-1, 1).mul(32767).to(torch.int16).cpu()
+            denoised = protect_audio_peak(
+                denoised.to(torch.float32), emit_warning=False
+            )
+            denoised = denoised.mul(PCM16_CEILING).to(torch.int16).cpu()
             audio_spectrogram = audio_spectrogram_image(denoised, sample_rate=sample_rate)
             preview_images.append((audio_spectrogram, f"Step {current_step} sigma={sigma:.3f} logSNR={log_snr:.3f}"))
 
@@ -227,7 +231,8 @@ def generate_cond(
 
     # Encode the audio to WAV format
     audio = rearrange(audio, "b d n -> d (b n)")
-    audio = audio.to(torch.float32).clamp(-1, 1).mul(32767).to(torch.int16).cpu()
+    audio = protect_audio_peak(audio.to(torch.float32))
+    audio = audio.mul(PCM16_CEILING).to(torch.int16).cpu()
 
     # save as wav file
     torchaudio.save(output_wav, audio, sample_rate)

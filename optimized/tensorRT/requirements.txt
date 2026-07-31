@@ -3,6 +3,7 @@ torch
 # Engines are NOT compatible across minor TRT versions (10.16 won't load 10.15 engines).
 tensorrt==10.15.1.29
 numpy
+onnx>=1.18
 tokenizers
 huggingface-hub
 nvidia-ml-py    # process-local VRAM tracking (replaces pynvml — same module name)

@@ -174,6 +174,22 @@ def test_output_single(mock_model, mock_torchaudio_save, tmp_path):
     assert torch.equal(saved_tensor, mock_model.generate.return_value[0].cpu())
 
 
+def test_output_attenuates_out_of_range_audio(
+    mock_model, mock_torchaudio_save, tmp_path
+):
+    mock_model.generate.return_value = torch.tensor(
+        [[[0.0, 1.25, 1.75], [0.0, -1.25, -1.75]]], dtype=torch.float32
+    )
+
+    with pytest.warns(RuntimeWarning, match="peak 1.750"):
+        _run(["-p", "test", "-o", str(tmp_path / "out.wav")])
+
+    saved_audio = mock_torchaudio_save.call_args.args[1]
+    assert saved_audio.abs().max() == 1.0
+    ratio = (saved_audio[0, 1] / saved_audio[0, 2]).item()
+    assert ratio == pytest.approx(1.25 / 1.75)
+
+
 def test_output_batch_naming(mock_torchaudio_save, tmp_path):
     model = _make_model_mock(batch=3)
     with patch(

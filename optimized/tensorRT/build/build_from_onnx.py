@@ -40,6 +40,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 sys.path.insert(0, str(SCRIPTS_DIR.parent / "scripts"))
 
 from _arch import detect_arch, arch_dir  # noqa: E402
+from decoder_output import rewrite_decoder_onnx  # noqa: E402
 
 
 HF_REPO = "stabilityai/stable-audio-3-optimized"
@@ -99,6 +100,7 @@ TARGETS = {
         "workspace_gb": 16,
         "profile":      {"latent": [(1, 256, 32), (1, 256, 1292), (1, 256, 4096)]},
         "plugin":       False,
+        "unbounded_pcm": True,
     },
     "same-l-encoder": {
         "onnx_hf":      ["same-l/enc_dynamic_triton_swa.onnx"],
@@ -119,6 +121,7 @@ TARGETS = {
         "workspace_gb": 16,
         "profile":      {"latent": [(1, 256, 32), (1, 256, 1292), (1, 256, 4096)]},
         "plugin":       True,
+        "unbounded_pcm": True,
     },
     # SA3 DiT engines: build from the pre-processed FP16-mixed ONNX hosted on
     # HF. The producer (build_dit_fp16mixed.py) does the FP32-island surgery
@@ -333,6 +336,7 @@ TARGETS = {
         "profile":      {"latent": [(1, 256, 32), (1, 256, 1292), (1, 256, 4096)]},
         "plugin":       True,
         "upcast_to_fp32": True,
+        "unbounded_pcm": True,
     },
     # SAME-S FP32 decoder: the canonical ONNX is already FP32 throughout
     # (no FP16 ops to upcast). Just build STRONGLY_TYPED so the engine
@@ -345,6 +349,7 @@ TARGETS = {
         "workspace_gb": 16,
         "profile":      {"latent": [(1, 256, 32), (1, 256, 1292), (1, 256, 4096)]},
         "plugin":       False,
+        "unbounded_pcm": True,
     },
 }
 
@@ -492,6 +497,12 @@ def build_one(name: str) -> str:
     if recipe.get("upcast_to_fp32"):
         upcast_path = "/tmp/_build_from_onnx_fp32_upcast.onnx"
         onnx_path = _upcast_onnx_to_fp32(onnx_path, upcast_path)
+
+    # Decoder ONNXes historically baked `audio.clamp(-1, 1)` into the PCM
+    # tail. Remove it so runtime peak protection can preserve sample ratios.
+    if recipe.get("unbounded_pcm"):
+        unbounded_path = f"/tmp/_build_from_onnx_{name}_unbounded_pcm.onnx"
+        onnx_path = rewrite_decoder_onnx(onnx_path, unbounded_path)
 
     # 2. Optional plugin import (SAME-L only — registers samel::diff_attn_swa)
     if recipe["plugin"]:

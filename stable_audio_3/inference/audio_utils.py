@@ -50,7 +50,7 @@ def set_audio_channels(audio, target_channels):
     # Add channel dim if it's missing
     if audio.dim() == 2:
         audio = audio.unsqueeze(1)
-        
+
     if target_channels == 1:
         # Convert to mono
         audio = audio.mean(1, keepdim=True)
@@ -63,7 +63,7 @@ def set_audio_channels(audio, target_channels):
     return audio
 
 def prepare_audio(audio, in_sr, target_sr, target_length, target_channels, device):
-    
+
     audio = audio.to(device)
 
     if in_sr != target_sr:

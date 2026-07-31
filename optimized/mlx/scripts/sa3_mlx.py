@@ -30,6 +30,7 @@ from models.defs.sa3_pipeline import (
     load_conditioner_from_npz,
 )
 from models.defs.t5gemma_mlx import T5Gemma
+from wav_io import save_wav
 from weights import ensure_local, is_present
 
 SAMPLE_RATE = 44100
@@ -226,20 +227,6 @@ def _stage_peak_b(label: str | None = None) -> int:
         _STAGE_PEAKS.append((label, b))
     _reset_peak_mem()
     return b
-
-
-def save_wav(path: str, audio: np.ndarray, sample_rate: int = SAMPLE_RATE):
-    """audio: (channels, T) float32 in [-1, 1]. Writes 16-bit PCM stereo WAV."""
-    if not np.isfinite(audio).all():
-        n_bad = int((~np.isfinite(audio)).sum())
-        raise RuntimeError(f"refusing to write WAV — audio contains {n_bad} non-finite samples (NaN/Inf)")
-    audio = np.clip(audio, -1.0, 1.0)
-    pcm = (audio * 32767.0).astype(np.int16).T  # (T, channels) interleaved
-    with wave.open(path, "wb") as w:
-        w.setnchannels(audio.shape[0])
-        w.setsampwidth(2)
-        w.setframerate(sample_rate)
-        w.writeframes(pcm.tobytes())
 
 
 def read_wav(path: str) -> np.ndarray:

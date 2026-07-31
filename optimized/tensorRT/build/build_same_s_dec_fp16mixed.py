@@ -28,9 +28,9 @@ explicit Cast(FP16<->FP32) before doing the trunk FP16 conversion.
 
 Inputs/outputs:
 - Input: `latent` (FP32, shape [1, 256, L])  — keep FP32
-- Output: `pcm` (INT32, shape [1, T, 2]) — already produced by a Cast(to=INT32)
-  inside the graph. The pre-Cast chain (Clip + Mul) is in trunk-FP16; the
-  Cast(to=INT32) is unaffected by trunk dtype since it's an explicit dtype change.
+- Output: `pcm_unbounded` (INT32, shape [1, T, 2]) — the output Clip is removed
+  before conversion so runtime can apply no-boost attenuation before INT16 narrowing.
+  The pre-Cast scale remains in the graph.
 
 Usage:
     python build_same_s_dec_fp16mixed.py
@@ -57,6 +57,7 @@ from build_dit_fp16mixed import (
     fix_dtype_mismatches,
     manual_convert_to_fp16,
 )
+from decoder_output import remove_output_hard_clip
 
 
 # SAME-S decoder profile — same as the canonical BF16 engine.
@@ -504,6 +505,9 @@ def convert_to_fp16mixed(input_onnx, output_onnx, mode="minimal"):
                     _inline_tensor(attr.t)
     print(f"  inlined external-data tensors")
 
+    removed_clips = remove_output_hard_clip(model)
+    print(f"  decoder peak policy: removed {removed_clips} hard Clip")
+
     # Find FP32 islands BEFORE stripping no-op casts (so RoPE seeds are
     # still in the graph).
     blocked_names = find_fp32_islands_same_s_dec(model, mode=mode)
@@ -525,13 +529,7 @@ def convert_to_fp16mixed(input_onnx, output_onnx, mode="minimal"):
     print(f"  fixing dtype mismatches with autocast insertion...")
     fp16_model = fix_dtype_mismatches(fp16_model, blocked_names)
 
-    # SAME-S-specific: the DecWrap postprocess tail has a Clip node
-    # (audio.clamp(-1, 1)) whose min/max come from Cast(to=FP32) of two
-    # Constants. After our conversion the Slice feeding it is FP16, but
-    # the Cast outputs remain FP32 — the Clip is then a heterogeneous
-    # op. Fix by retargeting those Casts to FP16 (the min/max values are
-    # -1, +1, well within FP16 range). fix_dtype_mismatches doesn't
-    # cover Clip in its SHARED_FLOAT_DT_OPS set.
+    # Retain compatibility with input graphs that have other Clip nodes.
     fp16_model = fix_extra_dtype_mismatches(fp16_model)
 
     print(f"  saving to {output_onnx}")

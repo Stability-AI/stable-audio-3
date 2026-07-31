@@ -20,6 +20,9 @@ from typing import Optional
 import numpy as np
 import torch
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(PROJECT_ROOT / "stable_audio_3"))
+from audio_output import PCM16_CEILING, protect_audio_peak  # noqa: E402
 
 TRT_REPO = Path("/weka2/cj/clod/sa3s/stable-audio-3/optimized/tensorRT")
 SCRIPTS_DIR = TRT_REPO / "scripts"
@@ -289,13 +292,15 @@ class PTInference:
             torch.cuda.synchronize()
             decode_ms = (time.time() - t0) * 1000
 
-            # 5. FP32 audio → int16 stereo PCM (same formula as TRT pipeline).
-            pcm_torch = (audio_fp32.clamp(-1.0, 1.0) * 32767.0).to(torch.int16)
+            # 5. Trim before peak protection so discarded decoder padding
+            # cannot attenuate the requested clip.
+            actual_samples = int(round(seconds * SAMPLE_RATE))
+            audio_fp32 = audio_fp32[..., :actual_samples]
+            audio_fp32 = protect_audio_peak(audio_fp32)
+            pcm_torch = (audio_fp32 * PCM16_CEILING).to(torch.int16)
             pcm = pcm_torch.squeeze(0).T.contiguous().cpu().numpy()
 
-        # Trim to requested seconds.
-        actual_samples = int(round(seconds * SAMPLE_RATE))
-        pcm = pcm[:actual_samples].copy()
+        pcm = pcm.copy()
 
         inference_ms = (time.time() - t_total) * 1000
         return pcm, {

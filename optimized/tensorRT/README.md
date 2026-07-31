@@ -221,6 +221,12 @@ The full-pipeline CUDA graph eliminates per-stage Python/dispatch overhead
 — each replay completes in **literally identical wall-clock time** (zero
 variance once the graph is built).
 
+Decoder engines built before the peak-protection update expose a `pcm`
+binding with hard clipping baked into the engine. The runtime detects those
+legacy engines and warns, but clipped sample ratios cannot be recovered.
+Rebuild the decoder through `build/build.py`; updated engines expose
+`pcm_unbounded` and apply no-boost attenuation at runtime before INT16 narrowing.
+
 ### Benchmark DiT step time across L values
 
 ```bash
@@ -272,6 +278,7 @@ optimized/tensorRT/
 │   ├── README.md                ← how to build for a new GPU arch
 │   ├── build.py                 ← interactive menu (default entry)
 │   ├── build_from_onnx.py       ← one target → ONNX → TRT engine
+│   ├── decoder_output.py        ← removes baked decoder clipping before engine build
 │   └── build_dit_profile.py     ← DiT with custom (min, opt, max) profile shapes
 └── models/                      ← .trt engines (auto-downloaded per arch; ~8 GB)
     └── sm_<cc>/                 ← arch dir matches `nvidia-smi --query-gpu=compute_cap`
@@ -301,8 +308,9 @@ invocation per sampling step handles everything.
 - **STRONGLY_TYPED T5Gemma**: built with an FP16-mixed graph (FP32
   attention island around softmax) — fixes a BF16 numerical bug where one
   specific cross-attention output token collapsed in magnitude.
-- **PCM-baked SAME-S decoder**: the int16 narrow + transpose are folded
-  into the decoder engine itself; saves ~3 ms of post-decode CPU work.
+- **PCM-baked SAME-S decoder**: PCM scaling + transpose are folded into the
+  decoder engine; peak protection + INT16 narrowing stay in the captured
+  runtime graph so out-of-range sample ratios are preserved.
 - **Mixed precision**: DiT runs FP16-mixed (FP16 trunk + FP32 RMSNorm/RoPE
   islands + FMHA-fused FP16 attention core), decoder int32→int16, T5Gemma
   FP16-mixed. `--quiet` skips per-stage NVML probes for an extra ~4 ms.

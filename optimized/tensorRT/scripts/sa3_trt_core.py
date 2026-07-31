@@ -10,7 +10,7 @@ Usage:
 If --dit or --decoder is omitted, the script prompts the user interactively.
 """
 from __future__ import annotations
-import argparse, math, os, random, sys, termios, time, tty, wave
+import argparse, math, os, random, sys, termios, time, tty, warnings, wave
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +19,16 @@ import numpy as np
 SCRIPTS = Path(__file__).resolve().parent
 REPO = SCRIPTS.parent
 sys.path.insert(0, str(SCRIPTS))
+PROJECT_ROOT = REPO.parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "stable_audio_3"))
+
+from audio_output import (
+    PCM16_CEILING,
+    audio_peak,
+    protect_audio_peak,
+    report_peak_protection,
+    save_wav,
+)
 
 # torch + tensorrt are imported LAZILY in main() (after CLI parsing) so that
 # `sa3 --help` doesn't pay the ~5 s of import cost. The silence_fd helper is
@@ -631,13 +641,14 @@ def decoder_decode(runner: TRTRunner, latents: torch.Tensor) -> torch.Tensor:
 
     Two engine flavors are supported (auto-detected by output tensor name):
 
-      - Legacy (output name "audio", fp32/bf16): shape (1, 2, L*4096) audio
-        in [-1, 1]. The caller is responsible for clip + scale + cast to
+      - Legacy (output name "audio", fp32/bf16): shape (1, 2, L*4096) audio.
+        The caller is responsible for peak protection + scale + cast to
         int16 and transposing to (T, 2) interleaved PCM.
-      - PCM-baked (output name "pcm", int32): shape (1, L*4096, 2) PCM
-        already clipped + scaled to int16 range and transposed. The caller
-        only needs `.to(torch.int16)` to finish the conversion. Saves ~18 ms
-        per inference by letting TRT fuse the postprocess tail.
+      - Unbounded PCM (output name "pcm_unbounded", int32): shape
+        (1, L*4096, 2), scaled and transposed but not hard-clipped. The caller
+        applies peak protection before narrowing to int16.
+      - Legacy PCM-baked (output name "pcm", int32): the same shape, but the
+        engine has a baked hard clip that cannot be undone at runtime.
 
     Both engines accept any L in [32, 4096] (odd or even); SAME-S decoder at
     odd L matches PT eager at cos ≥ 0.99 on in-distribution latents — no
@@ -648,7 +659,18 @@ def decoder_decode(runner: TRTRunner, latents: torch.Tensor) -> torch.Tensor:
     """
     ctx = runner.context
     in_dt = runner.in_dtype["latent"]
-    out_name = "pcm" if "pcm" in runner.out_dtype else "audio"
+    if "pcm_unbounded" in runner.out_dtype:
+        out_name = "pcm_unbounded"
+    elif "pcm" in runner.out_dtype:
+        out_name = "pcm"
+        warnings.warn(
+            "legacy TensorRT decoder engine has baked hard clipping; rebuild the "
+            "decoder engine to get the pcm_unbounded output and preserve peak ratios",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    else:
+        out_name = "audio"
     out_dt = runner.out_dtype[out_name]
     lat = latents.to(in_dt).contiguous()
     ctx.set_input_shape("latent", tuple(lat.shape))
@@ -1001,20 +1023,6 @@ class GraphPingpongSampler:
 
 
 # ─── WAV I/O ─────────────────────────────────────────────────────────────
-def save_wav(path: str, audio: np.ndarray, sample_rate: int = SAMPLE_RATE):
-    """audio: (channels, T) float32 in [-1, 1]. Writes 16-bit PCM stereo WAV."""
-    if not np.isfinite(audio).all():
-        n_bad = int((~np.isfinite(audio)).sum())
-        raise RuntimeError(f"refusing to write WAV — audio contains {n_bad} non-finite samples (NaN/Inf)")
-    audio = np.clip(audio, -1.0, 1.0)
-    pcm = (audio * 32767.0).astype(np.int16).T   # (T, channels) interleaved
-    with wave.open(path, "wb") as w:
-        w.setnchannels(audio.shape[0])
-        w.setsampwidth(2)
-        w.setframerate(sample_rate)
-        w.writeframes(pcm.tobytes())
-
-
 def read_wav(path: str) -> np.ndarray:
     """Read 16-bit PCM @ 44.1 kHz. Returns (2, T) float32 in [-1, 1]."""
     with wave.open(path, "rb") as w:
@@ -1614,12 +1622,10 @@ def main():
     t0_total = time.time()
 
     # PCM conversion. Two paths:
-    #   - PCM-baked engines (output "pcm", int32 (1, T_full, 2)): clip + scale
-    #     + transpose are already done inside the decoder graph. The only
-    #     remaining work is narrow int32→int16 and trim → done as part of
-    #     the GPU→CPU copy (one fast kernel + DtoH).
-    #   - Legacy engines (output "audio", fp32 (1, 2, T_full)): we still do
-    #     the old clip + scale + cast + transpose on the GPU before the copy.
+    #   - PCM engines (int32 (1, T_full, 2)): scale + transpose are already
+    #     done inside the decoder graph. Apply peak protection before narrowing.
+    #   - Legacy engines (output "audio", fp32 (1, 2, T_full)): protect,
+    #     scale, cast, and transpose on the GPU before the copy.
     requested_samples = int(round(args.seconds * SAMPLE_RATE))
     t0 = time.time()
     if _pcm_baked:
@@ -1627,9 +1633,7 @@ def main():
         pcm_gpu = audio[0]                                      # (T_full, 2) int32
         if pcm_gpu.shape[0] > requested_samples:
             pcm_gpu = pcm_gpu[:requested_samples]
-        # Engine output isn't clipped — values > ±32767 wrap when cast to int16
-        # (audible clicks). Clamp first.
-        pcm_gpu = pcm_gpu.clamp(-32767, 32767).to(torch.int16)
+        pcm_gpu = protect_audio_peak(pcm_gpu, ceiling=PCM16_CEILING).to(torch.int16)
         n = pcm_gpu.shape[0]
         if _pinned_pcm is not None:
             # Non-blocking DMA straight into the pre-allocated pinned host
@@ -1641,11 +1645,12 @@ def main():
         else:
             pcm = pcm_gpu.contiguous().cpu().numpy()             # blocking fallback
     else:
-        # legacy fp32 (1, 2, T_full): clip + scale + cast + transpose on GPU
+        # legacy fp32 (1, 2, T_full): protect + scale + cast + transpose on GPU
         audio_gpu = audio[0]                                    # (2, T_full) fp32
         if audio_gpu.shape[-1] > requested_samples:
             audio_gpu = audio_gpu[..., :requested_samples]
-        pcm_gpu = (audio_gpu.clamp(-1.0, 1.0) * 32767.0).to(torch.int16).T.contiguous()  # (T, 2)
+        audio_gpu = protect_audio_peak(audio_gpu)
+        pcm_gpu = (audio_gpu * PCM16_CEILING).to(torch.int16).T.contiguous()  # (T, 2)
         pcm = pcm_gpu.cpu().numpy()
     t_gpu2cpu = (time.time() - t0) * 1000
 
@@ -1657,9 +1662,9 @@ def main():
 
     stage("[5/5]", f"WAV → {out_display}", (time.time() - t0_total) * 1000)
     if _pcm_baked:
-        sub(f"cast int32→int16 + GPU→CPU {t_gpu2cpu:.0f} ms  ·  disk write {t_disk:.0f} ms")
+        sub(f"protect/cast int32→int16 + GPU→CPU {t_gpu2cpu:.0f} ms  ·  disk write {t_disk:.0f} ms")
     else:
-        sub(f"clip/cast/transpose + GPU→CPU {t_gpu2cpu:.0f} ms  ·  disk write {t_disk:.0f} ms")
+        sub(f"protect/cast/transpose + GPU→CPU {t_gpu2cpu:.0f} ms  ·  disk write {t_disk:.0f} ms")
 
     t_full = time.time() - t_wall_start
     # ── Per-stage VRAM table ──

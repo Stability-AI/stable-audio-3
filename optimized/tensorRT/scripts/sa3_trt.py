@@ -109,9 +109,9 @@ class FullPipelineGraph:
               dit_engine.execute_async_v3
               ... pingpong math reads dit._vel_buf / dit._x_buf / noise_bufs[i] ...
       5. decoder_in_buf <- final_latents_buf
-      6. decoder engine reads decoder_in_buf, writes pcm_int32_buf
-         (1, T_lat*4096, 2) int32
-      7. pcm_int16_buf <- pcm_int32_buf.to(int16)  (narrow cast)
+      6. decoder engine reads decoder_in_buf, writes audio_unbounded_buf
+         (1, T_lat*4096, 2) fp32
+      7. peak-protect, scale, and narrow into pcm_int16_buf
       8. pinned_host_pcm.copy_(pcm_int16_buf[:requested_samples], non_blocking)
 
     Per-inference (replay path):
@@ -146,6 +146,7 @@ class FullPipelineGraph:
         self._sigma_next_bufs = None
         self.latents_out_buf = None     # (1, 256, L) fp32, device — final latent
         self.decoder_in_buf = None      # (1, 256, L) fp32, device — what dec reads
+        self.audio_unbounded_buf = None  # (1, T_lat*4096, 2) fp32, device
         self.pcm_int32_buf = None       # (1, T_lat*4096, 2) int32, device
         self.pcm_int16_buf = None       # (T_lat*4096, 2) int16, device
         self.pinned_host_pcm = None     # (T_lat*4096, 2) int16, pinned host
@@ -228,17 +229,21 @@ class FullPipelineGraph:
         dec_in_dt = self.dec_runner.in_dtype["latent"]
         self.decoder_in_buf = canon.torch.empty(1, IO_CHANNELS, L, dtype=dec_in_dt, device="cuda")
         # Auto-detect output flavor like decoder_decode does.
-        if "pcm_unbounded" in self.dec_runner.out_dtype:
-            self._dec_out_name = "pcm_unbounded"
-            pcm_dt = self.dec_runner.out_dtype[self._dec_out_name]
-            self.pcm_int32_buf = canon.torch.empty(1, T_full, 2, dtype=pcm_dt, device="cuda")
+        if "audio_unbounded" in self.dec_runner.out_dtype:
+            self._dec_out_name = "audio_unbounded"
+            audio_dt = self.dec_runner.out_dtype[self._dec_out_name]
+            self.audio_unbounded_buf = canon.torch.empty(
+                1, T_full, 2, dtype=audio_dt, device="cuda"
+            )
             dec_ctx.set_tensor_address("latent", self.decoder_in_buf.data_ptr())
-            dec_ctx.set_tensor_address(self._dec_out_name, self.pcm_int32_buf.data_ptr())
+            dec_ctx.set_tensor_address(
+                self._dec_out_name, self.audio_unbounded_buf.data_ptr()
+            )
         elif "pcm" in self.dec_runner.out_dtype:
             self._dec_out_name = "pcm"
             warnings.warn(
                 "legacy TensorRT decoder engine has baked hard clipping; rebuild the "
-                "decoder engine to get the pcm_unbounded output and preserve peak ratios",
+                "decoder engine to get the audio_unbounded output and preserve peak ratios",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -374,8 +379,29 @@ class FullPipelineGraph:
                 # Stage 4: Decoder
                 self.decoder_in_buf.copy_(self.latents_out_buf)
                 _enqueue(self.dec_runner.context, capture_stream, "decoder (mega-graph)")
-                # Stage 5a: narrow + cast int32 → int16 (or legacy fp32 → int16)
-                if self._dec_out_name in ("pcm_unbounded", "pcm"):
+                # Stage 5a: peak-protect before PCM scaling / INT16 narrowing.
+                if self._dec_out_name == "audio_unbounded":
+                    source = self.audio_unbounded_buf[
+                        0, :self.requested_samples
+                    ]
+                    canon.zero_audio_padding_(
+                        source,
+                        self.valid_sample_mask[:self.requested_samples],
+                        sample_dim=0,
+                    )
+                    peak = canon.audio_peak(source).float()
+                    protected = canon.protect_audio_peak(
+                        source,
+                        ceiling=self.peak_ceiling,
+                        peak=peak,
+                        validate_nonfinite=False,
+                        emit_warning=False,
+                    )
+                    self.pcm_int16_buf[:self.requested_samples].copy_(
+                        (protected * canon.PCM16_CEILING).to(canon.torch.int16)
+                    )
+                    self._peak_ceiling = self.peak_ceiling
+                elif self._dec_out_name == "pcm":
                     source = self.pcm_int32_buf[0, :self.requested_samples]
                     canon.zero_audio_padding_(
                         source,
@@ -718,7 +744,8 @@ class SA3Inference:
         """Generate one audio clip. Returns (pcm_int16, timing_dict).
 
         Returns:
-            pcm:    (T_samples, 2) int16 numpy array, T_samples = round(seconds*44100)
+            pcm:    (T_samples, 2) int16 numpy array,
+                    T_samples = round(seconds * SAMPLE_RATE)
             timing: dict with 'inference_ms', 'graph_build_ms' (0 if cache hit),
                     'realtime', 'seed', 'T_lat', 'samples'
         """

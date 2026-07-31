@@ -255,15 +255,24 @@ def save_wav(
     peak_ceiling_dbfs: float = 0.0,
 ) -> None:
     """Write channel-first NumPy floating-point audio as 16-bit PCM WAV."""
-    if _backend_name(audio) != "numpy":
-        raise TypeError("save_wav expects a channel-first numpy.ndarray")
-
-    import numpy as np
-
-    audio = protect_audio_peak(audio, ceiling=dbfs_to_amplitude(peak_ceiling_dbfs))
-    pcm = (audio * PCM16_CEILING).astype(np.int16).T
+    pcm = audio_to_pcm16(audio, peak_ceiling_dbfs=peak_ceiling_dbfs)
     with wave.open(path, "wb") as wav:
         wav.setnchannels(audio.shape[0])
         wav.setsampwidth(2)
         wav.setframerate(sample_rate)
         wav.writeframes(pcm.tobytes())
+
+
+def audio_to_pcm16(
+    audio: Any,
+    *,
+    peak_ceiling_dbfs: float = 0.0,
+) -> Any:
+    """Protect channel-first NumPy audio and return interleaved PCM16."""
+    if _backend_name(audio) != "numpy":
+        raise TypeError("audio_to_pcm16 expects a channel-first numpy.ndarray")
+
+    import numpy as np
+
+    audio = protect_audio_peak(audio, ceiling=dbfs_to_amplitude(peak_ceiling_dbfs))
+    return (audio * PCM16_CEILING).astype(np.int16).T

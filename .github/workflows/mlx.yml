@@ -30,3 +30,10 @@ jobs:
           python scripts/lora_train_mlx.py --help > /dev/null
           python scripts/pre_encode_mlx.py --help > /dev/null
           echo "CLI smoke OK"
+      - name: Standalone subtree import smoke
+        run: |
+          bundle_dir="$(mktemp -d)/sa3_mlx"
+          cp -R optimized/mlx "$bundle_dir"
+          cp stable_audio_3/audio_output.py "$bundle_dir/scripts/audio_output.py"
+          cd "$bundle_dir"
+          python scripts/sa3_mlx.py --help > /dev/null

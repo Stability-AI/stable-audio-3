@@ -12,10 +12,11 @@ Conditioner / unpatch, encode_prompt / decode_with helpers) live in the speed-me
 repo's tflite_pipeline.py and are intentionally dropped here.
 """
 from __future__ import annotations
-import wave
 from pathlib import Path
 from typing import Callable
 import numpy as np
+
+from .wav_io import save_wav as _save_wav
 
 # This file lives in <project>/models/defs/. The bundled SentencePiece model sits at
 # <project>/models/tokenizer.model — resolve it relative to this file so the tokenizer
@@ -30,12 +31,14 @@ COND_TOKENS = 256                  # T5Gemma seq len
 
 
 # ───────────────────────── WAV ─────────────────────────
-def save_wav(path, audio):  # audio: (2, T) float32 in [-1,1]
-    audio = np.clip(np.asarray(audio, np.float32), -1, 1)
-    pcm = (audio * 32767.0).astype(np.int16).T  # (T, 2) interleaved
-    with wave.open(str(path), "wb") as w:
-        w.setnchannels(audio.shape[0]); w.setsampwidth(2); w.setframerate(SAMPLE_RATE)
-        w.writeframes(pcm.tobytes())
+def save_wav(path, audio, *, peak_ceiling_dbfs=0.0):
+    """Write channel-first float audio with shared no-boost peak protection."""
+    _save_wav(
+        str(path),
+        np.asarray(audio, np.float32),
+        SAMPLE_RATE,
+        peak_ceiling_dbfs=peak_ceiling_dbfs,
+    )
 
 
 # ───────────────────────── Tokenizer (SentencePiece, bundled) ─────────────────────────

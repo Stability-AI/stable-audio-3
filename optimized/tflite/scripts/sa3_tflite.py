@@ -60,6 +60,7 @@ sys.path.insert(0, str(REPO))                    # so `from models.defs.* import
 sys.path.insert(0, str(REPO / "scripts"))        # so `from weights import *` resolves
 
 from models.defs import tflite_pipeline as P    # Tokenizer, T5GemmaTFLite, build_pingpong_schedule, make_noise, sample, save_wav
+from models.defs.wav_io import dbfs_to_amplitude
 from weights import ensure_local, is_present, PRECISIONS, dit_rel, dec_rel, enc_rel
 
 SAMPLE_RATE = 44100
@@ -607,6 +608,8 @@ def main():
     ap.add_argument("--out", "-o", default=None,
                     help="Output WAV path. Relative → output/<file>; absolute → as-is. "
                          "If omitted, auto-named from the prompt + seed.")
+    ap.add_argument("--peak-ceiling-dbfs", type=float, default=0.0,
+                    help="Output sample-peak ceiling in dBFS, at or below 0 (default: 0).")
     ap.add_argument("--play", action="store_true",
                     help="Play the WAV after writing (blocking): `afplay` on macOS, "
                          "winsound on Windows, `aplay` on Linux (prints the path if "
@@ -614,6 +617,10 @@ def main():
     args = ap.parse_args()
     if args.steps < 1:
         ap.error(f"--steps must be ≥ 1 (got {args.steps})")
+    try:
+        dbfs_to_amplitude(args.peak_ceiling_dbfs)
+    except ValueError as exc:
+        ap.error(str(exc))
     # per-component overrides fall back to the shared --precision
     args.dit_precision = args.dit_precision or args.precision
     args.decoder_precision = args.decoder_precision or args.precision
@@ -877,7 +884,11 @@ def main():
     req = int(round(args.seconds * SAMPLE_RATE))
     if audio_np.shape[-1] > req:
         audio_np = audio_np[:, :req]
-    P.save_wav(args.out, audio_np)
+    P.save_wav(
+        args.out,
+        audio_np,
+        peak_ceiling_dbfs=args.peak_ceiling_dbfs,
+    )
     stage(TAG["dec"], f"Decoder ({dec}, audio-out) + WAV", load2_ms + dec_ms)
     peak = float(np.abs(audio_np).max()); rms = float(np.sqrt((audio_np**2).mean()))
     sub(f"decode {dmode}  {dec_ms:.0f} ms   audio {audio_np.shape}   peak {peak:.3f} rms {rms:.3f}")

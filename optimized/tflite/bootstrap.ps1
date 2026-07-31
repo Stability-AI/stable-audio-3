@@ -59,6 +59,9 @@ if (Get-Command git -ErrorAction SilentlyContinue) {
         if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
         Expand-Archive $zip -DestinationPath $extract -Force
         Move-Item (Join-Path $extract "$RepoName-$Branch\$SubDir") $LocalDir
+        Copy-Item `
+            (Join-Path $extract "$RepoName-$Branch\stable_audio_3\audio_output.py") `
+            (Join-Path $LocalDir "models\defs\audio_output.py")
         Remove-Item $zip -Force
         Remove-Item $extract -Recurse -Force
         Ok "extracted to .\$LocalDir"

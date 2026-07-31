@@ -19,10 +19,8 @@ import numpy as np
 SCRIPTS = Path(__file__).resolve().parent
 REPO = SCRIPTS.parent
 sys.path.insert(0, str(SCRIPTS))
-PROJECT_ROOT = REPO.parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "stable_audio_3"))
 
-from audio_output import (
+from wav_io import (
     PCM16_CEILING,
     audio_peak,
     dbfs_to_amplitude,
@@ -641,14 +639,14 @@ def encode_chunked(runner: TRTRunner, audio: torch.Tensor, *,
 def decoder_decode(runner: TRTRunner, latents: torch.Tensor) -> torch.Tensor:
     """SAME-S/L decoder.
 
-    Two engine flavors are supported (auto-detected by output tensor name):
+    Three engine flavors are supported (auto-detected by output tensor name):
 
       - Legacy (output name "audio", fp32/bf16): shape (1, 2, L*4096) audio.
         The caller is responsible for peak protection + scale + cast to
         int16 and transposing to (T, 2) interleaved PCM.
-      - Unbounded PCM (output name "pcm_unbounded", int32): shape
-        (1, L*4096, 2), scaled and transposed but not hard-clipped. The caller
-        applies peak protection before narrowing to int16.
+      - Unbounded audio (output name "audio_unbounded", fp32): shape
+        (1, L*4096, 2), transposed but neither hard-clipped nor PCM-scaled. The
+        caller applies peak protection before scaling and narrowing to int16.
       - Legacy PCM-baked (output name "pcm", int32): the same shape, but the
         engine has a baked hard clip that cannot be undone at runtime.
 
@@ -656,18 +654,18 @@ def decoder_decode(runner: TRTRunner, latents: torch.Tensor) -> torch.Tensor:
     odd L matches PT eager at cos ≥ 0.99 on in-distribution latents — no
     chunking needed.
 
-    Returns whatever the engine emits (caller branches on .dtype to decide
-    what postprocessing — if any — is still needed in Stage 5).
+    Returns whatever the engine emits; the caller uses dtype and layout to
+    select the remaining Stage-5 postprocessing.
     """
     ctx = runner.context
     in_dt = runner.in_dtype["latent"]
-    if "pcm_unbounded" in runner.out_dtype:
-        out_name = "pcm_unbounded"
+    if "audio_unbounded" in runner.out_dtype:
+        out_name = "audio_unbounded"
     elif "pcm" in runner.out_dtype:
         out_name = "pcm"
         warnings.warn(
             "legacy TensorRT decoder engine has baked hard clipping; rebuild the "
-            "decoder engine to get the pcm_unbounded output and preserve peak ratios",
+            "decoder engine to get the audio_unbounded output and preserve peak ratios",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -1414,6 +1412,15 @@ def main():
                 _pinned_pcm.copy_(pcm_w, non_blocking=True)
             else:
                 _ = pcm_w.cpu().numpy()
+        elif dec_out.shape[-1] == 2:
+            protected_w = protect_audio_peak(
+                dec_out[0], validate_nonfinite=False, emit_warning=False
+            )
+            pcm_w = (protected_w * PCM16_CEILING).to(torch.int16)
+            if _pinned_pcm is not None:
+                _pinned_pcm.copy_(pcm_w, non_blocking=True)
+            else:
+                _ = pcm_w.cpu().numpy()
         else:
             _ = dec_out.cpu().numpy()
         if _w_audio is not None:
@@ -1607,10 +1614,11 @@ def main():
     if args.free_models:
         runners["dec"].free(); del runners["dec"]
     decode_ms = (time.time() - t0) * 1000
-    _pcm_baked = audio.dtype == torch.int32
+    _legacy_pcm_baked = audio.dtype == torch.int32
+    _sample_major_float = audio.dtype.is_floating_point and audio.shape[-1] == 2
     stage("[4/5]", f"Decoder ({args.decoder})", decode_ms)
     sub(f"audio {tuple(audio.shape)} {audio.dtype}"
-        f"{'  (pcm baked-in)' if _pcm_baked else ''}")
+        f"{'  (legacy pcm baked-in)' if _legacy_pcm_baked else ''}")
     _stage_vram("Decode")
 
     # ── End of inference wall clock (WAV save excluded — that's I/O) ──
@@ -1630,13 +1638,28 @@ def main():
     t0_total = time.time()
 
     # PCM conversion. Two paths:
-    #   - PCM engines (int32 (1, T_full, 2)): scale + transpose are already
-    #     done inside the decoder graph. Apply peak protection before narrowing.
+    #   - New engines (fp32 (1, T_full, 2)): transpose is already done inside
+    #     the decoder graph. Protect before PCM scaling and narrowing.
+    #   - Legacy PCM engines (int32 (1, T_full, 2)): clipping, scale, and
+    #     transpose are already baked in and cannot be undone.
     #   - Legacy engines (output "audio", fp32 (1, 2, T_full)): protect,
     #     scale, cast, and transpose on the GPU before the copy.
     requested_samples = int(round(args.seconds * SAMPLE_RATE))
     t0 = time.time()
-    if _pcm_baked:
+    if _sample_major_float:
+        audio_gpu = audio[0]
+        if audio_gpu.shape[0] > requested_samples:
+            audio_gpu = audio_gpu[:requested_samples]
+        audio_gpu = protect_audio_peak(audio_gpu, ceiling=peak_ceiling)
+        pcm_gpu = (audio_gpu * PCM16_CEILING).to(torch.int16).contiguous()
+        n = pcm_gpu.shape[0]
+        if _pinned_pcm is not None:
+            _pinned_pcm[:n].copy_(pcm_gpu, non_blocking=True)
+            torch.cuda.synchronize()
+            pcm = _pinned_pcm[:n].numpy()
+        else:
+            pcm = pcm_gpu.cpu().numpy()
+    elif _legacy_pcm_baked:
         # (1, T_full, 2) int32 → (T, 2) int16 on GPU
         pcm_gpu = audio[0]                                      # (T_full, 2) int32
         if pcm_gpu.shape[0] > requested_samples:
@@ -1672,8 +1695,10 @@ def main():
     t_disk = (time.time() - t0) * 1000
 
     stage("[5/5]", f"WAV → {out_display}", (time.time() - t0_total) * 1000)
-    if _pcm_baked:
-        sub(f"protect/cast int32→int16 + GPU→CPU {t_gpu2cpu:.0f} ms  ·  disk write {t_disk:.0f} ms")
+    if _sample_major_float:
+        sub(f"protect/scale/cast + GPU→CPU {t_gpu2cpu:.0f} ms  ·  disk write {t_disk:.0f} ms")
+    elif _legacy_pcm_baked:
+        sub(f"legacy int32→int16 + GPU→CPU {t_gpu2cpu:.0f} ms  ·  disk write {t_disk:.0f} ms")
     else:
         sub(f"protect/cast/transpose + GPU→CPU {t_gpu2cpu:.0f} ms  ·  disk write {t_disk:.0f} ms")
 

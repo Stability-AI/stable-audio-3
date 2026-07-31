@@ -38,6 +38,7 @@ DEFAULT_ARGS=(--prompt "Impending tribal, epic orchestral buildup" --dit sm-musi
 
 TAR_URL="https://github.com/$REPO_OWNER/$REPO_NAME/archive/refs/heads/$BRANCH.tar.gz"
 TAR_INNER="$REPO_NAME-$BRANCH/$SUBDIR_IN_REPO"
+SHARED_AUDIO_INNER="$REPO_NAME-$BRANCH/stable_audio_3/audio_output.py"
 
 # ── colours ─────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -104,11 +105,13 @@ else
         curl -fL --progress-bar "$TAR_URL" -o "$TMP_TAR"
 
         # BSD tar (macOS) / GNU tar both extract only paths matching the pattern.
-        tar -xz -f "$TMP_TAR" -C "$TMP_EXTRACT" "$TAR_INNER"
+        tar -xz -f "$TMP_TAR" -C "$TMP_EXTRACT" \
+            "$TAR_INNER" "$SHARED_AUDIO_INNER"
 
         SRC="$TMP_EXTRACT/$TAR_INNER"
         [[ -d "$SRC" ]] || fail "Expected '$TAR_INNER' inside the tarball but didn't find it."
         mv "$SRC" "$LOCAL_DIR"
+        mv "$TMP_EXTRACT/$SHARED_AUDIO_INNER" "$LOCAL_DIR/models/defs/audio_output.py"
         ok "extracted $(find "$LOCAL_DIR" -type f | wc -l | tr -d ' ') files to ./$LOCAL_DIR"
     fi
 fi

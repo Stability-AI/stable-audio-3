@@ -289,6 +289,7 @@ For sub-realtime latency on a supported device, prefer the GPU siblings:
 | `--inpaint-range`     | —        | `START,END` seconds; regenerate that span, keep the rest              |
 | `--threads`           | 8        | XNNPACK CPU threads (all TFLite models run on CPU)                    |
 | `--free-models`       | on       | Free each model after its last use; `--no-free-models` keeps them resident |
+| `--peak-ceiling-dbfs` | 0        | Sample-peak ceiling in dBFS; use `-1` for additional encoding headroom |
 | `--out` / `-o`        | (auto)   | Relative → `output/<file>`; absolute → as-is. 16-bit PCM stereo @ 44.1 kHz, trimmed to exactly `--seconds` |
 | `--play`              | off      | After writing, play the WAV: `afplay` (macOS) / `winsound` (Windows) / `aplay` (Linux); Ctrl-C stops both |
 

@@ -61,6 +61,7 @@ from lora_core import parse_lora_spec, LoraError  # noqa: E402
 from lora_patch import get_patched_dit  # noqa: E402
 from weights import ensure_local, PRECISIONS, dit_rel, dec_rel, enc_rel  # noqa: E402
 from spec import render_spectrogram_png  # noqa: E402
+from models.defs.wav_io import audio_to_pcm16  # noqa: E402
 
 OUTPUT_DIR = REPO / "output" / "gradio"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -824,7 +825,12 @@ def build_ui(initial_dit: str, initial_decoder: str, initial_precision: str, *,
         if not np.isfinite(audio_np).all():
             return None, "error: model produced non-finite audio (try a higher σmax or different seed)"
 
-        pcm = (np.clip(audio_np, -1, 1) * 32767.0).astype(np.int16).T   # (T, 2)
+        raw_peak = float(np.abs(audio_np).max()) if audio_np.size else 0.0
+        pcm = audio_to_pcm16(audio_np)
+        if raw_peak > 1.0:
+            notes.append(
+                f"output peak {raw_peak:.3f} exceeded 0 dBFS — attenuated without boosting"
+            )
         basename = verbose_basename(prompt, negative_prompt, cfg, sigma_max, seed, precision)
         out_path = OUTPUT_DIR / f"{basename}.wav"
         _save_wav(pcm, out_path)

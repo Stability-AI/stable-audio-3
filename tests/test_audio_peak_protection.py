@@ -11,6 +11,7 @@ from optimized.mlx.scripts.wav_io import save_wav
 from stable_audio_3.audio_output import (
     PCM16_CEILING,
     apply_output_peak_policy,
+    audio_to_pcm16,
     audio_peak,
     dbfs_to_amplitude,
     protect_audio_peak,
@@ -165,6 +166,34 @@ def test_mlx_wav_serializer_attenuates_instead_of_clipping(tmp_path):
     assert pcm[0, -2] < pcm[0, -1]
     assert pcm[0, -2] == pytest.approx(32767 * 1.25 / 1.75, abs=1)
     assert pcm[1, -2] == pytest.approx(-32767 * 1.25 / 1.75, abs=1)
+
+
+def test_shared_pcm_conversion_attenuates_without_changing_sample_ratios():
+    audio = np.array([[0.0, 1.25, 1.75], [0.0, -1.25, -1.75]], dtype=np.float32)
+
+    with pytest.warns(RuntimeWarning, match="peak 1.750"):
+        pcm = audio_to_pcm16(audio)
+
+    assert pcm.shape == (3, 2)
+    assert pcm[-1, 0] == 32767
+    assert pcm[-2, 0] == pytest.approx(32767 * 1.25 / 1.75, abs=1)
+
+
+def test_tflite_wav_serializer_uses_shared_peak_policy(tmp_path):
+    from optimized.tflite.models.defs.tflite_pipeline import save_wav as save_tflite_wav
+
+    audio = np.array([[0.0, 1.25, 1.75], [0.0, -1.25, -1.75]], dtype=np.float32)
+    output = tmp_path / "tflite.wav"
+
+    with pytest.warns(RuntimeWarning, match="peak 1.750"):
+        save_tflite_wav(output, audio, peak_ceiling_dbfs=-1.0)
+
+    with wave.open(str(output), "rb") as wav:
+        pcm = np.frombuffer(wav.readframes(wav.getnframes()), dtype=np.int16)
+        pcm = pcm.reshape(-1, wav.getnchannels()).T
+
+    assert pcm[0, -1] == pytest.approx(32767 * dbfs_to_amplitude(-1.0), abs=1)
+    assert pcm[0, -2] == pytest.approx(pcm[0, -1] * 1.25 / 1.75, abs=1)
 
 
 class _FakePipeline:

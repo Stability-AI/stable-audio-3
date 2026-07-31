@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
+import uuid
+import warnings
 from pathlib import Path
 
 
-UNBOUNDED_PCM_OUTPUT = "pcm_unbounded"
+UNBOUNDED_AUDIO_OUTPUT = "audio_unbounded"
+_FP32_CAST_NAME = "PeakProtectAudioOutputFP32"
+_FP32_CAST_OUTPUT = "audio_unbounded_channels_first_fp32"
 
 
 def _producer_map(model):
@@ -64,7 +70,9 @@ def _find_pcm_tail(model, output_name: str):
     producer_by_output = _producer_map(model)
     output_tensor = graph_output.name
     output_producer = producer_by_output.get(output_tensor)
+    output_identity = None
     if output_producer is not None and output_producer.op_type == "Identity":
+        output_identity = output_producer
         output_tensor = output_producer.input[0]
 
     transpose = producer_by_output.get(output_tensor)
@@ -104,12 +112,47 @@ def _find_pcm_tail(model, output_name: str):
     signal_index = 1 - scale_index
     return {
         "output": graph_output,
+        "output_identity": output_identity,
         "transpose": transpose,
         "cast": cast,
         "multiply": multiply,
         "signal_index": signal_index,
         "scale_index": scale_index,
         "scale": scale,
+        "producer_by_output": producer_by_output,
+    }
+
+
+def _find_unbounded_audio_tail(model):
+    """Return the verified sample-major floating-point output Transpose."""
+    graph_output = next(
+        (
+            output
+            for output in model.graph.output
+            if output.name == UNBOUNDED_AUDIO_OUTPUT
+        ),
+        None,
+    )
+    if graph_output is None:
+        raise RuntimeError(
+            f"decoder ONNX has no {UNBOUNDED_AUDIO_OUTPUT!r} graph output"
+        )
+
+    producer_by_output = _producer_map(model)
+    output_tensor = graph_output.name
+    output_producer = producer_by_output.get(output_tensor)
+    if output_producer is not None and output_producer.op_type == "Identity":
+        output_tensor = output_producer.input[0]
+    transpose = producer_by_output.get(output_tensor)
+    if transpose is None or transpose.op_type != "Transpose":
+        raise RuntimeError("unbounded decoder audio is not produced by Transpose")
+    if _attribute_ints(transpose, "perm") != (0, 2, 1):
+        raise RuntimeError(
+            "unbounded decoder audio Transpose does not use the expected [0, 2, 1] perm"
+        )
+    return {
+        "output": graph_output,
+        "transpose": transpose,
         "producer_by_output": producer_by_output,
     }
 
@@ -126,17 +169,17 @@ def _clip_bounds(model, clip) -> tuple[float | None, float | None]:
 
 
 def remove_output_hard_clip(model) -> int:
-    """Remove only the verified final audio Clip and mark PCM unbounded.
+    """Remove only the verified final Clip and expose float sample-major audio.
 
-    The decoder's existing scale, INT32 cast, and channel transpose stay in
-    the graph. Runtime code can then apply the shared no-boost attenuation
-    policy before narrowing to INT16. Returns the number of removed Clip nodes.
+    The destructive scale and integer cast are removed with the Clip. Runtime
+    code applies the shared no-boost attenuation policy to floating-point audio,
+    then scales and narrows to INT16. Returns the number of removed Clip nodes.
     """
     import numpy as np
-    from onnx import helper
+    from onnx import TensorProto, helper
 
-    if any(output.name == UNBOUNDED_PCM_OUTPUT for output in model.graph.output):
-        _find_pcm_tail(model, UNBOUNDED_PCM_OUTPUT)
+    if any(output.name == UNBOUNDED_AUDIO_OUTPUT for output in model.graph.output):
+        _find_unbounded_audio_tail(model)
         return 0
 
     tail = _find_pcm_tail(model, "pcm")
@@ -164,104 +207,167 @@ def remove_output_hard_clip(model) -> int:
             "decoder output Clip is shared; refusing to remove a semantic graph node"
         )
 
-    multiply.input[signal_index] = clip.input[0]
-    model.graph.node.remove(clip)
-
-    # Give rebuilt engines an explicit binding name. Runtime can distinguish
-    # them from legacy `pcm` engines whose destructive Clip is already baked in.
-    model.graph.node.append(
-        helper.make_node(
-            "Identity",
-            inputs=[tail["output"].name],
-            outputs=[UNBOUNDED_PCM_OUTPUT],
-            name="ExposeUnboundedPCM",
+    multiply_consumers = [
+        node for node in model.graph.node if multiply.output[0] in node.input
+    ]
+    if multiply_consumers != [tail["cast"]]:
+        raise RuntimeError(
+            "decoder PCM scale is shared; refusing to remove a semantic graph node"
         )
-    )
-    tail["output"].name = UNBOUNDED_PCM_OUTPUT
-    return 1
-
-
-def force_unbounded_pcm_tail_fp32(model) -> int:
-    """Force unbounded audio scaling to FP32 before the INT32 cast.
-
-    FP16 can only represent finite values through 65504, so an unbounded
-    ``audio * 32767`` tail would overflow for peaks just above 2. This inserts
-    a stable FP32 boundary and restores the exact 32767 scale after any mixed-
-    precision graph conversion. Returns 1 when the graph changed, else 0.
-    """
-    import numpy as np
-    from onnx import TensorProto, helper, numpy_helper
-
-    tail = _find_pcm_tail(model, UNBOUNDED_PCM_OUTPUT)
-    multiply = tail["multiply"]
-    signal_index = tail["signal_index"]
-    scale_index = tail["scale_index"]
-    producer_by_output = tail["producer_by_output"]
-
-    scale_name = "peak_protect_pcm16_scale_fp32"
-    cast_name = "PeakProtectPCMInputFP32"
-    cast_output = "pcm_unbounded_input_fp32"
-    signal_input = multiply.input[signal_index]
-    signal_producer = producer_by_output.get(signal_input)
-    already_cast = (
-        signal_producer is not None
-        and signal_producer.op_type == "Cast"
-        and signal_producer.name == cast_name
-        and _attribute_int(signal_producer, "to") == TensorProto.FLOAT
-    )
-    if already_cast and multiply.input[scale_index] == scale_name:
-        return 0
+    cast_consumers = [
+        node for node in model.graph.node if tail["cast"].output[0] in node.input
+    ]
+    if cast_consumers != [tail["transpose"]]:
+        raise RuntimeError(
+            "decoder PCM Cast is shared; refusing to remove a semantic graph node"
+        )
 
     existing_node_names = {node.name for node in model.graph.node}
     existing_tensor_names = {tensor.name for tensor in model.graph.initializer} | {
         output for node in model.graph.node for output in node.output
     }
-    if cast_name in existing_node_names or cast_output in existing_tensor_names:
-        raise RuntimeError("decoder graph already uses reserved FP32 PCM tail names")
-    if scale_name in existing_tensor_names:
-        raise RuntimeError(
-            "decoder graph already uses the reserved FP32 PCM scale name"
-        )
+    if (
+        _FP32_CAST_NAME in existing_node_names
+        or _FP32_CAST_OUTPUT in existing_tensor_names
+    ):
+        raise RuntimeError("decoder graph already uses reserved unbounded-audio names")
 
-    cast = helper.make_node(
-        "Cast",
-        inputs=[signal_input],
-        outputs=[cast_output],
-        name=cast_name,
-        to=TensorProto.FLOAT,
+    for node in (clip, multiply, tail["cast"]):
+        model.graph.node.remove(node)
+    transpose = tail["transpose"]
+    transpose_index = list(model.graph.node).index(transpose)
+    model.graph.node.insert(
+        transpose_index,
+        helper.make_node(
+            "Cast",
+            inputs=[clip.input[0]],
+            outputs=[_FP32_CAST_OUTPUT],
+            name=_FP32_CAST_NAME,
+            to=TensorProto.FLOAT,
+        ),
     )
-    multiply_index = list(model.graph.node).index(multiply)
-    model.graph.node.insert(multiply_index, cast)
-    model.graph.initializer.append(
-        numpy_helper.from_array(np.array(32767.0, dtype=np.float32), scale_name)
+    transpose.input[0] = _FP32_CAST_OUTPUT
+
+    terminal = (
+        tail["output_identity"] if tail["output_identity"] is not None else transpose
     )
-    multiply.input[signal_index] = cast_output
-    multiply.input[scale_index] = scale_name
+    terminal.output[0] = UNBOUNDED_AUDIO_OUTPUT
+    tail["output"].name = UNBOUNDED_AUDIO_OUTPUT
+    tail["output"].type.tensor_type.elem_type = TensorProto.FLOAT
+    return 1
+
+
+def force_unbounded_audio_output_fp32(model) -> int:
+    """Restore the explicit FP32 output boundary after mixed-precision conversion."""
+    from onnx import TensorProto, helper
+
+    tail = _find_unbounded_audio_tail(model)
+    transpose = tail["transpose"]
+    signal_input = transpose.input[0]
+    producer = tail["producer_by_output"].get(signal_input)
+    if producer is not None and producer.name == _FP32_CAST_NAME:
+        if producer.op_type != "Cast":
+            raise RuntimeError("reserved unbounded-audio node is not a Cast")
+        to_attribute = next(
+            (item for item in producer.attribute if item.name == "to"), None
+        )
+        if to_attribute is None:
+            raise RuntimeError("unbounded-audio Cast has no target dtype")
+        if to_attribute.i == TensorProto.FLOAT:
+            return 0
+        to_attribute.i = TensorProto.FLOAT
+        tail["output"].type.tensor_type.elem_type = TensorProto.FLOAT
+        return 1
+
+    existing_node_names = {node.name for node in model.graph.node}
+    existing_tensor_names = {tensor.name for tensor in model.graph.initializer} | {
+        output for node in model.graph.node for output in node.output
+    }
+    if (
+        _FP32_CAST_NAME in existing_node_names
+        or _FP32_CAST_OUTPUT in existing_tensor_names
+    ):
+        raise RuntimeError("decoder graph already uses reserved unbounded-audio names")
+
+    transpose_index = list(model.graph.node).index(transpose)
+    model.graph.node.insert(
+        transpose_index,
+        helper.make_node(
+            "Cast",
+            inputs=[signal_input],
+            outputs=[_FP32_CAST_OUTPUT],
+            name=_FP32_CAST_NAME,
+            to=TensorProto.FLOAT,
+        ),
+    )
+    transpose.input[0] = _FP32_CAST_OUTPUT
+    tail["output"].type.tensor_type.elem_type = TensorProto.FLOAT
     return 1
 
 
 def rewrite_decoder_onnx(input_path: str, output_path: str) -> str:
-    """Write a decoder ONNX whose INT32 PCM output has no baked hard clip."""
+    """Write a decoder ONNX exposing sample-major FP32 audio without clipping."""
     import onnx
 
     model = onnx.load(input_path, load_external_data=True)
     removed = remove_output_hard_clip(model)
-    force_unbounded_pcm_tail_fp32(model)
+    force_unbounded_audio_output_fp32(model)
     onnx.checker.check_model(model)
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    onnx.save_model(
-        model,
-        str(output),
-        save_as_external_data=True,
-        all_tensors_to_one_file=True,
-        location=output.name + ".data",
-        size_threshold=1024 * 1024,
-    )
+    sidecar_prefix = output.name + ".data"
+    old_sidecars = set()
+    if output.exists():
+        old_model = onnx.load(str(output), load_external_data=False)
+        for initializer in old_model.graph.initializer:
+            for entry in initializer.external_data:
+                if entry.key != "location":
+                    continue
+                location = entry.value
+                if location == sidecar_prefix or location.startswith(
+                    sidecar_prefix + "."
+                ):
+                    old_sidecars.add(output.parent / location)
+
+    sidecar_name = f"{sidecar_prefix}.{uuid.uuid4().hex}"
+    sidecar = output.parent / sidecar_name
+    with tempfile.TemporaryDirectory(
+        prefix=f".{output.name}-", dir=output.parent
+    ) as staging_dir:
+        staged_output = Path(staging_dir) / output.name
+        staged_sidecar = Path(staging_dir) / sidecar_name
+        onnx.save_model(
+            model,
+            str(staged_output),
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=sidecar_name,
+            size_threshold=1024 * 1024,
+        )
+        sidecar_published = False
+        if staged_sidecar.exists():
+            os.replace(staged_sidecar, sidecar)
+            sidecar_published = True
+        try:
+            os.replace(staged_output, output)
+        except BaseException:
+            if sidecar_published:
+                sidecar.unlink(missing_ok=True)
+            raise
+
+    for old_sidecar in old_sidecars - {sidecar}:
+        try:
+            old_sidecar.unlink(missing_ok=True)
+        except OSError as exc:
+            warnings.warn(
+                f"could not remove superseded ONNX sidecar {old_sidecar}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
     print(
         f"  decoder peak policy: removed {removed} hard Clip; "
-        f"output binding -> {UNBOUNDED_PCM_OUTPUT}",
+        f"output binding -> {UNBOUNDED_AUDIO_OUTPUT}",
         flush=True,
     )
     return str(output)

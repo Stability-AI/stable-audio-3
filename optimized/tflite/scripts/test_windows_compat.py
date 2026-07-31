@@ -19,8 +19,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import warnings
+import wave
 from pathlib import Path
 from unittest import mock
+
+import numpy as np
 
 # Keep this test's own output safe under legacy Windows console code pages
 # (the subprocess tests below spawn FRESH interpreters, so this does not mask them).
@@ -33,6 +37,7 @@ for _stream in (sys.stdout, sys.stderr):
 SCRIPTS_DIR = Path(__file__).resolve().parent          # <project>/scripts
 PROJECT_DIR = SCRIPTS_DIR.parent                       # <project>
 sys.path.insert(0, str(SCRIPTS_DIR))                   # import weights / sa3_tflite / examples
+sys.path.insert(0, str(PROJECT_DIR))                   # import models.defs.*
 
 import weights  # noqa: E402
 
@@ -133,7 +138,23 @@ class TestConsoleEncoding(unittest.TestCase):
             f"stderr:\n{r.stderr.decode('utf-8', 'replace')}")
         out = r.stdout.decode("utf-8", "replace")
         self.assertIn("--prompt", out)
+        self.assertIn("--peak-ceiling-dbfs", out)
         self.assertIn("--play", out)
+
+    def test_positive_peak_ceiling_is_rejected_before_model_loading(self):
+        r = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS_DIR / "sa3_tflite.py"),
+                "--peak-ceiling-dbfs",
+                "0.1",
+            ],
+            capture_output=True,
+            env=self._clean_env(),
+            timeout=120,
+        )
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("ceiling_dbfs must be <= 0", r.stderr.decode("utf-8", "replace"))
 
     def test_examples_block(self):
         # examples.py is a module (no __main__): render the full emoji block.
@@ -181,6 +202,29 @@ class TestPlayBackendDispatch(unittest.TestCase):
             self.assertIsInstance(argv, list)
         else:
             self.assertIsNone(argv)
+
+
+class TestWavPeakProtection(unittest.TestCase):
+    def test_tflite_writer_attenuates_instead_of_hard_clipping(self):
+        from models.defs.tflite_pipeline import save_wav
+
+        audio = np.array(
+            [[0.0, 1.25, 1.75], [0.0, -1.25, -1.75]], dtype=np.float32
+        )
+        with tempfile.TemporaryDirectory(prefix="sa3_pcm_test_") as tmp:
+            path = Path(tmp) / "protected.wav"
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                save_wav(path, audio)
+            with wave.open(str(path), "rb") as wav_file:
+                pcm = np.frombuffer(
+                    wav_file.readframes(wav_file.getnframes()), dtype=np.int16
+                ).reshape(-1, wav_file.getnchannels())
+
+        self.assertEqual(int(pcm[-1, 0]), 32767)
+        self.assertAlmostEqual(
+            int(pcm[-2, 0]), 32767 * 1.25 / 1.75, delta=1
+        )
 
 
 if __name__ == "__main__":

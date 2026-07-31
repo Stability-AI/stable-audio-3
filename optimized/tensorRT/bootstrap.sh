@@ -73,6 +73,14 @@ ok "GPU: $GPU_INFO"
 if [[ -f ./install.sh && -x ./sa3 && -d ./build && -d ./scripts ]]; then
     step "Already inside an optimized/tensorRT/ checkout — using ./ in place"
     cd "$(pwd)"   # no-op; just makes the path absolute for later messages
+    if [[ ! -f ../../stable_audio_3/audio_output.py && ! -f ./scripts/audio_output.py ]]; then
+        command -v curl >/dev/null 2>&1 || \
+            fail "curl is required to complete this standalone TensorRT checkout."
+        step "Fetching shared audio output helper for the standalone checkout"
+        curl -fL --progress-bar \
+            "https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/$BRANCH/stable_audio_3/audio_output.py" \
+            -o ./scripts/audio_output.py
+    fi
     [[ -x ./install.sh ]] || fail "install.sh not executable in $(pwd)."
     ok "running install.sh in $(pwd)"
     ./install.sh -y

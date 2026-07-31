@@ -20,9 +20,9 @@ from typing import Optional
 import numpy as np
 import torch
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(PROJECT_ROOT / "stable_audio_3"))
-from audio_output import (  # noqa: E402
+LOCAL_SCRIPTS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(LOCAL_SCRIPTS_DIR))
+from wav_io import (  # noqa: E402
     PCM16_CEILING,
     dbfs_to_amplitude,
     protect_audio_peak,

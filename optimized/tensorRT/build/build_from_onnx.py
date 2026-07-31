@@ -31,6 +31,7 @@ Usage:
 """
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -100,7 +101,7 @@ TARGETS = {
         "workspace_gb": 16,
         "profile":      {"latent": [(1, 256, 32), (1, 256, 1292), (1, 256, 4096)]},
         "plugin":       False,
-        "unbounded_pcm": True,
+        "unbounded_audio": True,
     },
     "same-l-encoder": {
         "onnx_hf":      ["same-l/enc_dynamic_triton_swa.onnx"],
@@ -121,7 +122,7 @@ TARGETS = {
         "workspace_gb": 16,
         "profile":      {"latent": [(1, 256, 32), (1, 256, 1292), (1, 256, 4096)]},
         "plugin":       True,
-        "unbounded_pcm": True,
+        "unbounded_audio": True,
     },
     # SA3 DiT engines: build from the pre-processed FP16-mixed ONNX hosted on
     # HF. The producer (build_dit_fp16mixed.py) does the FP32-island surgery
@@ -336,7 +337,7 @@ TARGETS = {
         "profile":      {"latent": [(1, 256, 32), (1, 256, 1292), (1, 256, 4096)]},
         "plugin":       True,
         "upcast_to_fp32": True,
-        "unbounded_pcm": True,
+        "unbounded_audio": True,
     },
     # SAME-S FP32 decoder: the canonical ONNX is already FP32 throughout
     # (no FP16 ops to upcast). Just build STRONGLY_TYPED so the engine
@@ -349,7 +350,7 @@ TARGETS = {
         "workspace_gb": 16,
         "profile":      {"latent": [(1, 256, 32), (1, 256, 1292), (1, 256, 4096)]},
         "plugin":       False,
-        "unbounded_pcm": True,
+        "unbounded_audio": True,
     },
 }
 
@@ -489,20 +490,25 @@ def build_one(name: str) -> str:
     # 1. Pull ONNX (cached by huggingface_hub)
     onnx_path = _ensure_onnx(recipe["onnx_hf"])
     print(f"  onnx: {onnx_path}", flush=True)
+    transform_tmp = None
+    if recipe.get("upcast_to_fp32") or recipe.get("unbounded_audio"):
+        transform_tmp = tempfile.TemporaryDirectory(prefix=f"sa3-{name}-")
+        transform_dir = Path(transform_tmp.name)
 
     # 1b. Optional in-process FP16→FP32 upcast for FP32 variants of FP16-mixed
     # source ONNXes (currently only SAME-L decoder needs this — DiT FP32 reads
     # the pre-existing FP32 dit.onnx directly, SAME-S canonical ONNX is already
     # FP32 throughout).
     if recipe.get("upcast_to_fp32"):
-        upcast_path = "/tmp/_build_from_onnx_fp32_upcast.onnx"
-        onnx_path = _upcast_onnx_to_fp32(onnx_path, upcast_path)
+        upcast_path = transform_dir / "decoder_fp32.onnx"
+        onnx_path = _upcast_onnx_to_fp32(onnx_path, str(upcast_path))
 
-    # Decoder ONNXes historically baked `audio.clamp(-1, 1)` into the PCM
-    # tail. Remove it so runtime peak protection can preserve sample ratios.
-    if recipe.get("unbounded_pcm"):
-        unbounded_path = f"/tmp/_build_from_onnx_{name}_unbounded_pcm.onnx"
-        onnx_path = rewrite_decoder_onnx(onnx_path, unbounded_path)
+    # Decoder ONNXes historically baked `audio.clamp(-1, 1)`, PCM scaling,
+    # and INT32 conversion into the output tail. Expose sample-major FP32 so
+    # runtime peak protection sees non-finites and preserves sample ratios.
+    if recipe.get("unbounded_audio"):
+        unbounded_path = transform_dir / "decoder_unbounded_audio.onnx"
+        onnx_path = rewrite_decoder_onnx(onnx_path, str(unbounded_path))
 
     # 2. Optional plugin import (SAME-L only — registers samel::diff_attn_swa)
     if recipe["plugin"]:
@@ -542,7 +548,10 @@ def build_one(name: str) -> str:
                   "sm_120; verify before shipping (see build/README.md)", flush=True)
     network = builder.create_network(net_flags)
     parser = trt.OnnxParser(network, logger)
-    if not parser.parse_from_file(onnx_path):
+    parsed = parser.parse_from_file(onnx_path)
+    if transform_tmp is not None:
+        transform_tmp.cleanup()
+    if not parsed:
         for i in range(parser.num_errors):
             print(f"  parse error: {parser.get_error(i)}", flush=True)
         sys.exit(2)

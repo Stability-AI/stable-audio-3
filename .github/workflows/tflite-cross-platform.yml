@@ -48,10 +48,19 @@ jobs:
             optimized/tflite/scripts/install.py \
             optimized/tflite/scripts/examples.py \
             optimized/tflite/scripts/test_windows_compat.py \
-            optimized/tflite/models/defs/tflite_pipeline.py
+            optimized/tflite/models/defs/tflite_pipeline.py \
+            optimized/tflite/models/defs/wav_io.py
 
       - name: LiteRT interpreter imports
         run: python -c "from ai_edge_litert.interpreter import Interpreter"
+
+      - name: Standalone subtree import smoke
+        run: |
+          bundle_dir="$(mktemp -d)/sa3_tflite"
+          cp -R optimized/tflite "$bundle_dir"
+          cp stable_audio_3/audio_output.py "$bundle_dir/models/defs/audio_output.py"
+          cd "$bundle_dir"
+          python scripts/sa3_tflite.py --help > /dev/null
 
       - name: Windows-compat test suite
         run: python optimized/tflite/scripts/test_windows_compat.py

@@ -1,0 +1,21 @@
+name: TensorRT decoder rewrite
+
+on:
+  pull_request:
+    paths:
+      - "optimized/tensorRT/build/**"
+      - "tests/test_tensorrt_decoder_output.py"
+      - ".github/workflows/tensorrt-decoder-rewrite.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install weight-free rewrite test dependencies
+        run: python -m pip install pytest numpy "onnx>=1.18" onnxruntime
+      - name: Test decoder output rewrite
+        run: pytest tests/test_tensorrt_decoder_output.py -q

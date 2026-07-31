@@ -225,7 +225,8 @@ Decoder engines built before the peak-protection update expose a `pcm`
 binding with hard clipping baked into the engine. The runtime detects those
 legacy engines and warns, but clipped sample ratios cannot be recovered.
 Rebuild the decoder through `build/build.py`; updated engines expose
-`pcm_unbounded` and apply no-boost attenuation at runtime before INT16 narrowing.
+`audio_unbounded` FP32 and apply no-boost attenuation at runtime before PCM
+scaling and INT16 narrowing.
 
 ### Benchmark DiT step time across L values
 
@@ -309,11 +310,11 @@ invocation per sampling step handles everything.
 - **STRONGLY_TYPED T5Gemma**: built with an FP16-mixed graph (FP32
   attention island around softmax) — fixes a BF16 numerical bug where one
   specific cross-attention output token collapsed in magnitude.
-- **PCM-baked SAME-S decoder**: PCM scaling + transpose are folded into the
-  decoder engine; peak protection + INT16 narrowing stay in the captured
-  runtime graph so out-of-range sample ratios are preserved.
+- **Sample-major SAME-S decoder output**: transpose is folded into the decoder
+  engine; peak protection, PCM scaling, and INT16 narrowing stay in the
+  captured runtime graph so non-finites and out-of-range ratios remain visible.
 - **Mixed precision**: DiT runs FP16-mixed (FP16 trunk + FP32 RMSNorm/RoPE
-  islands + FMHA-fused FP16 attention core), decoder int32→int16, T5Gemma
+  islands + FMHA-fused FP16 attention core), decoder FP32→int16, T5Gemma
   FP16-mixed. `--quiet` skips per-stage NVML probes for an extra ~4 ms.
 - **Auto-download**: missing engines are pulled from
   `stabilityai/stable-audio-3-optimized/tensorRT/sm_<cc>/` on first use.

@@ -28,9 +28,9 @@ explicit Cast(FP16<->FP32) before doing the trunk FP16 conversion.
 
 Inputs/outputs:
 - Input: `latent` (FP32, shape [1, 256, L])  — keep FP32
-- Output: `pcm_unbounded` (INT32, shape [1, T, 2]) — the output Clip is removed
-  before conversion so runtime can apply no-boost attenuation before INT16 narrowing.
-  The pre-Cast scale remains in the graph.
+- Output: `audio_unbounded` (FP32, shape [1, T, 2]) — the output Clip, PCM
+  scale, and integer cast are removed so runtime can apply no-boost attenuation
+  before PCM scaling and INT16 narrowing.
 
 Usage:
     python build_same_s_dec_fp16mixed.py
@@ -57,7 +57,7 @@ from build_dit_fp16mixed import (
     fix_dtype_mismatches,
     manual_convert_to_fp16,
 )
-from decoder_output import force_unbounded_pcm_tail_fp32, remove_output_hard_clip
+from decoder_output import force_unbounded_audio_output_fp32, remove_output_hard_clip
 
 
 # SAME-S decoder profile — same as the canonical BF16 engine.
@@ -535,7 +535,7 @@ def convert_to_fp16mixed(input_onnx, output_onnx, mode="minimal"):
     # Removing the output Clip makes the PCM scale genuinely unbounded. Keep
     # that small postprocess tail in FP32 so values above ~2 cannot overflow
     # FP16 before runtime peak protection sees them.
-    force_unbounded_pcm_tail_fp32(fp16_model)
+    force_unbounded_audio_output_fp32(fp16_model)
 
     print(f"  saving to {output_onnx}")
     try:

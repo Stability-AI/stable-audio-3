@@ -445,6 +445,7 @@ class SA3Inference:
 
     def __init__(self, dit: str, decoder: str, *,
                  precision: str | None = None,
+                 dec_precision: str = "canonical",
                  default_T_lat: int = 324, default_steps: int = 8,
                  default_seconds: float = 30.0,
                  models_dir: Path | None = None,
@@ -521,7 +522,7 @@ class SA3Inference:
         self.quiet = quiet
 
         # 1. Lazy-download any missing engines (precision-aware).
-        needed = canon.get_engine_files(dit, decoder, precision, with_encoder=with_encoder)
+        needed = canon.get_engine_files(dit, decoder, precision, with_encoder=with_encoder, dec_tier=dec_precision)
         _ensure_files(needed)
 
         # 2. Heavy imports (torch + tensorrt + plugin).
@@ -547,10 +548,10 @@ class SA3Inference:
         engine_specs = {
             "t5":  canon.T5GEMMA_PATH,
             "dit": canon.get_dit_engine_path(dit, precision),
-            "dec": canon.get_decoder_engine_path(decoder, precision),
+            "dec": canon.resolve_decoder_engine(decoder, precision, dec_precision),
         }
         if with_encoder:
-            engine_specs["enc"] = ENCODER_PATHS[decoder]
+            engine_specs["enc"] = canon.resolve_encoder_engine(decoder, dec_precision)
         t0 = time.time()
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(engine_specs)) as ex:
             futs = {name: ex.submit(TRTRunner, path) for name, path in engine_specs.items()}
@@ -721,6 +722,12 @@ def main():
     ap.add_argument("--inpaint-range", default=None)
     ap.add_argument("--dit", choices=list(DIT_CHOICES.keys()), default=None)
     ap.add_argument("--decoder", choices=list(DECODER_PATHS.keys()), default=None)
+    ap.add_argument("--dec-precision", choices=list(canon.DECODER_TIERS), default="canonical",
+                    help="Decoder/encoder quantization tier (orthogonal to --precision, which is the "
+                         "DiT). 'canonical' (bf16, default); 'fp8' (~1.14x, near-transparent); 'w8_bf16' "
+                         "(int8 weight-only, bf16 compute — transparent, smaller download, same speed); "
+                         "'fp8_fast' (SAME-S only; fp8 attention projections too, ~1.22x, lossier). "
+                         "Engine auto-downloads from HF.")
     ap.add_argument("--precision", choices=list(canon.PRECISIONS), default=None,
                     help="DiT engine precision. Default is 'fp16mixed' for every model: "
                          "canonical FP16 trunk + FP32 RMSNorm/RoPE islands + FMHA-fused FP16 "
@@ -837,7 +844,8 @@ def main():
     if args.negative_prompt:
         suffix = "" if args.cfg != 1.0 else dim("  (ignored: --cfg=1.0)")
         print(f"  {k('neg prompt')}  {bold(repr(args.negative_prompt))}{suffix}")
-    print(f"  {k('dit')}  {magenta(v(args.dit))}   {k('decoder')}  {magenta(v(args.decoder))}   {k('precision')}  {v(args.precision)}")
+    _dtier = f"   {k('dec-tier')}  {magenta(v(args.dec_precision))}" if args.dec_precision != "canonical" else ""
+    print(f"  {k('dit')}  {magenta(v(args.dit))}   {k('decoder')}  {magenta(v(args.decoder))}{_dtier}   {k('precision')}  {v(args.precision)}")
     print(f"  {k('σmax')}  {bold(f'{sigma_max:.2f}')}")
     print(f"  {k('seconds')}  {v(f'{args.seconds}s')}   {k('steps')}  {v(args.steps)}   {k('seed')}  {args.seed}")
     print(f"  {k('cfg')}  {v(args.cfg)}   {k('mega-graph')}  {v('on' if use_mega else 'off (fallback)')}")
@@ -853,7 +861,7 @@ def main():
 
     # Lazy-download
     needed = canon.get_engine_files(args.dit, args.decoder, args.precision,
-                                      with_encoder=bool(args.init_audio))
+                                      with_encoder=bool(args.init_audio), dec_tier=args.dec_precision)
     _ensure_files(needed)
 
     # Heavy imports
@@ -879,10 +887,10 @@ def main():
     engine_specs = {
         "t5":  canon.T5GEMMA_PATH,
         "dit": canon.get_dit_engine_path(args.dit, args.precision),
-        "dec": canon.get_decoder_engine_path(args.decoder, args.precision),
+        "dec": canon.resolve_decoder_engine(args.decoder, args.precision, args.dec_precision),
     }
     if args.init_audio:
-        engine_specs["enc"] = ENCODER_PATHS[args.decoder]
+        engine_specs["enc"] = canon.resolve_encoder_engine(args.decoder, args.dec_precision)
     t0 = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(engine_specs)) as ex:
         futs = {name: ex.submit(TRTRunner, path) for name, path in engine_specs.items()}

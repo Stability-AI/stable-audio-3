@@ -243,6 +243,64 @@ DECODER_ENGINE_FILENAME = {
 }
 PRECISIONS = ("bf16", "fp8", "fp16mixed", "fp32")
 
+# ── Decoder / encoder quantization TIERS (orthogonal to the DiT --precision) ──
+# Train-free fp8 / int8-weight tiers grafted onto the bf16 export (see quantize/README.md).
+# "canonical" = the shipped bf16/fp16-mixed engine. The others are downloaded from HF on demand
+# (tensorRT/<arch>/<same-*>/dec_*.trt) — the same wide-profile engines built by quantize/build_tiers.py.
+#   fp8       fp8 FFN GEMMs (near-transparent, ~1.14×) — the speed pick
+#   w8_bf16   int8 weight-only storage, bf16 compute (transparent, same speed, smaller download)
+#   fp8_fast  SAME-S only: fp8 on the attention projections too (~1.22×, lossier)
+DECODER_TIER_FILENAME = {
+    "same-s": {"canonical": DECODER_ENGINE_FILENAME["same-s"]["bf16"],
+               "w8_bf16": "dec_w8_bf16.trt", "fp8": "dec_fp8.trt", "fp8_fast": "dec_fp8_fast.trt"},
+    "same-l": {"canonical": DECODER_ENGINE_FILENAME["same-l"]["fp16mixed"],
+               "w8_bf16": "dec_w8_bf16.trt", "fp8": "dec_fp8.trt"},
+}
+ENCODER_TIER_FILENAME = {
+    "same-s": {"canonical": "enc_dynamic_bf16.trt",
+               "w8_bf16": "enc_w8_bf16.trt", "fp8": "enc_fp8.trt", "fp8_fast": "enc_fp8_fast.trt"},
+    "same-l": {"canonical": "enc_dynamic_triton_swa.trt",
+               "w8_bf16": "enc_w8_bf16.trt", "fp8": "enc_fp8.trt"},
+}
+DECODER_TIERS = ("canonical", "w8_bf16", "fp8", "fp8_fast")
+
+
+def get_decoder_tier_path(decoder_name: str, tier: str = "canonical") -> Path:
+    tiers = DECODER_TIER_FILENAME.get(decoder_name)
+    if tiers is None:
+        raise ValueError(f"unknown decoder={decoder_name!r}; valid: {list(DECODER_TIER_FILENAME)}")
+    if tier not in tiers:
+        raise ValueError(f"decoder tier {tier!r} not available for {decoder_name}; valid: {list(tiers)}")
+    return ARCH_DIR / decoder_name / tiers[tier]
+
+
+def get_encoder_tier_path(decoder_name: str, tier: str = "canonical") -> Path:
+    tiers = ENCODER_TIER_FILENAME[decoder_name]
+    return ARCH_DIR / decoder_name / tiers.get(tier, tiers["canonical"])   # enc falls back if a tier is decoder-only
+
+
+def decoder_tier_from_filename(decoder_name: str, filename: str) -> str:
+    """Reverse-map a decoder engine filename (e.g. 'dec_fp8.trt') to its tier name
+    ('fp8'); used by the gradio variant picker. Falls back to 'canonical'."""
+    for tier, fname in DECODER_TIER_FILENAME.get(decoder_name, {}).items():
+        if fname == filename:
+            return tier
+    return "canonical"
+
+
+def resolve_decoder_engine(decoder_name: str, precision: str = None, dec_tier: str = "canonical") -> Path:
+    """dec_tier 'canonical' → the precision-driven canonical/fp32 decoder (back-compat with
+    --precision, e.g. fp32 still yields dec_dynamic_fp32.trt); any other tier → its engine."""
+    if dec_tier == "canonical":
+        return get_decoder_engine_path(decoder_name, precision)
+    return get_decoder_tier_path(decoder_name, dec_tier)
+
+
+def resolve_encoder_engine(decoder_name: str, dec_tier: str = "canonical") -> Path:
+    if dec_tier == "canonical":
+        return ENCODER_PATHS[decoder_name]
+    return get_encoder_tier_path(decoder_name, dec_tier)
+
 
 def default_precision(dit_name: str) -> str:
     """Default DiT precision: fp16-mixed for every model.
@@ -283,17 +341,24 @@ def get_decoder_engine_path(decoder_name: str, precision: str = None) -> Path:
 
 
 def get_engine_files(dit_name: str, decoder_name: str, precision: str = None,
-                       with_encoder: bool = False) -> list[str]:
+                       with_encoder: bool = False, dec_tier: str = "canonical") -> list[str]:
     """Relative paths (under ARCH_DIR) needed for the chosen pipeline. Pass this
     list to _ensure_files() to auto-download anything missing from HF.
-    precision=None resolves to the per-model default (fp16-mixed)."""
+    precision=None resolves to the per-model default (fp16-mixed); dec_tier picks the
+    decoder/encoder quantization tier (canonical / fp8 / w8_bf16 / fp8_fast)."""
     if precision is None:
         precision = default_precision(dit_name)
     files = list(SHARED_FILES)
     files.append(f"{_DIT_SUBDIR[dit_name]}/{DIT_ENGINE_FILENAME[precision]}")
-    files.append(f"{decoder_name}/{DECODER_ENGINE_FILENAME[decoder_name][precision]}")
-    if with_encoder:
-        files.append(f"{decoder_name}/" + ENCODER_PATHS[decoder_name].name)
+    if dec_tier == "canonical":   # precision-driven canonical/fp32 decoder (back-compat)
+        files.append(f"{decoder_name}/{DECODER_ENGINE_FILENAME[decoder_name][precision]}")
+        if with_encoder:
+            files.append(f"{decoder_name}/{ENCODER_PATHS[decoder_name].name}")
+    else:                          # a quantization tier
+        files.append(f"{decoder_name}/{DECODER_TIER_FILENAME[decoder_name][dec_tier]}")
+        if with_encoder:
+            enc = ENCODER_TIER_FILENAME[decoder_name]
+            files.append(f"{decoder_name}/{enc.get(dec_tier, enc['canonical'])}")
     return files
 
 # ─── Display helpers (ANSI color when stdout is a TTY) ───────────────────
@@ -1137,6 +1202,10 @@ def main():
     ap.add_argument("--decoder", choices=list(DECODER_PATHS.keys()), default=None,
                     help="Audio decoder. 'same-s' pairs with sm-* (110 MB engine). "
                          "'same-l' pairs with medium (1.2 GB engine). Interactive picker if omitted.")
+    ap.add_argument("--dec-precision", choices=list(DECODER_TIERS), default="canonical",
+                    help="Decoder/encoder quantization tier (orthogonal to --precision, the DiT): "
+                         "canonical (bf16) | fp8 (~1.14x, near-transparent) | w8_bf16 (int8 weight-only, "
+                         "transparent, smaller) | fp8_fast (SAME-S only, ~1.22x). Auto-downloads from HF.")
     ap.add_argument("--precision", choices=list(PRECISIONS), default=None,
                     help="DiT engine precision (default is 'fp16mixed' for every model). "
                          "'fp16mixed' = FP16 trunk + FP32 RMSNorm/RoPE islands with an FMHA-fused "
@@ -1309,7 +1378,7 @@ def main():
 
     # ── Lazy-download any missing engine files for the chosen (dit, decoder) combo ──
     needed = get_engine_files(args.dit, args.decoder, args.precision,
-                                with_encoder=bool(args.init_audio))
+                                with_encoder=bool(args.init_audio), dec_tier=args.dec_precision)
     _ensure_files(needed)
 
     # ── Heavy imports (torch + tensorrt + plugin) ──
@@ -1337,10 +1406,10 @@ def main():
     engine_specs = {
         "t5":  T5GEMMA_PATH,
         "dit": get_dit_engine_path(args.dit, args.precision),
-        "dec": get_decoder_engine_path(args.decoder, args.precision),
+        "dec": resolve_decoder_engine(args.decoder, args.precision, args.dec_precision),
     }
     if args.init_audio:
-        engine_specs["enc"] = ENCODER_PATHS[args.decoder]
+        engine_specs["enc"] = resolve_encoder_engine(args.decoder, args.dec_precision)
     t0 = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(engine_specs)) as ex:
         futs = {name: ex.submit(TRTRunner, path) for name, path in engine_specs.items()}

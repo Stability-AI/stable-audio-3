@@ -215,16 +215,15 @@ def _run():
                     help="Audio decoder. 'same-l' = native 426M medium codec (default). "
                          "'same-s' = distilled 50M (faster, shares the medium latent space).")
     ap.add_argument("--dit-precision", choices=["int8", "bf16"], default="int8",
-                    help="DiT C++ engine precision. int8 (default, shipped, ~40 dB, 1-thread core) "
-                         "or bf16 (near-lossless fp32 RoPE/RMSNorm islands, ~59/54 dB @L1292/L4096, "
-                         "~1.24× the int8 latency, runs at --threads). The cpu-amx analogue of MLX's "
-                         "per-model dtype for the DiT.")
+                    help="DiT C++ engine precision. int8 (default, ~40 dB) or bf16 (near-lossless "
+                         "fp32 RoPE/RMSNorm islands, ~59/54 dB @L1292/L4096, ~1.24× the int8 latency). "
+                         "Both run at --threads. The cpu-amx analogue of MLX's per-model dtype.")
     ap.add_argument("--decoder-precision", choices=["bf16", "int8"], default="bf16",
                     help="Decoder C++ engine precision. bf16 (default, best fidelity) or int8 "
                          "(SmoothQuant+GPTQ fused w8a8, smaller/faster). T5Gemma is bf16 regardless.")
     ap.add_argument("--threads", type=int, default=16,
-                    help="Thread count for T5Gemma + the decoder + the bf16 DiT (default 16). The "
-                         "int8 DiT is pinned to 1 thread for stability (its .so heap-races higher).")
+                    help="Thread count for T5Gemma + the decoder + the DiT (default 16). Both DiT "
+                         "precisions run multi-threaded — at 1 thread the DiT is ~7.6× slower.")
     ap.add_argument("--lora", action="append", nargs="+", default=None, metavar="ADAPTER",
                     help="(not supported in cpu-amx — accepted and ignored with a note; the int8 "
                          "C++ DiT core has no runtime LoRA merge. Use optimized/mlx for LoRA.)")
@@ -394,8 +393,7 @@ def _run():
     stage("[3/5]", f"DiT — load + sample ({args.dit_precision}, {args.steps} steps, σmax={sigma_max:.2f})")
     t0 = time.time()
     dit = B.load_dit(precision=args.dit_precision, threads=args.threads)
-    _dit_th = 1 if args.dit_precision == "int8" else args.threads
-    sub(f"load {time.time()-t0:.1f}s  (medium {args.dit_precision} C++ core, {_dit_th} thread{'s' if _dit_th != 1 else ''})")
+    sub(f"load {time.time()-t0:.1f}s  (medium {args.dit_precision} C++ core, {args.threads} thread{'s' if args.threads != 1 else ''})")
 
     sigmas = P.build_pingpong_schedule(args.steps, sigma_max=sigma_max)
     sub("schedule  " + " · ".join(f"{float(x):.3f}" for x in sigmas))

@@ -80,10 +80,9 @@ def load_dit(precision="int8", threads=None):
     assert precision in ("int8", "bf16"), precision
     if precision == "int8":
         _ensure("dit")
-        dit_threads = None                       # backend pins int8 to 1
     else:
         _ensure("dit_bf16")                      # HF: dit_cpu_amx_bf16.so + core_bf16 + pin_fp32 + bf16 flash
-        dit_threads = threads
+    dit_threads = threads                        # BOTH precisions now run at `threads` (int8 stress-tested at 16)
     _add_path(DIR_DIT)
     from cpu_amx_backend import DiTCppAmx
     return DiTCppAmx(precision=precision, threads=dit_threads)

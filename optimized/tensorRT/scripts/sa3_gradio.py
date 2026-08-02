@@ -59,7 +59,7 @@ def discover_variants(dit_name: str) -> list[tuple[str, Path]]:
     """Return [(label, path)] of available DiT engine files for this model.
 
     Scans models/<arch>/<dit_subdir>/dit_*.trt. The canonical engine
-    (dit_fp16mixed.trt) is always first if present; other variants follow
+    (dit_fp16.trt) is always first if present; other variants follow
     alphabetically. For the medium DiT also appends a pseudo-variant
     "pytorch fp32 (GT)" that dispatches to the PyTorch-eager backend.
     """
@@ -70,14 +70,14 @@ def discover_variants(dit_name: str) -> list[tuple[str, Path]]:
     if not d.exists():
         return []
     files = sorted(d.glob("dit_*.trt"))
-    canonical_name = "dit_fp16mixed.trt"
+    canonical_name = "dit_fp16.trt"
     canonical = [f for f in files if f.name == canonical_name]
     others = [f for f in files if f.name != canonical_name]
     out = []
     for f in canonical + others:
         label = f.name[len("dit_"):-len(".trt")] if f.name.startswith("dit_") and f.name.endswith(".trt") else f.name
         if f.name == canonical_name:
-            label = "fp16mixed (canonical)"
+            label = "fp16 (canonical)"
         elif "buggy" in f.name:
             label = label + " ← old, broken"
         out.append((label, f))
@@ -88,34 +88,25 @@ def discover_variants(dit_name: str) -> list[tuple[str, Path]]:
 
 
 def discover_decoder_variants(decoder_name: str) -> list[tuple[str, Path]]:
-    """Return [(label, path)] of available decoder engine files. Scans
-    models/<arch>/<same-s|same-l>/dec_*.trt.
-
-    Canonical (what's referenced by DECODER_PATHS) is always first if present.
-    Naming convention: dec_dynamic_<precision_marker>.trt (e.g.
-    dec_dynamic_bf16.trt, dec_dynamic_fp32.trt, dec_dynamic_triton_swa.trt).
+    """Return [(label, path)] of decoder quantization tiers for this decoder —
+    canonical first. Uses the known tier set (canonical / fp8 / fp8_fast;
+    see quantize/README.md); engines auto-download from HF on selection if missing.
+    Any extra local dec_*.trt not in the known set are appended.
     """
-    d = MODELS_ROOT / decoder_name
-    if not d.exists():
-        return []
-    files = sorted(d.glob("dec_*.trt"))
-    canonical = canon.DECODER_PATHS.get(decoder_name)
-    canonical_name = canonical.name if canonical else ""
-    canonicals = [f for f in files if f.name == canonical_name]
-    others = [f for f in files if f.name != canonical_name]
-    out = []
-    for f in canonicals + others:
-        # Strip 'dec_dynamic_' prefix and '.trt' suffix for the label.
-        stem = f.name
-        if stem.startswith("dec_dynamic_"):
-            label = stem[len("dec_dynamic_"):-len(".trt")]
-        elif stem.startswith("dec_"):
-            label = stem[len("dec_"):-len(".trt")]
-        else:
-            label = stem
-        if f.name == canonical_name:
-            label = f"{label} (canonical)"
-        out.append((label, f))
+    out, known = [], set()
+    for tier, fname in canon.DECODER_TIER_FILENAME.get(decoder_name, {}).items():
+        label = f"{tier} (canonical)" if tier == "canonical" else tier
+        out.append((label, canon.ARCH_DIR / decoder_name / fname))
+        known.add(fname)
+    d = canon.ARCH_DIR / decoder_name
+    if d.exists():
+        for f in sorted(d.glob("dec_*.trt")):
+            if f.name in known:
+                continue
+            stem = f.name
+            label = (stem[len("dec_dynamic_"):-len(".trt")] if stem.startswith("dec_dynamic_")
+                     else stem[len("dec_"):-len(".trt")])
+            out.append((label, f))
     return out
 
 
@@ -196,10 +187,12 @@ def get_inference(dit: str, decoder: str, dit_variant_path: str,
     # Override the canonical engine path lookups before constructing.
     canon.DIT_CHOICES[dit]["engine"] = Path(dit_variant_path)
     canon.DECODER_PATHS[decoder] = Path(dec_variant_path)
+    dec_tier = canon.decoder_tier_from_filename(decoder, Path(dec_variant_path).name)
     print(f"\n  → loading SA3Inference({dit!r}, {decoder!r}, "
           f"dit={Path(dit_variant_path).name}, "
-          f"dec={Path(dec_variant_path).name})")
+          f"dec={Path(dec_variant_path).name}, tier={dec_tier})")
     inf = SA3Inference(dit, decoder,
+                        dec_precision=dec_tier,
                         default_T_lat=default_T_lat,
                         default_steps=default_steps,
                         default_seconds=default_seconds,

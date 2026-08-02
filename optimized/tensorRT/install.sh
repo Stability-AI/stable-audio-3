@@ -68,6 +68,9 @@ $(dim "After install, run with:")
   $(cyan ./.venv/bin/python) sa3_trt.py --prompt "..." --dit sm-music --decoder same-s
 $(dim "or (with uv):")
   $(cyan uv run) sa3_trt.py --prompt "..." --dit sm-music --decoder same-s
+$(dim "Quantized decoders/encoders (auto-download from HF):") $(yellow "--dec-precision") $(magenta "fp8 | fp8_fast")
+  $(dim "fp8 ~1.14x near-transparent · fp8_fast SAME-S only ~1.22x lossier · --precision fp32 for max fidelity")
+  $(dim "build tier engines locally with quantize/build_tiers.py; tier ONNX + sm_90/sm_120 engines live on HF")
 USAGE
             exit 0;;
         *) errmsg "unknown arg: $1"; exit 2;;
@@ -324,21 +327,21 @@ fi
 SHARED=(
     # T5Gemma engine — arch-specific. (tokenizer.json is arch-agnostic and
     # ships bundled with the repo at scripts/tokenizer.json — no download.)
-    "${HF_SUBDIR}/t5gemma/t5gemma_fp16mixed.trt"
+    "${HF_SUBDIR}/t5gemma/t5gemma_fp16.trt"
 )
 # Only TRT engines are downloaded from HF.
 MEDIUM=(
-    "${HF_SUBDIR}/sa3-m/dit_fp16mixed.trt"
+    "${HF_SUBDIR}/sa3-m/dit_fp16.trt"
     "${HF_SUBDIR}/same-l/enc_dynamic_triton_swa.trt"
     "${HF_SUBDIR}/same-l/dec_dynamic_triton_swa.trt"
 )
 SM_MUSIC=(
-    "${HF_SUBDIR}/sa3-sm-music/dit_fp16mixed.trt"
+    "${HF_SUBDIR}/sa3-sm-music/dit_fp16.trt"
     "${HF_SUBDIR}/same-s/enc_dynamic_bf16.trt"
     "${HF_SUBDIR}/same-s/dec_dynamic_bf16.trt"
 )
 SM_SFX=(
-    "${HF_SUBDIR}/sa3-sm-sfx/dit_fp16mixed.trt"
+    "${HF_SUBDIR}/sa3-sm-sfx/dit_fp16.trt"
     "${HF_SUBDIR}/same-s/enc_dynamic_bf16.trt"
     "${HF_SUBDIR}/same-s/dec_dynamic_bf16.trt"
 )
@@ -377,7 +380,7 @@ else
     SKIPPED=0
     for hf_path in "${DEDUP[@]}"; do
         # Strip only "tensorRT/" so the arch stays in the local path:
-        # tensorRT/sm_90/sa3-m/dit_fp16mixed.trt → models/sm_90/sa3-m/dit_fp16mixed.trt.
+        # tensorRT/sm_90/sa3-m/dit_fp16.trt → models/sm_90/sa3-m/dit_fp16.trt.
         local_rel="${hf_path#tensorRT/}"
         local_path="${MODELS_DIR}/${local_rel}"
         if [ -f "${local_path}" ] && [ -s "${local_path}" ]; then

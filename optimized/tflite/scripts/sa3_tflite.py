@@ -75,7 +75,7 @@ MIN_SIGMA = 0.01   # rf_denoiser is undefined at t≈0 → NaN below this
 #   fp32      reference models (default — on CPU fp16 is SLOWER than fp32, so unlike
 #             TRT the fastest-and-accurate choice is fp32)
 #   w16a32    fp16 weights / fp32 activations — half size, ≈lossless, 1.5-3× slower
-#             on an M4 Pro (legacy name: fp16mixed; ≈ TRT's fp16mixed in spirit,
+#             on an M4 Pro (legacy name: fp16; ≈ TRT's fp16 in spirit,
 #             storage-only here)
 #   w8a32     GPTQ weight-only int8 — ¼ size at fp32 speed (legacy: woint8)
 #   w8a8-dyn  GPTQ dynamic int8 — fastest (~1.2-1.3×), lowest quality (legacy: dynint8)

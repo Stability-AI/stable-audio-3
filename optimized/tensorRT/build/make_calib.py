@@ -7,7 +7,7 @@ but the model checkpoint, by driving the model's own ``generate()`` and
 recording the six DiT engine inputs at every sampling step.
 
 FP8 is the only quantization path in this repo that needs calibration data
-(``fp16mixed`` / ``fp32`` need none, MLX is weight-only), so this also
+(``fp16`` / ``fp32`` need none, MLX is weight-only), so this also
 establishes the convention: a ``<name>.calib.npz`` whose keys are the six ONNX
 input names, each a leading-axis batch of samples. The npz is a reproducible
 producer artifact: gitignored, never committed, regenerated on demand.

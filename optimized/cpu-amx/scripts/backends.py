@@ -70,13 +70,23 @@ def load_t5gemma(threads=16):
     return T5GemmaCPU(threads=int(threads))
 
 
-# ── DiT (medium int8) — the cond_backend for sample()/sample_cfg ────────────
-def load_dit(threads=DIT_THREADS):
-    """Returns a DiTCppAmx: __call__(x[1,256,T], t, cross[1,257,768], gcond[1,768]) -> v[1,256,T]."""
-    _ensure("dit")
+# ── DiT (medium) — the cond_backend for sample()/sample_cfg ─────────────────
+def load_dit(precision="int8", threads=None):
+    """Returns a DiTCppAmx: __call__(x[1,256,T], t, cross[1,257,768], gcond[1,768]) -> v[1,256,T].
+
+    precision 'int8' (default, shipped): the int8 C++ core, pinned to 1 thread (its .so
+    heap-races above 1) — fast, ~40 dB. 'bf16': the near-lossless fp32-RoPE/RMSNorm-islands
+    core (dit_cpu_amx_bf16.so), ~59/54 dB, runs at `threads` (~1.24× the int8 latency)."""
+    assert precision in ("int8", "bf16"), precision
+    if precision == "int8":
+        _ensure("dit")
+        dit_threads = None                       # backend pins int8 to 1
+    else:
+        _ensure("dit_bf16")                      # HF: dit_cpu_amx_bf16.so + core_bf16 + pin_fp32 + bf16 flash
+        dit_threads = threads
     _add_path(DIR_DIT)
     from cpu_amx_backend import DiTCppAmx
-    return DiTCppAmx(threads=int(threads))
+    return DiTCppAmx(precision=precision, threads=dit_threads)
 
 
 # ── Decoders (bf16 default, int8 optional) ──────────────────────────────────

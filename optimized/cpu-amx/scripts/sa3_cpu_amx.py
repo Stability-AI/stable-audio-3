@@ -4,7 +4,7 @@ The cpu-amx sibling of optimized/mlx/scripts/sa3_mlx.py and optimized/tensorRT.
 Same CLI, same modes; the compute runs on Xeon AMX C++ engines instead of MLX:
 
     prompt -> T5Gemma (C++ AMX) -> numpy conditioner
-           -> DiT pingpong (C++ AMX int8, MEDIUM) -> SAME-S/SAME-L decoder (C++ AMX)
+           -> DiT pingpong (C++ AMX int8 | bf16, MEDIUM) -> SAME-S/SAME-L decoder (C++ AMX)
            -> WAV
 
 Modes (identical flags to the MLX / TensorRT releases):
@@ -14,12 +14,14 @@ Modes (identical flags to the MLX / TensorRT releases):
     negative CFG     --prompt P --cfg N [--negative-prompt P_NEG] [--apg S]
 
 cpu-amx specifics vs MLX:
-    * DiT is MEDIUM only (the int8 C++ core). --dit sm-music / sm-sfx are rejected
-      with a pointer to optimized/tflite or optimized/mlx.
-    * MLX's --dit-dtype becomes --decoder-precision {bf16,int8} (default bf16) plus
-      --threads (the DiT is int8-fixed and pinned to 1 thread for stability).
-    * audio-to-audio / inpainting init-encode is the ONE torch step (fp32 AE); text
-      -to-audio and CFG are 100% C++/numpy.
+    * DiT is MEDIUM only, in int8 (default) or bf16 (--dit-precision). --dit sm-music /
+      sm-sfx are rejected with a pointer to optimized/tflite or optimized/mlx.
+    * MLX's per-model --dit-dtype splits into --dit-precision {int8,bf16} and
+      --decoder-precision {bf16,int8}. The int8 DiT is pinned to 1 thread (its .so
+      heap-races higher); the bf16 DiT (near-lossless, fp32 RoPE/RMSNorm islands) runs
+      at --threads. T5Gemma is bf16 regardless.
+    * audio-to-audio / inpainting init-encode is the torch-free C++ AMX SAME encoder;
+      the whole stack is 100% C++/numpy.
 """
 from __future__ import annotations
 
@@ -212,15 +214,17 @@ def _run():
     ap.add_argument("--decoder", choices=DECODER_CHOICES, default=None,
                     help="Audio decoder. 'same-l' = native 426M medium codec (default). "
                          "'same-s' = distilled 50M (faster, shares the medium latent space).")
+    ap.add_argument("--dit-precision", choices=["int8", "bf16"], default="int8",
+                    help="DiT C++ engine precision. int8 (default, shipped, ~40 dB, 1-thread core) "
+                         "or bf16 (near-lossless fp32 RoPE/RMSNorm islands, ~59/54 dB @L1292/L4096, "
+                         "~1.24× the int8 latency, runs at --threads). The cpu-amx analogue of MLX's "
+                         "per-model dtype for the DiT.")
     ap.add_argument("--decoder-precision", choices=["bf16", "int8"], default="bf16",
                     help="Decoder C++ engine precision. bf16 (default, best fidelity) or int8 "
-                         "(SmoothQuant+GPTQ fused w8a8, smaller/faster). The DiT is int8-fixed "
-                         "and T5Gemma is bf16 regardless — this is the cpu-amx analogue of MLX's "
-                         "--dit-dtype.")
+                         "(SmoothQuant+GPTQ fused w8a8, smaller/faster). T5Gemma is bf16 regardless.")
     ap.add_argument("--threads", type=int, default=16,
-                    help="Thread count for T5Gemma + the decoder (default 16). The DiT is pinned "
-                         "to 1 thread for stability (its .so heap-races at higher counts) and is "
-                         "fast enough for short clips.")
+                    help="Thread count for T5Gemma + the decoder + the bf16 DiT (default 16). The "
+                         "int8 DiT is pinned to 1 thread for stability (its .so heap-races higher).")
     ap.add_argument("--lora", action="append", nargs="+", default=None, metavar="ADAPTER",
                     help="(not supported in cpu-amx — accepted and ignored with a note; the int8 "
                          "C++ DiT core has no runtime LoRA merge. Use optimized/mlx for LoRA.)")
@@ -339,7 +343,8 @@ def _run():
     print(f"  {k('σmax')}  {bold(f'{sigma_max:.2f}')}")
     print(f"  {k('seconds')}  {v(f'{args.seconds}s')}   {k('steps')}  {v(args.steps)}   {k('seed')}  {args.seed}")
     cfg_label = f"{args.cfg}" + (f" (apg={args.apg})" if args.cfg != 1.0 else "")
-    print(f"  {k('dec prec')}  {v(args.decoder_precision)}   {k('threads')}  {v(args.threads)}   {k('cfg')}  {cfg_label}")
+    print(f"  {k('dit prec')}  {v(args.dit_precision)}   {k('dec prec')}  {v(args.decoder_precision)}   "
+          f"{k('threads')}  {v(args.threads)}   {k('cfg')}  {cfg_label}")
     print(f"  {k('T_lat')}  {T_lat} {dim(f'({target_dur:.2f}s → trimmed to {args.seconds}s)')}")
     print()
 
@@ -386,10 +391,11 @@ def _run():
             del enc
 
     # ── 3b. DiT load + pingpong sample ──
-    stage("[3/5]", f"DiT — load + sample ({args.steps} steps, σmax={sigma_max:.2f})")
+    stage("[3/5]", f"DiT — load + sample ({args.dit_precision}, {args.steps} steps, σmax={sigma_max:.2f})")
     t0 = time.time()
-    dit = B.load_dit()                                                    # threads=1 (stable)
-    sub(f"load {time.time()-t0:.1f}s  (medium int8 C++ core, 1 thread)")
+    dit = B.load_dit(precision=args.dit_precision, threads=args.threads)
+    _dit_th = 1 if args.dit_precision == "int8" else args.threads
+    sub(f"load {time.time()-t0:.1f}s  (medium {args.dit_precision} C++ core, {_dit_th} thread{'s' if _dit_th != 1 else ''})")
 
     sigmas = P.build_pingpong_schedule(args.steps, sigma_max=sigma_max)
     sub("schedule  " + " · ".join(f"{float(x):.3f}" for x in sigmas))

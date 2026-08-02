@@ -49,6 +49,11 @@ FILES = {
  "dit_medium_int8.so":                       f"{_C}/tritoncpu_sa3/aot_speedprove/dit_cpu_amx.so",
  "dit_medium_int8_core.bin":                 f"{_C}/tritoncpu_sa3/aot_speedprove/core_L320.bin",
  "dit_medium_int8_core_manifest.txt":        f"{_C}/tritoncpu_sa3/aot_speedprove/core_L320_manifest.txt",
+ "dit_medium_bf16.so":                       f"{_C}/tritoncpu_sa3/aot_bf16/dit_cpu_amx_bf16.so",
+ "dit_medium_bf16_core.bin":                 f"{_C}/tritoncpu_sa3/aot_bf16/core_bf16.bin",
+ "dit_medium_bf16_core_manifest.txt":        f"{_C}/tritoncpu_sa3/aot_bf16/core_bf16_manifest.txt",
+ "dit_medium_bf16_pin_fp32.npz":             f"{_C}/tritoncpu_sa3/aot_bf16/pin_fp32.npz",
+ "dit_medium_bf16_flash.so":                 f"{_C}/tritoncpu_sa3/aot_bf16/_flash_diff_bf16_bm128.so",
 }
 # dit_medium_kernels.tar.gz is extracted (not a single dst); handled specially.
 _DIT_KERNELS_HF = "dit_medium_int8_kernels.tar.gz"
@@ -57,6 +62,8 @@ _DIT_KERNELS_SENTINEL = f"{_C}/tritoncpu_sa3/aot_stage2/cpp_kernels.txt"
 GROUPS = {
  "t5gemma": ["t5gemma_bf16.so", "t5gemma_bf16_weights.bin", "t5gemma_bf16_weights_manifest.txt"],
  "dit": ["dit_medium_int8.so", "dit_medium_int8_core.bin", "dit_medium_int8_core_manifest.txt", _DIT_KERNELS_HF],
+ "dit_bf16": ["dit_medium_bf16.so", "dit_medium_bf16_core.bin", "dit_medium_bf16_core_manifest.txt",
+              "dit_medium_bf16_pin_fp32.npz", "dit_medium_bf16_flash.so", _DIT_KERNELS_HF],
  "same_s_decoder_bf16": ["same_s_decoder_bf16.so", "same_s_decoder_bf16_weights.bin", "same_s_decoder_bf16_weights_manifest.txt"],
  "same_l_decoder_bf16": ["same_l_decoder_bf16.so", "same_l_decoder_bf16_weights.bin", "same_l_decoder_bf16_weights_manifest.txt"],
  "same_s_decoder_int8": ["same_s_decoder_int8.so", "same_s_decoder_int8_weights.bin", "same_s_decoder_int8_weights_manifest.txt"],

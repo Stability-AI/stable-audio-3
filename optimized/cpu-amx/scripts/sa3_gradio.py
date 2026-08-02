@@ -50,18 +50,20 @@ OUTPUT_DIR = ROOT / "output" / "gradio"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DECODER_CHOICES = ["same-l", "same-s"]
-PRECISION_CHOICES = ["bf16", "int8"]
+PRECISION_CHOICES = ["bf16", "int8"]          # decoder quantization
+DIT_PRECISION_CHOICES = ["int8", "bf16"]      # DiT quantization (int8 default/shipped, bf16 near-lossless)
 MAX_SECONDS = 380   # medium's trained max
 MIN_SIGMA = 0.01
 
 
 # ── run one generation via the CLI subprocess (DiT-crash isolation) ─────────
-def run_generation(decoder, precision, threads, prompt, negative_prompt, seconds,
+def run_generation(decoder, precision, dit_precision, threads, prompt, negative_prompt, seconds,
                    steps, seed, cfg, apg, sigma_max, a2a_path, inpaint_path,
                    inp_start, inp_end):
     """Returns (audio_np (2,T) float32, info dict). Raises on failure."""
     out = Path(tempfile.gettempdir()) / f"sa3cpuamx_gr_{time.time_ns()}.wav"
     cmd = [sys.executable, CLI, "--dit", "medium",
+           "--dit-precision", str(dit_precision),
            "--decoder", str(decoder), "--decoder-precision", str(precision),
            "--threads", str(int(threads)), "--prompt", prompt or "",
            "--seconds", str(float(seconds)), "--steps", str(int(steps)),
@@ -151,12 +153,12 @@ def render_history(hist):
 
 
 # ── UI ──────────────────────────────────────────────────────────────────────
-def build_ui(initial_decoder, initial_precision, *, share, default_seconds,
+def build_ui(initial_decoder, initial_precision, initial_dit_precision, *, share, default_seconds,
              default_steps, default_threads, server_port):
     import gradio as gr
 
-    def _meta(decoder, precision, cfg, sigma_max, mode):
-        parts = [decoder, precision]
+    def _meta(decoder, precision, dit_precision, cfg, sigma_max, mode):
+        parts = [f"DiT-{dit_precision}", decoder, precision]
         if cfg != 1.0:
             parts.append(f"cfg {cfg:g}")
         if sigma_max != 1.0:
@@ -165,7 +167,7 @@ def build_ui(initial_decoder, initial_precision, *, share, default_seconds,
             parts.append(mode)
         return " · ".join(parts)
 
-    def generate(decoder, precision, threads, prompt, negative_prompt, seconds, steps,
+    def generate(decoder, precision, dit_precision, threads, prompt, negative_prompt, seconds, steps,
                  seed_text, cfg, apg, sigma_max, init_noise, a2a_audio, inpaint_audio,
                  inp_start, inp_end, autoplay, state):
         import random as _random
@@ -181,7 +183,7 @@ def build_ui(initial_decoder, initial_precision, *, share, default_seconds,
         mode = ("inpaint" if (inpaint_audio and inp_end > inp_start) else
                 "audio-to-audio" if a2a_audio else "text-to-audio")
         try:
-            pcm, info = run_generation(decoder, precision, threads, prompt, negative_prompt,
+            pcm, info = run_generation(decoder, precision, dit_precision, threads, prompt, negative_prompt,
                                        seconds, steps, seed, cfg, apg, smx,
                                        a2a_audio or None, inpaint_audio or None, inp_start, inp_end)
         except Exception as e:
@@ -198,7 +200,7 @@ def build_ui(initial_decoder, initial_precision, *, share, default_seconds,
         except Exception:
             pass
         entry = {"prompt": prompt, "seed": seed, "path": str(out_path), "spec_b64": spec_b64,
-                 "meta": _meta(decoder, precision, cfg, smx, mode)}
+                 "meta": _meta(decoder, precision, dit_precision, cfg, smx, mode)}
         timing = (f"{html_lib.escape(prompt) or '<i>(no prompt)</i>'} · "
                   f"<b>{info['wall']:.1f}s wall</b> · {info['realtime']:.2f}× realtime · "
                   f"seed <code>{seed}</code> · T_lat {info['T_lat']} · {entry['meta']}")
@@ -213,18 +215,20 @@ def build_ui(initial_decoder, initial_precision, *, share, default_seconds,
         gr.Markdown(
             "# SA3 — CPU AMX (torch-free C++ engines)\n"
             "Text→audio, CFG + negative prompt, audio-to-audio, inpainting — all on CPU "
-            "(Xeon AMX). DiT = **medium int8**; decoders = SAME-S / SAME-L (**bf16** default, "
-            "int8 optional). audio-to-audio / inpainting init-encode uses the torch-free C++ AMX "
-            "SAME-S/SAME-L encoder (matched to the decoder); the whole stack is now 100% C++/numpy.")
+            "(Xeon AMX). DiT = **medium** (int8 or near-lossless **bf16**, selectable); decoders = "
+            "SAME-S / SAME-L (**bf16** / int8). audio-to-audio / inpainting init-encode uses the "
+            "torch-free C++ AMX SAME-S/SAME-L encoder (matched to the decoder); 100% C++/numpy.")
         st = gr.State({"current": None, "history": []})
         with gr.Row():
             with gr.Column(scale=3):
                 with gr.Row():
                     gr.Dropdown(label="DiT model", choices=["medium"], value="medium",
                                 interactive=False, scale=1)
+                    dit_precision_dd = gr.Dropdown(label="DiT quantization", choices=DIT_PRECISION_CHOICES,
+                                                   value=initial_dit_precision, scale=1)
                     decoder_dd = gr.Dropdown(label="Decoder (codec)", choices=DECODER_CHOICES,
                                              value=initial_decoder, scale=1)
-                    precision_dd = gr.Dropdown(label="Decoder precision", choices=PRECISION_CHOICES,
+                    precision_dd = gr.Dropdown(label="Decoder quantization", choices=PRECISION_CHOICES,
                                                value=initial_precision, scale=1)
                 with gr.Row():
                     prompt = gr.Textbox(label="Prompt", lines=2, scale=6,
@@ -269,7 +273,7 @@ def build_ui(initial_decoder, initial_precision, *, share, default_seconds,
 
         generate_btn.click(
             generate,
-            [decoder_dd, precision_dd, threads, prompt, negative_prompt, seconds, steps,
+            [decoder_dd, precision_dd, dit_precision_dd, threads, prompt, negative_prompt, seconds, steps,
              seed, cfg, apg, sigma_global, sigma_slider, a2a_audio, inpaint_audio,
              inp_start, inp_end, autoplay, st],
             [output_player, timing, history_html, st])
@@ -288,6 +292,8 @@ def main():
     ap.add_argument("--decoder", choices=DECODER_CHOICES, default="same-l",
                     help="Initial decoder (switchable in the UI). Default same-l.")
     ap.add_argument("--decoder-precision", choices=PRECISION_CHOICES, default="bf16")
+    ap.add_argument("--dit-precision", choices=DIT_PRECISION_CHOICES, default="int8",
+                    help="Initial DiT quantization (switchable in the UI). Default int8.")
     ap.add_argument("--default-seconds", type=float, default=10.0)
     ap.add_argument("--default-steps", type=int, default=8)
     ap.add_argument("--threads", type=int, default=16)
@@ -297,9 +303,9 @@ def main():
     args = ap.parse_args()
 
     print("\n━━━ SA3 cpu-amx — gradio ━━━")
-    print(f"  DiT:      medium (int8 C++ AMX)")
+    print(f"  DiT:      medium ({args.dit_precision} C++ AMX)  (switchable in UI)")
     print(f"  decoder:  {args.decoder} ({args.decoder_precision})  (switchable in UI)")
-    build_ui(args.decoder, args.decoder_precision, share=args.share,
+    build_ui(args.decoder, args.decoder_precision, args.dit_precision, share=args.share,
              default_seconds=args.default_seconds, default_steps=args.default_steps,
              default_threads=args.threads, server_port=args.port)
 

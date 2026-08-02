@@ -33,8 +33,10 @@ DIR_SAMES = "/weka2/cj/clod/same_s_cpu_amx"
 DIR_SAMEL = "/weka2/cj/clod/same_l_cpu_amx"
 DIR_SAMES_INT8 = "/weka2/cj/clod/same_s_int8fused_cpu_amx"
 DIR_SAMEL_INT8 = "/weka2/cj/clod/same_l_int8fused_cpu_amx"
-DIR_SAMES_ENC = "/weka2/cj/clod/same_s_encoder_cpu_amx"   # C++ AMX SAME-S encoder
-DIR_SAMEL_ENC = "/weka2/cj/clod/same_l_encoder_cpu_amx"   # C++ AMX SAME-L encoder
+DIR_SAMES_ENC = "/weka2/cj/clod/same_s_encoder_cpu_amx"   # C++ AMX SAME-S encoder (bf16)
+DIR_SAMEL_ENC = "/weka2/cj/clod/same_l_encoder_cpu_amx"   # C++ AMX SAME-L encoder (bf16)
+DIR_SAMES_ENC_INT8 = "/weka2/cj/clod/same_s_encoder_int8fused_cpu_amx"   # C++ AMX SAME-S encoder (int8)
+DIR_SAMEL_ENC_INT8 = "/weka2/cj/clod/same_l_encoder_int8fused_cpu_amx"   # C++ AMX SAME-L encoder (int8)
 DIR_AE = "/weka2/cj/clod/sa3s/fast_load"              # samel_loader.load_model (torch AE, fallback only)
 
 DIT_THREADS = 1   # verified-stable; the .so heap-races at higher thread counts
@@ -140,26 +142,35 @@ class CppEncoder:
     The encoder downsamples 4096 audio samples per latent token, so the audio is
     trimmed/zero-padded to exactly T_lat*4096 samples before encoding."""
 
-    def __init__(self, name: str, threads: int = 16):
+    def __init__(self, name: str, precision: str = "bf16", threads: int = 16):
         assert name in ("same-s", "same-l"), name
-        self.name = name
+        assert precision in ("bf16", "int8"), precision
+        self.name = name; self.precision = precision
         self.device = "cpu-amx"
-        if name == "same-s":
-            _ensure("same_s_encoder"); _add_path(DIR_SAMES_ENC)
+        if name == "same-s" and precision == "bf16":
+            _ensure("same_s_encoder_bf16"); _add_path(DIR_SAMES_ENC)
             from same_s_encoder_backend import SamesEncoderCPU
             self.m = SamesEncoderCPU(threads=threads)
-        else:
-            _ensure("same_l_encoder"); _add_path(DIR_SAMEL_ENC)
+        elif name == "same-s":
+            _ensure("same_s_encoder_int8"); _add_path(DIR_SAMES_ENC_INT8)
+            from same_s_encoder_int8fused_backend import SameSEncoderInt8FusedCPU
+            self.m = SameSEncoderInt8FusedCPU(threads=threads)
+        elif name == "same-l" and precision == "bf16":
+            _ensure("same_l_encoder_bf16"); _add_path(DIR_SAMEL_ENC)
             from same_l_encoder_backend import SamelEncoderCPU
             self.m = SamelEncoderCPU(threads=threads)
+        else:
+            _ensure("same_l_encoder_int8"); _add_path(DIR_SAMEL_ENC_INT8)
+            from same_l_encoder_int8fused_backend import SameLEncoderInt8FusedCPU
+            self.m = SameLEncoderInt8FusedCPU(threads=threads)
 
     def encode(self, audio: np.ndarray, T_lat: int) -> np.ndarray:
         return np.ascontiguousarray(self.m.encode(audio, T_lat), np.float32)
 
 
-def load_encoder(name: str = "same-l", threads: int = 16) -> CppEncoder:
-    """C++ AMX encoder matching the decoder. `name` in {'same-s','same-l'}."""
-    return CppEncoder(name, threads=threads)
+def load_encoder(name: str = "same-l", precision: str = "bf16", threads: int = 16) -> CppEncoder:
+    """C++ AMX encoder matching the decoder; precision follows --decoder-precision. name in {'same-s','same-l'}."""
+    return CppEncoder(name, precision=precision, threads=threads)
 
 
 # ── (fallback) fp32 torch AE encoder — retained for reference; not used by the release ──

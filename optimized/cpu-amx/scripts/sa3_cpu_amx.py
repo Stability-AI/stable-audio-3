@@ -378,7 +378,7 @@ def _run():
     if args.init_audio:
         stage("[3a]", f"Encode init audio → latents (C++ AMX {args.decoder} encoder)")
         t0 = time.time()
-        enc = B.load_encoder(args.decoder, threads=args.threads)
+        enc = B.load_encoder(args.decoder, precision=args.decoder_precision, threads=args.threads)
         audio_in = P.read_wav(args.init_audio)                            # (2, N)
         init_latents = enc.encode(audio_in, T_lat)                        # (1,256,T_lat)
         sub(f"device={enc.device}  {(time.time()-t0)*1000:.0f} ms  latents {init_latents.shape}")

@@ -17,9 +17,9 @@ _C = os.environ.get("SA3_CPUAMX_HOME", "/weka2/cj/clod")   # base the shims + Di
 
 # HF flat filename  ->  local destination the loader reads
 FILES = {
- "t5gemma.so":                          f"{_C}/t5gemma_cpu_amx/t5gemma_cpu_amx.so",
- "t5gemma_weights.bin":                 f"{_C}/t5gemma_cpu_amx/weights.bin",
- "t5gemma_weights_manifest.txt":        f"{_C}/t5gemma_cpu_amx/weights_manifest.txt",
+ "t5gemma_bf16.so":                          f"{_C}/t5gemma_cpu_amx/t5gemma_cpu_amx.so",
+ "t5gemma_bf16_weights.bin":                 f"{_C}/t5gemma_cpu_amx/weights.bin",
+ "t5gemma_bf16_weights_manifest.txt":        f"{_C}/t5gemma_cpu_amx/weights_manifest.txt",
  "same_s_decoder_bf16.so":              f"{_C}/same_s_cpu_amx/same_s_cpu_amx.so",
  "same_s_decoder_bf16_weights.bin":     f"{_C}/same_s_cpu_amx/weights.bin",
  "same_s_decoder_bf16_weights_manifest.txt": f"{_C}/same_s_cpu_amx/weights_manifest.txt",
@@ -32,32 +32,32 @@ FILES = {
  "same_l_decoder_int8.so":              f"{_C}/same_l_int8fused_cpu_amx/same_l_int8fused_cpu_amx.so",
  "same_l_decoder_int8_weights.bin":     f"{_C}/same_l_int8fused_cpu_amx/weights.bin",
  "same_l_decoder_int8_weights_manifest.txt": f"{_C}/same_l_int8fused_cpu_amx/weights_manifest.txt",
- "same_s_encoder.so":                   f"{_C}/same_s_encoder_cpu_amx/same_s_encoder_cpu_amx.so",
- "same_s_encoder_weights.bin":          f"{_C}/same_s_encoder_cpu_amx/weights.bin",
- "same_s_encoder_weights_manifest.txt": f"{_C}/same_s_encoder_cpu_amx/weights_manifest.txt",
- "same_l_encoder.so":                   f"{_C}/same_l_encoder_cpu_amx/same_l_encoder_cpu_amx.so",
- "same_l_encoder_weights.bin":          f"{_C}/same_l_encoder_cpu_amx/weights.bin",
- "same_l_encoder_weights_manifest.txt": f"{_C}/same_l_encoder_cpu_amx/weights_manifest.txt",
- "same_l_encoder_weights_f32.bin":      f"{_C}/same_l_encoder_cpu_amx/weights_f32.bin",
- "same_l_encoder_weights_f32_manifest.txt": f"{_C}/same_l_encoder_cpu_amx/weights_f32_manifest.txt",
- "dit_medium.so":                       f"{_C}/tritoncpu_sa3/aot_speedprove/dit_cpu_amx.so",
- "dit_medium_core.bin":                 f"{_C}/tritoncpu_sa3/aot_speedprove/core_L320.bin",
- "dit_medium_core_manifest.txt":        f"{_C}/tritoncpu_sa3/aot_speedprove/core_L320_manifest.txt",
+ "same_s_encoder_bf16.so":                   f"{_C}/same_s_encoder_cpu_amx/same_s_encoder_cpu_amx.so",
+ "same_s_encoder_bf16_weights.bin":          f"{_C}/same_s_encoder_cpu_amx/weights.bin",
+ "same_s_encoder_bf16_weights_manifest.txt": f"{_C}/same_s_encoder_cpu_amx/weights_manifest.txt",
+ "same_l_encoder_bf16.so":                   f"{_C}/same_l_encoder_cpu_amx/same_l_encoder_cpu_amx.so",
+ "same_l_encoder_bf16_weights.bin":          f"{_C}/same_l_encoder_cpu_amx/weights.bin",
+ "same_l_encoder_bf16_weights_manifest.txt": f"{_C}/same_l_encoder_cpu_amx/weights_manifest.txt",
+ "same_l_encoder_bf16_weights_f32.bin":      f"{_C}/same_l_encoder_cpu_amx/weights_f32.bin",
+ "same_l_encoder_bf16_weights_f32_manifest.txt": f"{_C}/same_l_encoder_cpu_amx/weights_f32_manifest.txt",
+ "dit_medium_int8.so":                       f"{_C}/tritoncpu_sa3/aot_speedprove/dit_cpu_amx.so",
+ "dit_medium_int8_core.bin":                 f"{_C}/tritoncpu_sa3/aot_speedprove/core_L320.bin",
+ "dit_medium_int8_core_manifest.txt":        f"{_C}/tritoncpu_sa3/aot_speedprove/core_L320_manifest.txt",
 }
 # dit_medium_kernels.tar.gz is extracted (not a single dst); handled specially.
-_DIT_KERNELS_HF = "dit_medium_kernels.tar.gz"
+_DIT_KERNELS_HF = "dit_medium_int8_kernels.tar.gz"
 _DIT_KERNELS_SENTINEL = f"{_C}/tritoncpu_sa3/aot_stage2/cpp_kernels.txt"
 
 GROUPS = {
- "t5gemma": ["t5gemma.so", "t5gemma_weights.bin", "t5gemma_weights_manifest.txt"],
- "dit": ["dit_medium.so", "dit_medium_core.bin", "dit_medium_core_manifest.txt", _DIT_KERNELS_HF],
+ "t5gemma": ["t5gemma_bf16.so", "t5gemma_bf16_weights.bin", "t5gemma_bf16_weights_manifest.txt"],
+ "dit": ["dit_medium_int8.so", "dit_medium_int8_core.bin", "dit_medium_int8_core_manifest.txt", _DIT_KERNELS_HF],
  "same_s_decoder_bf16": ["same_s_decoder_bf16.so", "same_s_decoder_bf16_weights.bin", "same_s_decoder_bf16_weights_manifest.txt"],
  "same_l_decoder_bf16": ["same_l_decoder_bf16.so", "same_l_decoder_bf16_weights.bin", "same_l_decoder_bf16_weights_manifest.txt"],
  "same_s_decoder_int8": ["same_s_decoder_int8.so", "same_s_decoder_int8_weights.bin", "same_s_decoder_int8_weights_manifest.txt"],
  "same_l_decoder_int8": ["same_l_decoder_int8.so", "same_l_decoder_int8_weights.bin", "same_l_decoder_int8_weights_manifest.txt"],
- "same_s_encoder": ["same_s_encoder.so", "same_s_encoder_weights.bin", "same_s_encoder_weights_manifest.txt"],
- "same_l_encoder": ["same_l_encoder.so", "same_l_encoder_weights.bin", "same_l_encoder_weights_manifest.txt",
-                    "same_l_encoder_weights_f32.bin", "same_l_encoder_weights_f32_manifest.txt"],
+ "same_s_encoder": ["same_s_encoder_bf16.so", "same_s_encoder_bf16_weights.bin", "same_s_encoder_bf16_weights_manifest.txt"],
+ "same_l_encoder": ["same_l_encoder_bf16.so", "same_l_encoder_bf16_weights.bin", "same_l_encoder_bf16_weights_manifest.txt",
+                    "same_l_encoder_bf16_weights_f32.bin", "same_l_encoder_bf16_weights_f32_manifest.txt"],
 }
 _DISABLE = os.environ.get("SA3_CPUAMX_NO_HF", "") not in ("", "0", "false")
 

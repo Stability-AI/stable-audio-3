@@ -59,7 +59,7 @@ def discover_variants(dit_name: str) -> list[tuple[str, Path]]:
     """Return [(label, path)] of available DiT engine files for this model.
 
     Scans models/<arch>/<dit_subdir>/dit_*.trt. The canonical engine
-    (dit_fp16mixed.trt) is always first if present; other variants follow
+    (dit_fp16.trt) is always first if present; other variants follow
     alphabetically. For the medium DiT also appends a pseudo-variant
     "pytorch fp32 (GT)" that dispatches to the PyTorch-eager backend.
     """
@@ -70,14 +70,14 @@ def discover_variants(dit_name: str) -> list[tuple[str, Path]]:
     if not d.exists():
         return []
     files = sorted(d.glob("dit_*.trt"))
-    canonical_name = "dit_fp16mixed.trt"
+    canonical_name = "dit_fp16.trt"
     canonical = [f for f in files if f.name == canonical_name]
     others = [f for f in files if f.name != canonical_name]
     out = []
     for f in canonical + others:
         label = f.name[len("dit_"):-len(".trt")] if f.name.startswith("dit_") and f.name.endswith(".trt") else f.name
         if f.name == canonical_name:
-            label = "fp16mixed (canonical)"
+            label = "fp16 (canonical)"
         elif "buggy" in f.name:
             label = label + " ← old, broken"
         out.append((label, f))

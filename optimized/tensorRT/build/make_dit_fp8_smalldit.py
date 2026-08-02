@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Produce the fp8 ONNX for the SMALL DiTs (sm-music / sm-sfx) by grafting fp8 E4M3 Q/DQ onto
-the LINEAR GEMMs of the model's fp16mixed ONNX — leaving attention fp16-fused and the fp32
+the LINEAR GEMMs of the model's fp16 ONNX — leaving attention fp16-fused and the fp32
 RMSNorm/RoPE islands intact. This is deliberately NOT the medium's fp8 recipe (baked RoPE +
 bf16 attention, build_dit_bf16.py + build_dit_fp8.py): the small DiTs never had the bf16
-long-angle RoPE problem, so their fp8 is a straight graft on the known-good fp16mixed graph.
+long-angle RoPE problem, so their fp8 is a straight graft on the known-good fp16 graph.
 
 Why a dedicated script (vs ModelOpt/build_dit_fp8.py): running ModelOpt PTQ on these models
 flattens the fp32 islands and its island-reapply (tuned for the medium graph) does NOT restore
 them correctly here — the resulting engine drops to velocity-cos ~0.69 with clipping. Grafting
-onto the fp16mixed ONNX keeps the islands correct by construction (velocity-cos ~0.99 vs eager).
+onto the fp16 ONNX keeps the islands correct by construction (velocity-cos ~0.99 vs eager).
 
 Two fp16-trunk specifics vs dit_fp8_max/make_fp8_onnx.py (which targets the fp32-trunk medium):
   * Q/DQ scales are FLOAT16 (the trunk is fp16 → DequantizeLinear must output fp16, else TRT
@@ -22,7 +22,7 @@ Scale VALUES affect accuracy only, not whether fp8 fires or the latency.
 
     python make_dit_fp8_smalldit.py \
         --model-config <ckpt>/model_config.json --checkpoint <ckpt>/model.safetensors \
-        --fp16mixed-onnx onnx/sa3-sm-music/dit_fp16mixed.onnx \
+        --fp16-onnx onnx/sa3-sm-music/dit_fp16.onnx \
         --domain Music --out onnx/sa3-sm-music/dit_fp8.onnx
 
 Then compile with build_from_onnx.py sa3-sm-music-fp8 (STRONGLY_TYPED; the QDQ carry fp8).
@@ -39,7 +39,7 @@ SCALE_DT = TensorProto.FLOAT16
 SCALE_FLOOR = 1e-4
 
 
-def calibrate_act_scales(model_config, checkpoint, fp16mixed_onnx, domain, margin, device):
+def calibrate_act_scales(model_config, checkpoint, fp16_onnx, domain, margin, device):
     """Per-linear activation max|x| from the eager model → {onnx_node_name: scale}. Maps ONNX
     linear nodes to torch modules by weight name (ONNX 'dit.<path>.weight' vs torch 'model.<path>'
     → match on the suffix after the first dotted component)."""
@@ -72,7 +72,7 @@ def calibrate_act_scales(model_config, checkpoint, fp16mixed_onnx, domain, margi
                  sampler_type="pingpong", seed=6000, duration_padding_sec=0.0, return_latents=True)
     print(f"  calibrated {len(mods)} linears on {len(prompts)} {domain} prompts + one full render", flush=True)
 
-    m = onnx.load(fp16mixed_onnx, load_external_data=False); g = m.graph
+    m = onnx.load(fp16_onnx, load_external_data=False); g = m.graph
     inits = {i.name for i in g.initializer}; prod = {o: n for n in g.node for o in n.output}
     def wsrc(n):
         w = n.input[1]
@@ -106,8 +106,8 @@ def topo_sort(g):
     del g.node[:]; g.node.extend(result)
 
 
-def graft_fp8(fp16mixed_onnx, node_scale, gscale, out):
-    model = onnx.load(fp16mixed_onnx, load_external_data=True); g = model.graph
+def graft_fp8(fp16_onnx, node_scale, gscale, out):
+    model = onnx.load(fp16_onnx, load_external_data=True); g = model.graph
     have = False
     for op in model.opset_import:
         if op.domain in ("", "ai.onnx"):
@@ -161,7 +161,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model-config", required=True)
     ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--fp16mixed-onnx", required=True, help="the model's canonical dit_fp16mixed.onnx")
+    ap.add_argument("--fp16-onnx", required=True, help="the model's canonical dit_fp16.onnx")
     ap.add_argument("--out", required=True, help="output dit_fp8.onnx (a .data sidecar is written alongside)")
     ap.add_argument("--domain", default="Music", choices=["Music", "SFX", "Instrument", "One-shot"],
                     help="reprompt few-shot domain for activation calibration (Music for sm-music, SFX for sm-sfx)")
@@ -170,9 +170,9 @@ def main():
     a = ap.parse_args()
     t0 = time.time()
     print(f"[make_dit_fp8_smalldit] calibrating ({a.domain}) ...", flush=True)
-    node_scale, gscale = calibrate_act_scales(a.model_config, a.checkpoint, a.fp16mixed_onnx, a.domain, a.margin, a.device)
+    node_scale, gscale = calibrate_act_scales(a.model_config, a.checkpoint, a.fp16_onnx, a.domain, a.margin, a.device)
     print(f"  {len(node_scale)} node scales, global={gscale:.5f}; grafting fp8 ...", flush=True)
-    graft_fp8(a.fp16mixed_onnx, node_scale, gscale, a.out)
+    graft_fp8(a.fp16_onnx, node_scale, gscale, a.out)
     print(f"DONE -> {a.out} ({time.time()-t0:.0f}s)", flush=True)
 
 

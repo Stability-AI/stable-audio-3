@@ -72,7 +72,7 @@ lazy-download from HuggingFace on first use.
 | `--precision` | legacy name | size (sm DiT / medium DiT / codecs) | quality | CPU speed |
 |---------------|-------------|-------------------------------------|---------|-----------|
 | `fp32` (default) | — | 1.8 GB / 5.8 GB / 0.2–1.8 GB | reference | 1× — on CPU this is *also* the fast choice |
-| `w16a32` | fp16mixed | 0.9 / 2.9 / 0.1–0.9 GB | ≈lossless (fp16 weights, fp32 activations; 62–75 dB per-forward) | 1.5–3× slower, model-dependent (XNNPACK dequantizes per-matmul) |
+| `w16a32` | fp16 | 0.9 / 2.9 / 0.1–0.9 GB | ≈lossless (fp16 weights, fp32 activations; 62–75 dB per-forward) | 1.5–3× slower, model-dependent (XNNPACK dequantizes per-matmul) |
 | `w8a32` | woint8 | 0.45 / 1.5 / 0.05–0.5 GB | GPTQ int8 weights — codecs transparent (40–46 dB); DiT gives a *different but plausible* sample | ≈fp32 |
 | `w8a8-dyn` | dynint8 | 0.45 / 1.5 / 0.05–0.5 GB | lowest (int8 weights + activations, per-invoke dynamic scales) | fastest (~1.2–1.3×) |
 

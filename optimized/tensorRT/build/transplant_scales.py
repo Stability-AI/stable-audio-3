@@ -23,7 +23,7 @@ Pipeline (medium-DiT fp8 "calibrated bakedmin" tier)
   5. build_from_onnx.py sa3-m-fp8   compile the calibrated ONNX to dit_fp8.trt
 
 Why transplant instead of shipping #47's engine directly: #47's calibrated ONNX
-is fp16mixed-derived and its engine uses fp16 attention + a runtime fp32 RoPE
+is fp16-derived and its engine uses fp16 attention + a runtime fp32 RoPE
 island (+~2 ms/fwd). Our bakedmin structure keeps the faster bf16 fused MHA and
 a baked fp32 RoPE constant. Calibration is a property of the SCALE VALUES, not of
 the structure, so grafting #47's scales onto the bakedmin graph gives #47's

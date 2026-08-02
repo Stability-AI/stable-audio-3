@@ -95,15 +95,15 @@ def _detect_gpu_arch() -> str:
 ARCH = _detect_gpu_arch()
 ARCH_DIR = MODELS_DIR / ARCH
 HF_SUBDIR = f"tensorRT/{ARCH}"
-T5GEMMA_PATH = ARCH_DIR / "t5gemma" / "t5gemma_fp16mixed.trt"
+T5GEMMA_PATH = ARCH_DIR / "t5gemma" / "t5gemma_fp16.trt"
 
 # What engine files each DiT choice needs (relative to MODELS_DIR, mirroring HF repo layout).
 # Each DiT engine bundles its conditioner tensors (padding_embedding + seconds_total
 # Linear) as graph Constants, so no sidecar weight files are needed.
 DIT_ENGINE_FILES = {
-    "sm-music": ["sa3-sm-music/dit_fp16mixed.trt"],
-    "sm-sfx":   ["sa3-sm-sfx/dit_fp16mixed.trt"],
-    "medium":   ["sa3-m/dit_fp16mixed.trt"],   # fp16mixed is the medium default
+    "sm-music": ["sa3-sm-music/dit_fp16.trt"],
+    "sm-sfx":   ["sa3-sm-sfx/dit_fp16.trt"],
+    "medium":   ["sa3-m/dit_fp16.trt"],   # fp16 is the medium default
 }
 DECODER_FILES = {
     "same-s": [
@@ -121,15 +121,15 @@ SHARED_FILES = [
     # T5Gemma engine — downloaded from HF per-arch. (The tokenizer.json is
     # arch-agnostic and ships bundled with the repo at scripts/tokenizer.json,
     # so it's NOT in this list.)
-    "t5gemma/t5gemma_fp16mixed.trt",
+    "t5gemma/t5gemma_fp16.trt",
 ]
 
 DIT_CHOICES = {
-    "sm-music": {"engine": ARCH_DIR / "sa3-sm-music" / "dit_fp16mixed.trt",
+    "sm-music": {"engine": ARCH_DIR / "sa3-sm-music" / "dit_fp16.trt",
                  "default_decoder": "same-s"},
-    "sm-sfx":   {"engine": ARCH_DIR / "sa3-sm-sfx" / "dit_fp16mixed.trt",
+    "sm-sfx":   {"engine": ARCH_DIR / "sa3-sm-sfx" / "dit_fp16.trt",
                  "default_decoder": "same-s"},
-    "medium":   {"engine": ARCH_DIR / "sa3-m" / "dit_fp16mixed.trt",  # medium default
+    "medium":   {"engine": ARCH_DIR / "sa3-m" / "dit_fp16.trt",  # medium default
                  "default_decoder": "same-l"},
 }
 DECODER_PATHS = {
@@ -144,78 +144,71 @@ ENCODER_PATHS = {
 
 # ─── Precision-keyed engine maps ─────────────────────────────────────────
 #
-# Three DiT precisions:
-#   fp16mixed  — canonical AND the default for every DiT, medium included since
-#                2026-07. FP16 trunk with FP32 islands around RMSNorm and the RoPE
-#                *generation*; the attention core (QK^T → Softmax → P·V) runs FP16
-#                so TRT's FMHA fuser fires (96 fused nodes on medium). Before that
-#                island was bounded the whole O(L²) core sat in FP32 unfused, which
-#                is what made bf16 look 4.7× faster. Now: teacher-forced velocity
-#                cos 1.0000 vs the FP32 engine at every length, and within ~3% of
-#                bf16's speed. Requires STRONGLY_TYPED (see build_dit_fp16mixed.py).
-#   bf16       — medium ONLY. Same dit.onnx as fp32, built with BuilderFlag.BF16
-#                (EXPLICIT_BATCH), which lets the FMHA fuser fire on a uniform bf16
-#                trunk. Marginally the fastest engine, but LOW-FIDELITY AT LONG
-#                SEQUENCE: it evaluates RoPE's rotation angle in bf16, and that
-#                angle reaches ~4155 rad at L=4092 where bf16's spacing is 32 rad
-#                (> 2π), so position information for the fast-rotating dims is
-#                destroyed. Over 8 sampling steps the latent inflates ~2.5× and the
-#                decoder clips 2–3% of samples on a 6-min render. Fine at short
-#                lengths (clean at L=256); prefer fp16mixed for anything long.
-#                Also not seed-reproducible vs fp16mixed.
+# Three DiT precisions (fp16mixed was renamed → fp16 — every tier is mixed, so the
+# qualifier was noise; the medium-only bf16 tier was retired. Both old tokens alias
+# to fp16, see _PRECISION_ALIAS):
+#   fp16       — canonical AND the default for every DiT. FP16 trunk with FP32
+#                islands around RMSNorm and the RoPE *generation*; the attention
+#                core (QK^T → Softmax → P·V) runs FP16 so TRT's FMHA fuser fires
+#                (96 fused nodes on medium). Bounding that island is what lets the
+#                core fuse — before it, the whole O(L²) core sat in FP32 unfused
+#                (which is what made the retired bf16 tier look 4.7× faster). Now:
+#                teacher-forced velocity cos 1.0000 vs the FP32 engine at every
+#                length, ~3% off the old bf16 speed, and accurate at long sequence
+#                (bf16 drifted — it evaluated RoPE's angle too coarsely past ~2048
+#                rad, ~4155 rad @L4092 vs bf16 spacing 32 rad, clipping 2–3% of a
+#                6-min render). Requires STRONGLY_TYPED (see build_dit_fp16.py).
 #   fp8        — all DiTs, fp8 E4M3 on the linear GEMMs (attention + RoPE kept
 #                higher precision). On MEDIUM it's a max-speed clean tier (~1.3×
-#                over fp16mixed) via the recipe described below. On sm-music /
+#                over fp16) via the recipe described below. On sm-music /
 #                sm-sfx it is a CLEAN WEIGHT-HALVING tier (engine 479 vs 936 MB),
 #                only marginally faster (~1.10–1.17×): those DiTs' ~5 ms forward is
 #                overhead-bound at batch 1, so fp8's GEMM-math savings barely show.
-#                Their fp8 is an fp8-QDQ graft onto the fp16mixed graph (fp8 linears
-#                + fp16 fused attention + the fp16mixed fp32 islands, STRONGLY_TYPED),
-#                velocity-cos ~0.99 vs eager, clip% at/below fp16mixed. medium recipe:
+#                Their fp8 is an fp8-QDQ graft onto the fp16 graph (fp8 linears
+#                + fp16 fused attention + the fp16 fp32 islands, STRONGLY_TYPED),
+#                velocity-cos ~0.99 vs eager, clip% at/below fp16. medium recipe:
 #                MAX-SPEED clean tier. fp8 E4M3 on the 176 linear
 #                GEMMs + bf16 fused FMHA (96 nodes) + a BAKED fp32 RoPE constant
 #                table: position cos/sin are computed host-side at build time and
 #                frozen as a graph Constant (no in-graph trig), so the island is
 #                precision-policy-robust and cross-runtime-stable — a constant
 #                can't be re-fused to bf16 the way a runtime pin can. ~1.3× faster
-#                than fp16mixed at every length (measured H200, same-run round-
+#                than fp16 at every length (measured H200, same-run round-
 #                robin: 1.40× @L129 / 1.32× @L1292 / 1.30× @L4092) and CLEAN at
 #                long sequence (latent std 0.86 vs eager 0.95, 0.000% clip @2min &
 #                full) — the baked RoPE dodges bf16's long-angle drift. It is a
 #                SPEED tier over an already-good default, NOT a fidelity upgrade:
-#                single-step velocity cos vs fp32 is ~0.92–0.97 (below fp16mixed's
+#                single-step velocity cos vs fp32 is ~0.92–0.97 (below fp16's
 #                ~1.0) but the 8-step render stays coherent. Built weakly-typed
 #                EXPLICIT_BATCH + BF16 + FP8 + OBEY_PRECISION_CONSTRAINTS (the
-#                opposite of fp16mixed's STRONGLY_TYPED — see build_from_onnx.py).
+#                opposite of fp16's STRONGLY_TYPED — see build_from_onnx.py).
 #                The baked table is sized to the profile max L=4096 (= the SAME-L
 #                decoder's own cap), so within the shipped range no re-bake is
 #                needed; L>4096 is rejected (a re-bake would be required).
 #   fp32       — pure-FP32, bit-equivalent to PyTorch eager. ~2× size/latency.
 #
 # The lookup tables below resolve the engine filename per (dit/decoder,
-# precision). The bf16 DiT recipe is a build-time precision change only (no new
-# ONNX): reuse sa3-m/dit.onnx, build with BF16. Decoders/encoders are unchanged
-# by bf16 (it's a DiT-trunk fusion recipe), so decoder "bf16" reuses the
-# canonical decoder engine. Encoders are FP16-mixed only.
+# precision). Decoders/encoders have no DiT-specific recipe, so they reuse their
+# canonical fp16 engine for every precision. Encoders are fp16 only.
 DIT_ENGINE_FILENAME = {
-    "bf16":      "dit_bf16.trt",        # medium only; drifts at long sequence
-    "fp8":       "dit_fp8.trt",         # all DiTs; fp8 linears (medium: +baked RoPE; small: graft on fp16mixed)
-    "fp16mixed": "dit_fp16mixed.trt",
-    "fp32":      "dit_fp32.trt",
+    "fp8":  "dit_fp8.trt",   # all DiTs; fp8 linears (medium: +baked RoPE; small: graft on fp16)
+    "fp16": "dit_fp16.trt",  # canonical + default for every DiT (fp16 trunk + fp32 RMSNorm/RoPE islands)
+    "fp32": "dit_fp32.trt",  # pure fp32, bit-equivalent to eager
 }
-# DiT precisions actually built per model. bf16 is medium-only; fp8 is available
-# for all three (medium via baked-RoPE/bf16-attn; sm-music/sm-sfx via an fp8-QDQ
-# graft onto their fp16mixed graph — fp8 linears + fp16 fused attn + fp32 islands).
+# DiT precisions actually built per model. fp8 is available for all three (medium
+# via baked-RoPE/bf16-attn; sm-music/sm-sfx via an fp8-QDQ graft onto their fp16
+# graph — fp8 linears + fp16 fused attn + fp32 islands). The retired medium-only
+# bf16 tier (drifted at long sequence) now aliases to fp16 — see _PRECISION_ALIAS.
 _DIT_PRECISIONS = {
-    "sm-music": ("fp16mixed", "fp8", "fp32"),
-    "sm-sfx":   ("fp16mixed", "fp8", "fp32"),
-    "medium":   ("bf16", "fp8", "fp16mixed", "fp32"),
+    "sm-music": ("fp16", "fp8", "fp32"),
+    "sm-sfx":   ("fp16", "fp8", "fp32"),
+    "medium":   ("fp8", "fp16", "fp32"),
 }
-# Per-DiT default precision — fp16mixed everywhere. Medium moved off bf16 once
-# fp16mixed's attention core was fused (4.3x faster than the old fp16mixed engine,
+# Per-DiT default precision — fp16 everywhere. Medium moved off bf16 once
+# fp16's attention core was fused (4.3x faster than the old fp16 engine,
 # ~3% off bf16, and fp32-accurate at every sequence length).
-DIT_DEFAULT_PRECISION = {"sm-music": "fp16mixed", "sm-sfx": "fp16mixed",
-                         "medium": "fp16mixed"}
+DIT_DEFAULT_PRECISION = {"sm-music": "fp16", "sm-sfx": "fp16",
+                         "medium": "fp16"}
 _DIT_SUBDIR = {"sm-music": "sa3-sm-music", "sm-sfx": "sa3-sm-sfx", "medium": "sa3-m"}
 # Both SAME decoders' latent profiles start at L=32 (verified against the engines:
 # min=(1,256,32) for same-l and same-s; the DiT's starts at 1). Below 32,
@@ -228,24 +221,30 @@ DECODER_MIN_L = 32
 
 DECODER_ENGINE_FILENAME = {
     "same-l": {
-        # bf16/fp8 are DiT-only recipes → decoder reuses its canonical fp16-mixed engine.
-        "bf16":      "dec_dynamic_triton_swa.trt",
-        "fp8":       "dec_dynamic_triton_swa.trt",
-        "fp16mixed": "dec_dynamic_triton_swa.trt",
-        "fp32":      "dec_dynamic_fp32.trt",
+        # fp8 is a DiT-only recipe → decoder reuses its canonical fp16 engine.
+        # (dec_dynamic_bf16.trt keeps its name — it's the same-s canonical engine.)
+        "fp8":  "dec_dynamic_triton_swa.trt",
+        "fp16": "dec_dynamic_triton_swa.trt",
+        "fp32": "dec_dynamic_fp32.trt",
     },
     "same-s": {
-        "bf16":      "dec_dynamic_bf16.trt",
-        "fp8":       "dec_dynamic_bf16.trt",
-        "fp16mixed": "dec_dynamic_bf16.trt",
-        "fp32":      "dec_dynamic_fp32.trt",
+        "fp8":  "dec_dynamic_bf16.trt",
+        "fp16": "dec_dynamic_bf16.trt",
+        "fp32": "dec_dynamic_fp32.trt",
     },
 }
-PRECISIONS = ("bf16", "fp8", "fp16mixed", "fp32")
+PRECISIONS = ("fp8", "fp16", "fp32")
+# Back-compat: retired precision tokens resolve to their replacement.
+#   fp16mixed → fp16 : every tier is mixed-precision, so the qualifier was noise.
+#   bf16      → fp16 : the medium-only bf16 DiT drifted at long sequence; retired.
+_PRECISION_ALIAS = {"fp16mixed": "fp16", "bf16": "fp16"}
+def normalize_precision(precision):
+    """Map a (possibly retired) precision token to its canonical name."""
+    return _PRECISION_ALIAS.get(precision, precision) if precision else precision
 
 # ── Decoder / encoder quantization TIERS (orthogonal to the DiT --precision) ──
 # Train-free fp8 tiers grafted onto the bf16 export (see quantize/README.md).
-# "canonical" = the shipped bf16/fp16-mixed engine. The others are downloaded from HF on demand
+# "canonical" = the shipped default decoder engine. The others are downloaded from HF on demand
 # (tensorRT/<arch>/<same-*>/dec_*.trt) — the same wide-profile engines built by quantize/build_tiers.py.
 #   fp8       fp8 FFN GEMMs (near-transparent, ~1.14×) — the speed pick
 #   fp8_fast  SAME-S only: fp8 on the attention projections too (~1.22×, lossier)
@@ -253,9 +252,9 @@ PRECISIONS = ("bf16", "fp8", "fp16mixed", "fp32")
 #  the engine was byte-for-byte the size/speed of the bf16 baseline with slightly lossier weights —
 #  strictly dominated. For a max-fidelity decoder use --precision fp32.)
 DECODER_TIER_FILENAME = {
-    "same-s": {"canonical": DECODER_ENGINE_FILENAME["same-s"]["bf16"],
+    "same-s": {"canonical": DECODER_ENGINE_FILENAME["same-s"]["fp16"],
                "fp8": "dec_fp8.trt", "fp8_fast": "dec_fp8_fast.trt"},
-    "same-l": {"canonical": DECODER_ENGINE_FILENAME["same-l"]["fp16mixed"],
+    "same-l": {"canonical": DECODER_ENGINE_FILENAME["same-l"]["fp16"],
                "fp8": "dec_fp8.trt"},
 }
 ENCODER_TIER_FILENAME = {
@@ -305,14 +304,14 @@ def resolve_encoder_engine(decoder_name: str, dec_tier: str = "canonical") -> Pa
 
 
 def default_precision(dit_name: str) -> str:
-    """Default DiT precision: fp16-mixed for every model.
+    """Default DiT precision: fp16 for every model.
 
-    Medium used bf16 until 2026-07, when bounding the fp16-mixed RoPE island let
-    its attention core fuse — that made fp16-mixed 4.3x faster than before and
-    within ~3% of bf16, while staying accurate at long sequence (bf16 evaluates
-    RoPE's angle too coarsely past ~2048 rad and drifts).
+    (fp16 = FP16 trunk + FP32 RMSNorm/RoPE islands + an FMHA-fused FP16 attention
+    core. Medium used the now-retired bf16 tier until 2026-07, when bounding the
+    fp16 RoPE island let its attention core fuse — 4.3x faster than before and
+    accurate at long sequence, where bf16 drifted.)
     """
-    return DIT_DEFAULT_PRECISION.get(dit_name, "fp16mixed")
+    return DIT_DEFAULT_PRECISION.get(dit_name, "fp16")
 
 
 def get_dit_engine_path(dit_name: str, precision: str = None) -> Path:
@@ -320,15 +319,11 @@ def get_dit_engine_path(dit_name: str, precision: str = None) -> Path:
         raise ValueError(f"unknown dit={dit_name!r}; valid: {list(_DIT_SUBDIR)}")
     if precision is None:
         precision = default_precision(dit_name)
+    precision = normalize_precision(precision)
     if precision not in DIT_ENGINE_FILENAME:
         raise ValueError(f"unknown precision={precision!r}; valid: {PRECISIONS}")
-    if precision == "bf16" and dit_name != "medium":
-        raise ValueError(
-            f"precision='bf16' is only available for --dit medium (FMHA-fused); "
-            f"{dit_name} uses standard attention and already fuses in fp16mixed. "
-            f"Valid for {dit_name}: {_DIT_PRECISIONS.get(dit_name)}")
     # fp8 is available for all three DiTs (medium: baked-RoPE + bf16 attn; sm-music/
-    # sm-sfx: fp8-QDQ graft on their fp16mixed graph). Only bf16 stays medium-only.
+    # sm-sfx: fp8-QDQ graft on their fp16 graph).
     return ARCH_DIR / _DIT_SUBDIR[dit_name] / DIT_ENGINE_FILENAME[precision]
 
 
@@ -336,7 +331,8 @@ def get_decoder_engine_path(decoder_name: str, precision: str = None) -> Path:
     if decoder_name not in DECODER_ENGINE_FILENAME:
         raise ValueError(f"unknown decoder={decoder_name!r}; valid: {list(DECODER_ENGINE_FILENAME)}")
     if precision is None:
-        precision = "fp16mixed"   # decoders have no bf16-specific engine; canonical
+        precision = "fp16"   # decoders track the canonical (fp16) engine
+    precision = normalize_precision(precision)
     if precision not in DECODER_ENGINE_FILENAME[decoder_name]:
         raise ValueError(f"unknown precision={precision!r}; valid: {PRECISIONS}")
     return ARCH_DIR / decoder_name / DECODER_ENGINE_FILENAME[decoder_name][precision]
@@ -346,10 +342,11 @@ def get_engine_files(dit_name: str, decoder_name: str, precision: str = None,
                        with_encoder: bool = False, dec_tier: str = "canonical") -> list[str]:
     """Relative paths (under ARCH_DIR) needed for the chosen pipeline. Pass this
     list to _ensure_files() to auto-download anything missing from HF.
-    precision=None resolves to the per-model default (fp16-mixed); dec_tier picks the
+    precision=None resolves to the per-model default (fp16); dec_tier picks the
     decoder/encoder quantization tier (canonical / fp8 / fp8_fast)."""
     if precision is None:
         precision = default_precision(dit_name)
+    precision = normalize_precision(precision)
     files = list(SHARED_FILES)
     files.append(f"{_DIT_SUBDIR[dit_name]}/{DIT_ENGINE_FILENAME[precision]}")
     if dec_tier == "canonical":   # precision-driven canonical/fp32 decoder (back-compat)
@@ -1149,14 +1146,14 @@ def prompt_user_if_missing(args):
         suggested = DIT_CHOICES[args.dit]["default_decoder"]
         args.decoder = _arrow_pick("Choose audio decoder:", list(DECODER_PATHS.keys()), default=suggested)
         print(f"  → {args.decoder}")
-    # Resolve DiT precision default per model: fp16-mixed everywhere. bf16 is
-    # medium-only and selectable (sm-music / sm-sfx use standard attention and
-    # already fuse in fp16mixed).
+    # Resolve DiT precision: default fp16 for every model. Retired tokens
+    # (fp16mixed, bf16) alias to fp16 with a one-line note.
     if getattr(args, "precision", None) is None:
         args.precision = default_precision(args.dit)
-    if args.precision == "bf16" and args.dit != "medium":
-        sys.exit("error: --precision bf16 is only available for --dit medium "
-                 "(sm-music / sm-sfx already fuse in fp16mixed).")
+    elif args.precision in _PRECISION_ALIAS:
+        _canon = _PRECISION_ALIAS[args.precision]
+        print(f"  note: --precision {args.precision} is retired → using {_canon}", file=sys.stderr)
+        args.precision = _canon
     if args.seed is None:
         args.seed = random.randint(0, 2**31 - 1)
     return args
@@ -1208,20 +1205,18 @@ def main():
                     help="Decoder/encoder quantization tier (orthogonal to --precision, the DiT): "
                          "canonical (bf16) | fp8 (~1.14x, near-transparent) | fp8_fast (SAME-S only, "
                          "~1.22x). Auto-downloads from HF. (For max-fidelity decode use --precision fp32.)")
-    ap.add_argument("--precision", choices=list(PRECISIONS), default=None,
-                    help="DiT engine precision (default is 'fp16mixed' for every model). "
-                         "'fp16mixed' = FP16 trunk + FP32 RMSNorm/RoPE islands with an FMHA-fused "
+    ap.add_argument("--precision", choices=list(PRECISIONS) + list(_PRECISION_ALIAS), default=None,
+                    help="DiT engine precision (default 'fp16' for every model). "
+                         "'fp16' = FP16 trunk + FP32 RMSNorm/RoPE islands with an FMHA-fused "
                          "FP16 attention core (canonical; fp32-accurate at every length). "
                          "'fp8' = fp8 E4M3 linears (attention + RoPE kept higher precision). On MEDIUM "
                          "it's a max-speed clean tier (bf16 fused FMHA + baked fp32 RoPE, ~1.3× faster, "
                          "clean at long sequence, capped at L<=4096). On sm-music/sm-sfx it's a clean "
                          "weight-halving tier (479 vs 936 MB engine, velocity-cos ~0.99 vs eager) that is "
                          "only marginally faster (~1.1×; their small forward is overhead-bound at batch 1). "
-                         "'bf16' (MEDIUM ONLY) = ~3%% faster still, but it evaluates RoPE's angle "
-                         "in bf16 and drifts at long sequence (clips 2-3%% of samples on a 6-min "
-                         "render); fine for short clips, not seed-reproducible vs fp16mixed. "
                          "'fp32' = pure FP32, matches PyTorch eager bit-for-bit but ~2× slower "
-                         "and ~2× the VRAM. Engines auto-download from HF if missing.")
+                         "and ~2× the VRAM. ('fp16mixed' and the retired medium-only 'bf16' are accepted "
+                         "as deprecated aliases for 'fp16'.) Engines auto-download from HF if missing.")
     ap.add_argument("--models-dir", default=str(MODELS_DIR),
                     help=f"Directory containing the TRT engines. Default: {MODELS_DIR}")
     # ── Sampling ──
@@ -1278,7 +1273,7 @@ def main():
     if args.models_dir != str(MODELS_DIR):
         new_root = Path(args.models_dir).resolve()
         new_arch_dir = new_root / ARCH
-        T5GEMMA_PATH = new_arch_dir / "t5gemma" / "t5gemma_fp16mixed.trt"
+        T5GEMMA_PATH = new_arch_dir / "t5gemma" / "t5gemma_fp16.trt"
         for kk in DIT_CHOICES:
             DIT_CHOICES[kk]["engine"] = new_arch_dir / DIT_CHOICES[kk]["engine"].relative_to(ARCH_DIR)
         for kk in DECODER_PATHS:

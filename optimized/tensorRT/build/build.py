@@ -52,7 +52,7 @@ def _from_onnx(name):
 TARGETS = [
     {"label": "t5gemma  (text encoder + tokenizer)",
      "command": _from_onnx("t5gemma"),
-     "outputs": ["t5gemma/t5gemma_fp16mixed.trt", "t5gemma/tokenizer.json"]},
+     "outputs": ["t5gemma/t5gemma_fp16.trt", "t5gemma/tokenizer.json"]},
     {"label": "same-s encoder",
      "command": _from_onnx("same-s-encoder"),
      "outputs": ["same-s/enc_dynamic_bf16.trt"]},
@@ -84,19 +84,19 @@ TARGETS = [
     # spacing is 32 rad — more than a full 2*pi rotation).
     {"label": "DiT medium  (SA3-M, FP16-mixed — medium DEFAULT, attention-fused)",
      "command": _from_onnx("sa3-m"),
-     "outputs": ["sa3-m/dit_fp16mixed.trt"]},
+     "outputs": ["sa3-m/dit_fp16.trt"]},
     {"label": "DiT medium  (SA3-M, bf16 — selectable; drifts at long sequence)",
      "command": _from_onnx("sa3-m-bf16"),
      "outputs": ["sa3-m/dit_bf16.trt"]},
-    {"label": "DiT medium  (SA3-M, fp8 — selectable; MAX-SPEED clean tier, ~1.3x over fp16mixed)",
+    {"label": "DiT medium  (SA3-M, fp8 — selectable; MAX-SPEED clean tier, ~1.3x over fp16)",
      "command": _from_onnx("sa3-m-fp8"),
      "outputs": ["sa3-m/dit_fp8.trt"]},
     {"label": "DiT sm-music (FP16-mixed)",
      "command": _from_onnx("sa3-sm-music"),
-     "outputs": ["sa3-sm-music/dit_fp16mixed.trt"]},
+     "outputs": ["sa3-sm-music/dit_fp16.trt"]},
     {"label": "DiT sm-sfx (FP16-mixed)",
      "command": _from_onnx("sa3-sm-sfx"),
-     "outputs": ["sa3-sm-sfx/dit_fp16mixed.trt"]},
+     "outputs": ["sa3-sm-sfx/dit_fp16.trt"]},
     # FP32 variants — opt-in. ~2× engine size, ~2× slower, but bit-equivalent
     # to PyTorch eager. Useful for precision-debug or reference comparisons.
     {"label": "[opt-in] same-l decoder FP32",

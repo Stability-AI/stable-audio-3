@@ -61,11 +61,11 @@ Validated results (sa3-sm-music, L=1292):
   - Engine size: 926 MB (BF16: 935 MB, FP32: 1842 MB)
 
 Usage:
-    python build_dit_fp16mixed.py
+    python build_dit_fp16.py
         [--mode {minimal,rope,full}]      # default: rope
         [--input  /tmp/dit_sm-music_fixed_v2.onnx]
-        [--onnx   /tmp/dit_sm-music_fp16mixed.onnx]
-        [--engine .../models/sm_90/sa3-sm-music/dit_fp16mixed.trt]
+        [--onnx   /tmp/dit_sm-music_fp16.onnx]
+        [--engine .../models/sm_90/sa3-sm-music/dit_fp16.trt]
 """
 import argparse
 import os
@@ -1001,7 +1001,7 @@ def manual_convert_to_fp16(model, blocked_names):
     return model
 
 
-def convert_to_fp16mixed(input_onnx, output_onnx, mode="minimal", bound_attn=True):
+def convert_to_fp16(input_onnx, output_onnx, mode="minimal", bound_attn=True):
     """Load FP32 ONNX, identify FP32 islands, convert everything else to
     FP16, and save."""
     import onnx
@@ -1142,11 +1142,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input",  default="/tmp/dit_sm-music_fixed_v2.onnx",
                     help="Input FP32 ONNX")
-    ap.add_argument("--onnx",   default="/tmp/dit_sm-music_fp16mixed.onnx",
+    ap.add_argument("--onnx",   default="/tmp/dit_sm-music_fp16.onnx",
                     help="Output FP16-mixed ONNX (intermediate)")
     ap.add_argument("--engine", default="/weka2/cj/clod/sa3s/stable-audio-3/"
                                        "optimized/tensorRT/models/sm_90/"
-                                       "sa3-sm-music/dit_fp16mixed.trt",
+                                       "sa3-sm-music/dit_fp16.trt",
                     help="Output TRT engine path")
     ap.add_argument("--workspace-gb", type=int, default=16)
     ap.add_argument("--mode", choices=("minimal", "rope", "full"),
@@ -1168,7 +1168,7 @@ def main():
 
     if not args.skip_convert:
         print(f"━━━ Convert FP32 ONNX -> FP16-mixed ONNX (mode={args.mode}) ━━━")
-        convert_to_fp16mixed(args.input, args.onnx, mode=args.mode,
+        convert_to_fp16(args.input, args.onnx, mode=args.mode,
                              bound_attn=not args.no_bound_attn)
 
     if not args.skip_build:

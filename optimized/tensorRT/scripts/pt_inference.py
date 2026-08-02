@@ -35,7 +35,7 @@ if SAT_PATH not in sys.path:
 
 # Defaults — matches the user's "medium / SAME-L / fp32" scope.
 PT_MODEL_DIR = Path("/weka2/cj/clod/sa3s/models/SA3-M-hf")
-T5_TRT_PATH = TRT_REPO / "models" / "sm_90" / "t5gemma" / "t5gemma_fp16mixed.trt"
+T5_TRT_PATH = TRT_REPO / "models" / "sm_90" / "t5gemma" / "t5gemma_fp16.trt"
 SAMEL_CKPT_DIR = Path("/weka2/cj/clod/sa3s/models/SAME-L")  # local SAME-L = TRT decoder's weight source
 SAMES_CKPT_DIR = Path("/weka2/cj/clod/sa3s/models/SAME-S")  # local SAME-S = TRT SAME-S decoder's weight source
 

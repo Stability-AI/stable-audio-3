@@ -119,30 +119,32 @@ Omit `--dit` / `--decoder` for an interactive arrow-key picker. Relative
 
 ### DiT precision (`--precision`)
 
-`fp16mixed` is the default for every model — no flag needed for the recommended setup:
+`fp16` is the default for every model — no flag needed for the recommended setup:
 
 | model            | default     | why                                                        |
 |------------------|-------------|------------------------------------------------------------|
-| `medium`         | `fp16mixed` | FMHA-fused (96 fused attention nodes) **and** fp32-accurate at every length |
-| `sm-music`/`sm-sfx` | `fp16mixed` | standard attention — already fuses in fp16-mixed           |
+| `medium`         | `fp16` | FMHA-fused (96 fused attention nodes) **and** fp32-accurate at every length |
+| `sm-music`/`sm-sfx` | `fp16` | standard attention — already fuses in fp16           |
 
-`--precision` also takes `fp8` (all DiTs), `bf16` (medium only) and `fp32` explicitly:
+`--precision` also takes `fp8` (all DiTs) and `fp32` explicitly:
 
-- **`fp16mixed`** — canonical: FP16 trunk, FP32 islands around RMSNorm and RoPE
-  generation, and an FP16 attention core (QK^T → Softmax → P·V) so TRT's FMHA fuser
-  fires. Teacher-forced velocity cos **1.0000** vs the FP32 engine at every length.
-  Bit-reproducible run to run.
-  <br>Medium used to default to `bf16` because this engine's attention core was
-  stuck in FP32 and therefore unfused — 0 fused MHA nodes. Bounding the RoPE island
-  before QK^T fixed that (**4.3× faster at L=4096**), which retired the reason to
-  prefer `bf16`. Engines built before 2026-07 are the slow variant; rebuild with
+- **`fp16`** — canonical **and default for every DiT** (formerly `fp16mixed`; every
+  tier is mixed-precision, so the qualifier was dropped). FP16 trunk, FP32 islands
+  around RMSNorm and RoPE generation, and an FP16 attention core (QK^T → Softmax →
+  P·V) so TRT's FMHA fuser fires. Teacher-forced velocity cos **1.0000** vs the FP32
+  engine at every length. Bit-reproducible run to run.
+  <br>Medium used to default to a uniform-`bf16` engine because this engine's
+  attention core was stuck in FP32 and therefore unfused — 0 fused MHA nodes.
+  Bounding the RoPE island before QK^T fixed that (**4.3× faster at L=4096**), which
+  retired the `bf16` tier entirely (it also drifted at long sequence — see below).
+  Engines built before 2026-07 are the slow variant; rebuild with
   `build_from_onnx.py sa3-m`.
 - **`fp8`** — *medium: the max-speed clean tier, calibrated; sm-music/sm-sfx: a clean
   weight-halving tier (see the end of this bullet).* On **medium**: fp8 E4M3 on the 176
   linear GEMMs + bf16 fused FMHA (96 nodes) + a **baked fp32 RoPE constant table** (position
   cos/sin computed host-side at build and frozen as a graph constant — no in-graph trig,
   so the island is precision-policy-robust and cross-runtime-stable). **~1.3× faster than
-  `fp16mixed` at every length** (H200, same-run round-robin: 1.40× @L129 / 1.32× @L1292 /
+  `fp16` at every length** (H200, same-run round-robin: 1.40× @L129 / 1.32× @L1292 /
   1.34× @L4092 — also ahead of `bf16`) and **clean at long sequence** (latent std 0.86 vs
   eager 0.95, **0.000% clip** at 2-min and 6-min), so it stays clean exactly where `bf16`
   clips. The fp8 scales are **calibrated on real conditioning** (per-tensor activation amax +
@@ -151,41 +153,37 @@ Omit `--dit` / `--decoder` for an interactive arrow-key picker. Relative
   velocity-cos vs fp32 on adversarial seeds **0.52/0.57/0.64 → 0.92/0.94/0.92** (steps 1–7
   match the fully-calibrated reference within ~0.001). It remains a **speed tier over an
   already-good default, not a fidelity upgrade over it**: single-step velocity cos ~0.92–0.94
-  (below fp16mixed's ~1.0) but the 8-step render stays coherent — it just no longer collapses
+  (below fp16's ~1.0) but the 8-step render stays coherent — it just no longer collapses
   at the highest-noise first step the way the uncalibrated engine did. **Capped at L≤4096** —
   the baked table is sized to the profile max, which is *also* the SAME-L decoder's own cap,
   so this is not a new end-to-end limit; longer renders are rejected (a re-bake would be
-  needed). **Not seed-reproducible vs fp16-mixed.** Built weakly-typed `EXPLICIT_BATCH` +
+  needed). **Not seed-reproducible vs fp16.** Built weakly-typed `EXPLICIT_BATCH` +
   `BF16` + `FP8` + `OBEY_PRECISION_CONSTRAINTS` (rebuild: `build_from_onnx.py sa3-m-fp8`;
   producer: `build/build_dit_bf16.py` RoPE-baker + `build/transplant_scales.py` calibrated-scale
   transplant; identity check: `scripts/verify_fp8_rope.py`; calibration by @ryanontheinside,
   [#47](https://github.com/Stability-AI/stable-audio-3/pull/47)).
   <br>On **sm-music / sm-sfx** fp8 is a **different, simpler recipe** — fp8 E4M3 grafted onto
-  the linear GEMMs of the fp16mixed graph (attention stays fp16-fused, fp32 islands untouched;
+  the linear GEMMs of the fp16 graph (attention stays fp16-fused, fp32 islands untouched;
   no baked RoPE — these DiTs never had bf16's long-angle problem). It's a **clean weight-halving
-  tier** (engine 479 vs 936 MB, velocity-cos **~0.99** vs eager, clip% at/below fp16mixed) that
+  tier** (engine 479 vs 936 MB, velocity-cos **~0.99** vs eager, clip% at/below fp16) that
   is only **marginally faster (~1.1×)**: a small DiT's ~5 ms forward at batch 1 is overhead-bound,
-  so fp8's GEMM savings barely show. Default stays fp16mixed. Rebuild: `build_from_onnx.py
+  so fp8's GEMM savings barely show. Default stays fp16. Rebuild: `build_from_onnx.py
   sa3-sm-music-fp8` / `sa3-sm-sfx-fp8`; producer: `build/make_dit_fp8_smalldit.py`. Not
-  seed-reproducible vs fp16mixed.
-- **`bf16`** — *medium only.* Same `dit.onnx` as fp32, built with `BuilderFlag.BF16`;
-  a uniform bf16 trunk also lets the FMHA fuser fire, and it is ~3% faster than
-  `fp16mixed`. **But it drifts at long sequence**: weakly-typed BF16 lets TRT
-  evaluate RoPE's rotation angle in bf16, and that angle reaches ~4155 rad at
-  L=4092 where bf16's spacing is 32 rad (bigger than a full 2π rotation), so
-  position information for the fast-rotating dims is destroyed. The latent inflates
-  ~2.5× over the 8 steps and a 6-minute render clips 2–3% of samples. Clean at short
-  lengths; use `fp16mixed` for anything long. Also **not seed-reproducible vs
-  fp16-mixed** — a different-but-equal take per seed. Same varlen profile
-  (L 1..4096, opt 1292) and full mode/feature set as the other precisions.
+  seed-reproducible vs fp16.
 - **`fp32`** — pure FP32, bit-equivalent to PyTorch eager (~2× slower, ~2× VRAM).
 
+> **Retired: `bf16` (was medium-only).** A uniform-bf16 trunk was ~3% faster than
+> `fp16` but **drifted at long sequence** — weakly-typed BF16 evaluated RoPE's
+> rotation angle in bf16, which reaches ~4155 rad at L=4092 where bf16's spacing is
+> 32 rad (> 2π), destroying position info for the fast-rotating dims (latent inflates
+> ~2.5×, a 6-min render clips 2–3% of samples). `fp16` matches its FMHA fusion
+> without the drift, so `bf16` was removed. `--precision bf16` (and the old
+> `--precision fp16mixed`) now silently alias to `fp16`.
+
 ```bash
-# medium defaults to fp16mixed. fp8 is the max-speed clean tier (~1.3x faster at
-# every length, clean at long L where bf16 clips):
+# medium defaults to fp16. fp8 is the max-speed clean tier (~1.3x faster at
+# every length, clean at long sequence):
 ./sa3 --prompt "..." --dit medium --decoder same-l --precision fp8
-# bf16 trades long-sequence accuracy for the last ~3% of speed:
-./sa3 --prompt "..." --dit medium --decoder same-l --precision bf16
 ```
 
 The TRT DiT engines are static batch=1 (the ONNX bakes batch=1), so CFG runs as a
@@ -225,7 +223,7 @@ variance once the graph is built).
 
 ```bash
 .venv/bin/python scripts/bench_dit_profile.py \
-    --engines "canonical=models/sm_90/sa3-sm-music/dit_fp16mixed.trt" \
+    --engines "canonical=models/sm_90/sa3-sm-music/dit_fp16.trt" \
     --lvals 1,32,128,256,512,1024,1292,2048,4096 --warmup 3 --runs 7
 ```
 
@@ -275,10 +273,10 @@ optimized/tensorRT/
 │   └── build_dit_profile.py     ← DiT with custom (min, opt, max) profile shapes
 └── models/                      ← .trt engines (auto-downloaded per arch; ~8 GB)
     └── sm_<cc>/                 ← arch dir matches `nvidia-smi --query-gpu=compute_cap`
-        ├── t5gemma/t5gemma_fp16mixed.trt
-        ├── sa3-sm-music/dit_fp16mixed.trt
-        ├── sa3-sm-sfx/dit_fp16mixed.trt
-        ├── sa3-m/dit_fp16mixed.trt      ← + dit_fp8.trt / dit_bf16.trt / dit_fp32.trt if selected
+        ├── t5gemma/t5gemma_fp16.trt
+        ├── sa3-sm-music/dit_fp16.trt
+        ├── sa3-sm-sfx/dit_fp16.trt
+        ├── sa3-m/dit_fp16.trt      ← + dit_fp8.trt / dit_fp32.trt if selected
         ├── same-s/{enc,dec}_dynamic_bf16.trt
         └── same-l/{enc,dec}_dynamic_triton_swa.trt
 ```

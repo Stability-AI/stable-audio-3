@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+#
+# Wrapper around scripts/sa3_cpu_amx.py — the cpu-amx (torch-free C++ AMX) SA3 CLI.
+#
+# Interpreter resolution (first that works):
+#   1. $SA3_PYTHON            (export it to pin a specific python)
+#   2. $SCRIPT_DIR/.venv/bin/python
+#   3. python3 on PATH
+#
+# The runtime needs numpy + sentencepiece (+ soundfile/ffmpeg for non-wav input;
+# + torch & CUDA only for --init-audio / --inpaint-range). See requirements.txt.
+#
+# Usage: ./sa3 --prompt "lofi house" --dit medium --decoder same-l --out a.wav
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+pick_python() {
+    if [[ -n "${SA3_PYTHON:-}" ]]; then echo "$SA3_PYTHON"; return; fi
+    if [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then echo "$SCRIPT_DIR/.venv/bin/python"; return; fi
+    command -v python3 || command -v python
+}
+PY="$(pick_python)"
+
+if [[ -z "$PY" ]] || ! "$PY" -c "import numpy" >/dev/null 2>&1; then
+    echo "error: no usable python with numpy found." >&2
+    echo "  set SA3_PYTHON to an interpreter that has numpy+sentencepiece," >&2
+    echo "  or create a .venv (see requirements.txt)." >&2
+    exit 1
+fi
+
+cd "$SCRIPT_DIR"
+exec "$PY" scripts/sa3_cpu_amx.py "$@"

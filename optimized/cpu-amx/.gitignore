@@ -1,0 +1,10 @@
+# Big engine binaries live on HF (stabilityai/stable-audio-3-optimized/cpu-amx);
+# weights.py pulls them at runtime. Never commit them here.
+*.so
+*.bin
+weights_manifest.txt
+weights_f32_manifest.txt
+hf/
+__pycache__/
+*.pyc
+*.wav

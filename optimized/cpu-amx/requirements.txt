@@ -1,0 +1,10 @@
+numpy>=1.24
+sentencepiece>=0.2
+# Non-WAV / non-44.1k init audio for --init-audio is decoded via ffmpeg if present.
+soundfile>=0.12
+# torch is needed ONLY for --init-audio / --inpaint-range (the fp32 AE init-encode).
+# Text-to-audio and CFG are 100% torch-free (C++ AMX + numpy). Install torch (with
+# CUDA if you have a GPU) only if you use audio-to-audio / inpainting:
+#   pip install torch
+# The C++ AMX engines (T5Gemma / DiT / SAME-S / SAME-L .so + weights) are imported
+# from their build directories by sys.path (see scripts/backends.py) — not pip deps.

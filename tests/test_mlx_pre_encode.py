@@ -10,13 +10,13 @@ import pytest
 pytest.importorskip("mlx.core")
 soundfile = pytest.importorskip("soundfile")
 
-import mlx.core as mx
+import mlx.core as mx  # noqa: E402
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "optimized" / "mlx" / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-import pre_encode_mlx as pe
+import pre_encode_mlx as pe  # noqa: E402
 
 SR = 44100
 
@@ -133,9 +133,7 @@ def test_long45_chunked_mono_and_txt_prompt(encoded, dataset):
 
     # >30 s took the chunked path; stub is stride-local → must match unchunked
     audio = pe.load_audio(dataset / "long45.wav")
-    ref = pe.encode_audio(
-        StubEncoder(), audio[None, ...], pad_modulo=32, chunked=False
-    )
+    ref = pe.encode_audio(StubEncoder(), audio[None, ...], pad_modulo=32, chunked=False)
     np.testing.assert_allclose(latents, np.asarray(ref.latents)[0], atol=1e-6)
     assert np.any(latents != 0.0)
 
@@ -192,9 +190,7 @@ def test_encode_file_seconds_rounding_and_mask():
     rng = np.random.default_rng(7)
     audio = rng.standard_normal((2, 130000)).astype(np.float32)
 
-    latents, mask, seconds_total = pe.encode_file(
-        StubEncoder(), audio, pad_modulo=32
-    )
+    latents, mask, seconds_total = pe.encode_file(StubEncoder(), audio, pad_modulo=32)
     assert seconds_total == round(130000 / SR, 3) == 2.948
     # 130000 → padded to 16*8192 = 131072 → 32 latents; ceil(130000/4096) = 32 valid
     assert latents.shape == (8, 32)
@@ -212,7 +208,9 @@ def test_encode_file_seconds_rounding_and_mask():
 
 def test_encode_file_rejects_non_stereo():
     with pytest.raises(ValueError, match=r"\(2, T\)"):
-        pe.encode_file(StubEncoder(), np.zeros((1, 8192), dtype=np.float32), pad_modulo=32)
+        pe.encode_file(
+            StubEncoder(), np.zeros((1, 8192), dtype=np.float32), pad_modulo=32
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -251,9 +249,7 @@ def test_load_audio_resamples_to_44100(tmp_path):
     assert audio.shape == (2, SR)
     # Still a ~110 Hz sine after resampling: correlate with the ideal signal
     ideal = 0.3 * np.sin(2 * np.pi * 110 * np.arange(SR) / SR)
-    corr = np.dot(audio[0], ideal) / (
-        np.linalg.norm(audio[0]) * np.linalg.norm(ideal)
-    )
+    corr = np.dot(audio[0], ideal) / (np.linalg.norm(audio[0]) * np.linalg.norm(ideal))
     assert corr > 0.99
 
 

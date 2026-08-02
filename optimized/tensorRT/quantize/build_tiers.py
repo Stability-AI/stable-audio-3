@@ -12,8 +12,9 @@ Profiles built here:
   encoder : audio  (1,2,1)   .. (1,2,2097152) .. (1,2,33554432)          # 1 samp  .. ~12:40
 
 SAME-S  -> weakly-typed EXPLICIT_BATCH + BF16 (+ FP8 builder flag for fp8/fp8_fast tiers).
-SAME-L  -> strongly-typed + diff_attn_swa plugin (PREFER_JIT) + NO FP8 flag
-           (the in-graph fp8 QDQ nodes carry the precision themselves).
+SAME-L  -> strongly-typed + diff_attn_swa plugin + NO FP8 flag (the in-graph fp8 QDQ nodes
+           carry the precision). Plugin impl is chosen by GPU arch: AOT on sm_120 (JIT isn't
+           stream-capturable there), JIT on sm_90 (override with SA3_SWA_PLUGIN=aot|jit).
 `--fp8` is required for fp8 / fp8_fast SAME-S tiers; harmless/ignored for SAME-L and w8/bf16.
 """
 import argparse, os, sys
@@ -27,12 +28,19 @@ def build(onnx_path, out_path, arch, kind, fp8):
     lg = trt.Logger(trt.Logger.ERROR)
     trt.init_libnvinfer_plugins(lg, "")
     strong = arch == "same-l"
-    if strong:
-        import diff_attn_nocast_plugin  # registers samel::diff_attn_swa (AOT + JIT impls)  # noqa: F401
     flags = 0
     if strong:
+        # SWA plugin: sm_120 (Blackwell) needs AOT — the JIT impl isn't stream-capturable there
+        # and silently drops the decode inside the runtime's mega-graph. sm_90 uses JIT. Choose by
+        # the GPU arch (override with SA3_SWA_PLUGIN=aot|jit); set it before importing the plugin.
+        import torch
+        gpu = "sm_%d%d" % torch.cuda.get_device_capability()
+        want_aot = gpu == "sm_120" or os.environ.get("SA3_SWA_PLUGIN") == "aot"
+        os.environ.setdefault("SA3_SWA_PLUGIN", "aot" if want_aot else "jit")
+        import diff_attn_nocast_plugin  # registers samel::diff_attn_swa (AOT + JIT impls)  # noqa: F401
         flags |= 1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
-        flags |= 1 << int(trt.NetworkDefinitionCreationFlag.PREFER_JIT_PYTHON_PLUGINS)
+        flags |= 1 << int(trt.NetworkDefinitionCreationFlag.PREFER_AOT_PYTHON_PLUGINS if want_aot
+                          else trt.NetworkDefinitionCreationFlag.PREFER_JIT_PYTHON_PLUGINS)
     else:
         flags |= 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
     b = trt.Builder(lg); net = b.create_network(flags); p = trt.OnnxParser(net, lg)

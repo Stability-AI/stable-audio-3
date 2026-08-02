@@ -534,9 +534,7 @@ def test_trainable_seconds_embedder_matches_pipeline_conditioner():
         assert actual.shape == (len(seconds), 1, 768)
         assert bool(mx.all(actual == expected))
     # mx.array input path (what the trainer passes) is bit-identical too.
-    assert bool(
-        mx.all(trainable(mx.array([12.5, 380.0])) == reference([12.5, 380.0]))
-    )
+    assert bool(mx.all(trainable(mx.array([12.5, 380.0])) == reference([12.5, 380.0])))
 
     report, _ = inject_from_lora_config(
         trainable,
@@ -546,9 +544,7 @@ def test_trainable_seconds_embedder_matches_pipeline_conditioner():
     layer = next(iter(iter_trainable_lora_layers(trainable)))
 
     assert report.layer_names == ("embedder.embedding.1",)
-    assert layer.checkpoint_name == (
-        "conditioners.seconds_total.embedder.embedding.1"
-    )
+    assert layer.checkpoint_name == ("conditioners.seconds_total.embedder.embedding.1")
     # Base Linear is frozen — only the adapter trains.
     assert sorted(
         name for name, _ in tree_flatten(trainable.trainable_parameters())
@@ -711,9 +707,7 @@ def test_reformulated_dora_gradients_match_naive(monkeypatch, adapter_type, dtyp
 
     new_flat = dict(tree_flatten(grads_new))
     old_flat = dict(tree_flatten(grads_old))
-    expected_params = (
-        {"M_xs"} if adapter_type.endswith("-xs") else {"lora_A", "lora_B"}
-    )
+    expected_params = {"M_xs"} if adapter_type.endswith("-xs") else {"lora_A", "lora_B"}
     if "dora" in adapter_type:
         expected_params = expected_params | {"magnitude"}
     elif "bora" in adapter_type:
@@ -722,9 +716,7 @@ def test_reformulated_dora_gradients_match_naive(monkeypatch, adapter_type, dtyp
     assert set(new_flat) == set(old_flat)
 
     tol = 1e-3 if dtype == mx.float32 else 3e-2
-    np.testing.assert_allclose(
-        float(loss_new), float(loss_old), rtol=tol, atol=tol
-    )
+    np.testing.assert_allclose(float(loss_new), float(loss_old), rtol=tol, atol=tol)
     for name in sorted(new_flat):
         np.testing.assert_allclose(
             np.asarray(new_flat[name], dtype=np.float32),
@@ -941,9 +933,7 @@ def test_checkpoint_key_naming_matches_real_underfit_checkpoint(tmp_path: Path):
         produced_keys.update(
             f"{root}.{param}" for param in ("lora_A", "lora_B", "magnitude")
         )
-    reference_dit_keys = {
-        key for key in reference_state if key.startswith("model.")
-    }
+    reference_dit_keys = {key for key in reference_state if key.startswith("model.")}
 
     assert produced_keys == reference_dit_keys
     assert report.layer_count == len(reference_dit_keys) // 3
@@ -953,9 +943,7 @@ def test_checkpoint_key_naming_matches_real_underfit_checkpoint(tmp_path: Path):
 
     # The saver reproduces a real medium DiT layer's keys AND shapes exactly.
     single = dit_mlx_medium.DiT(T_lat=8)
-    inject_from_lora_config(
-        single, dict(config, include=["layers.0.self_attn.to_qkv"])
-    )
+    inject_from_lora_config(single, dict(config, include=["layers.0.self_attn.to_qkv"]))
     saved_state, _ = load_lora_checkpoint(
         save_lora_checkpoint(single, tmp_path / "single-layer.safetensors")
     )

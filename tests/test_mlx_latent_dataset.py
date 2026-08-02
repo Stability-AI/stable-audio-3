@@ -15,14 +15,14 @@ from optimized.mlx.models.defs.latent_dataset import (
     iterate_batches,
 )
 
-D = 8          # latent channels
-CROP = 16      # latent_crop_length used throughout
+D = 8  # latent channels
+CROP = 16  # latent_crop_length used throughout
 
-LONG_T = 64        # stored length of the long item (> CROP)
-LONG_VALID = 50    # 1s in its padding mask (trailing zeros after)
+LONG_T = 64  # stored length of the long item (> CROP)
+LONG_VALID = 50  # 1s in its padding mask (trailing zeros after)
 LONG_SECONDS = 120.5
 
-SHORT_T = 6        # stored length of the short item (< CROP)
+SHORT_T = 6  # stored length of the short item (< CROP)
 SHORT_SECONDS = 2.786
 
 SILENCE_VALUE = 7.5
@@ -53,14 +53,22 @@ def _make_root(tmp_path, with_silence):
     root = tmp_path / ("latents" if with_silence else "latents_nosilence")
     root.mkdir()
     _write_item(
-        root, "long", LONG_T, LONG_SECONDS,
-        {"title": "Neon Skyline", "artist": "The Testers",
-         "genre": "Synthwave", "bpm": "120"},
+        root,
+        "long",
+        LONG_T,
+        LONG_SECONDS,
+        {
+            "title": "Neon Skyline",
+            "artist": "The Testers",
+            "genre": "Synthwave",
+            "bpm": "120",
+        },
         valid=LONG_VALID,
     )
     # "prompt" tag = what pre_encode extracts from a .txt sidecar caption
-    _write_item(root, "short", SHORT_T, SHORT_SECONDS,
-                {"prompt": "a lofi hip hop beat"})
+    _write_item(
+        root, "short", SHORT_T, SHORT_SECONDS, {"prompt": "a lofi hip hop beat"}
+    )
     if with_silence:
         # Reference stores silence as [1, C, N] (it squeezes axis 0 on load)
         silence = np.full((1, D, 4), SILENCE_VALUE, dtype=np.float32)
@@ -294,8 +302,12 @@ def test_legacy_prompt_without_prompt_config():
 
 def test_legacy_prompt_via_dataset(data_root):
     ds = PreEncodedLatentDataset(data_root, CROP)  # prompt_config=None → legacy
-    expected = {"Artist: The Testers", "Title: Neon Skyline",
-                "BPM: 120", "Genre: Synthwave"}
+    expected = {
+        "Artist: The Testers",
+        "Title: Neon Skyline",
+        "BPM: 120",
+        "Genre: Synthwave",
+    }
     for _ in range(20):
         prompt = _get_by_relpath(ds, "long.npy")["prompt"]
         assert prompt
@@ -308,7 +320,8 @@ def test_txt_derived_prompt_tag(data_root):
     assert _get_by_relpath(ds, "short.npy")["prompt"] == "Prompt: a lofi hip hop beat"
 
     ds = PreEncodedLatentDataset(
-        data_root, CROP,
+        data_root,
+        CROP,
         prompt_config={"shuffle": False, "hide_tag_names": True},
     )
     assert _get_by_relpath(ds, "short.npy")["prompt"] == "a lofi hip hop beat"
@@ -322,6 +335,11 @@ def test_path_prompt_and_space_joined_trigger():
     assert build_prompt(meta, pc, rng) == "artistX/track01"
 
     # non-tag method → trigger joined with a space, not ", "
-    pc = {"use_tags": False, "use_paths": True,
-          "path_opts": {"hideExt": True}, "trigger": "zkq", "trigger_pct": 100}
+    pc = {
+        "use_tags": False,
+        "use_paths": True,
+        "path_opts": {"hideExt": True},
+        "trigger": "zkq",
+        "trigger_pct": 100,
+    }
     assert build_prompt(meta, pc, rng) == "zkq artistX/track01"

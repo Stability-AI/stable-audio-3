@@ -16,40 +16,59 @@ So `dec_fp8` is *faster*; `dec_w8_bf16` is just *smaller*.
 
 ## Tiers at a glance
 
-dB is PSNR vs the **bf16 baseline** (a heuristic — confirm the near-transparent tiers by ear;
-`_fast` will have audible artifacts). Speed is whole-decoder median at seq 1292 (~2 min audio).
+The **bf16 baseline is the first row** of each table. Decoder dB is PSNR vs that bf16 baseline; encoder
+dB/cos is vs **eager** encode (the latent). dB is a heuristic — confirm near-transparent tiers by ear;
+`_fast` has audible artifacts. Speed is whole-model median at seq 1292 (~2 min audio).
 
-### SAME-S — baseline `dec_dynamic_bf16.onnx`: 7.25 ms @1292 · 23.2 ms @4096 · 218 MB
+### SAME-S decoder
 
-| file | quantized | compute | size | speed | dB vs bf16 (music / sfx) |
+| file | quantized | compute | onnx | speed | dB vs bf16 (music / sfx) |
 |---|---|---|---|---|---|
+| `dec_dynamic_bf16.onnx` | — *(bf16 baseline)* | bf16 | 219 MB | 1.00× | ref (7.25 ms @1292 · 23.2 @4096) |
 | `dec_w8_bf16.onnx` | int8 weights (all linears) | bf16 | 59 MB | 1.00× | 38.2 / 50.0 · transparent |
 | `dec_fp8.onnx` | fp8 weights + activations (FFN) | fp8 FFN GEMM | 58 MB | **1.14×** | 30.9 / 41.0 · near-transparent |
 | `dec_fp8_fast.onnx` | fp8 weights + activations (all linears) | fp8 all GEMMs | 58 MB | **1.22×** | 26.1 / 36.5 · lossy |
 
-### SAME-L — baseline `dec_dynamic_triton_swa.onnx`: 54.0 ms @1292 · 174.4 ms @4096 · 1192 MB
+### SAME-L decoder
 
-| file | quantized | compute | size | speed | dB vs bf16 |
+| file | quantized | compute | onnx | speed | dB vs bf16 |
 |---|---|---|---|---|---|
+| `dec_dynamic_triton_swa.onnx` | — *(bf16 baseline)* | bf16 | 1193 MB | 1.00× | ref (54.0 ms @1292 · 174.4 @4096) |
 | `dec_w8_bf16.onnx` | int8 weights (FFN) | bf16 | 937 MB | 1.00× | 51.4 · transparent |
 | `dec_fp8.onnx` | fp8 weights + activations (FFN) | fp8 FFN GEMM | 937 MB | **1.15×** | 43.4 · near-transparent |
 
 SAME-L has **no `_fast` tier**: its attention projections are fp32 islands (fp8 there collapses quality — see islands below).
 
-### Encoders (same tiers, same grafters)
+### SAME-S encoder
 
-The encoders share the decoders' architecture, so the same tiers apply — but the **encoder is cheap**
-(~1 ms SAME-S, ~7 ms SAME-L), so quant buys **size, not speed**. `w8_bf16` is the useful encoder tier.
-dB/cos vs eager encode (the latent):
+The **encoder is cheap** (~1 ms SAME-S, ~7 ms SAME-L), so quant buys **size, not speed** — `w8_bf16` is the useful encoder tier.
 
-| file | SAME-S enc | SAME-L enc |
-|---|---|---|
-| `enc_w8_bf16.onnx` | 36.2 dB · cos 0.997 · transparent | 44.5 dB · cos 0.9995 · transparent |
-| `enc_fp8.onnx` | 29.9 dB · cos 0.986 · near-transparent | 30.8 dB · cos 0.989 · near-transparent |
-| `enc_fp8_fast.onnx` | 22.3 dB · cos 0.924 · lossy | — (fp32 islands) |
+| file | quantized | compute | onnx | speed | dB / cos vs eager |
+|---|---|---|---|---|---|
+| `enc_dynamic_bf16.onnx` | — *(bf16 baseline)* | bf16 | 216 MB | 1.00× | 36.4 / 0.997 (~1 ms) |
+| `enc_w8_bf16.onnx` | int8 weights | bf16 | 54 MB | 1.00× | 36.2 / 0.997 · transparent |
+| `enc_fp8.onnx` | fp8 (FFN) | fp8 FFN GEMM | 54 MB | 1.08× | 29.9 / 0.986 · near-transparent |
+| `enc_fp8_fast.onnx` | fp8 (all linears) | fp8 all GEMMs | 54 MB | 1.14× | 22.3 / 0.924 · lossy |
+
+### SAME-L encoder
+
+| file | quantized | compute | onnx | speed | dB / cos vs eager |
+|---|---|---|---|---|---|
+| `enc_dynamic_triton_swa.onnx` | — *(bf16 baseline)* | bf16 | 1192 MB | 1.00× | 46.0 / 0.9997 (~7 ms) |
+| `enc_w8_bf16.onnx` | int8 weights (FFN) | bf16 | 895 MB | 1.02× | 44.5 / 0.9995 · transparent |
+| `enc_fp8.onnx` | fp8 (FFN) | fp8 FFN GEMM | 895 MB | 1.03× | 30.8 / 0.989 · near-transparent |
 
 Encoder input is audio `(1,2,N)`; output latent `(1,256,N/4096)`. **Every encoder onnx carries a
 silence-pad node** (see below), so any `N` is accepted.
+
+### `fp8` vs `fp8_fast`
+
+Both run the **FFN** GEMMs (`ff.0` / `ff.2`) in fp8. The difference is the **attention projections**:
+- **`fp8`** leaves `to_qkv` / `to_out` in bf16 compute (weight-only fp8 for storage) — attention inputs
+  stay full-precision → near-transparent.
+- **`fp8_fast`** runs `to_qkv` / `to_out` in fp8 too — the extra **+0.08×** (1.14 → 1.22×), but it
+  fp8-rounds Q/K/V *before* the still-bf16 attention core, and the softmax path is fp8-sensitive → the
+  quality drop (31 → 26 dB). SAME-S only.
 
 ---
 

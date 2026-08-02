@@ -244,25 +244,27 @@ DECODER_ENGINE_FILENAME = {
 PRECISIONS = ("bf16", "fp8", "fp16mixed", "fp32")
 
 # ── Decoder / encoder quantization TIERS (orthogonal to the DiT --precision) ──
-# Train-free fp8 / int8-weight tiers grafted onto the bf16 export (see quantize/README.md).
+# Train-free fp8 tiers grafted onto the bf16 export (see quantize/README.md).
 # "canonical" = the shipped bf16/fp16-mixed engine. The others are downloaded from HF on demand
 # (tensorRT/<arch>/<same-*>/dec_*.trt) — the same wide-profile engines built by quantize/build_tiers.py.
 #   fp8       fp8 FFN GEMMs (near-transparent, ~1.14×) — the speed pick
-#   w8_bf16   int8 weight-only storage, bf16 compute (transparent, same speed, smaller download)
 #   fp8_fast  SAME-S only: fp8 on the attention projections too (~1.22×, lossier)
+# (int8-weight-only "w8_bf16" was retired: its DequantizeLinear constant-folds to bf16 at build, so
+#  the engine was byte-for-byte the size/speed of the bf16 baseline with slightly lossier weights —
+#  strictly dominated. For a max-fidelity decoder use --precision fp32.)
 DECODER_TIER_FILENAME = {
     "same-s": {"canonical": DECODER_ENGINE_FILENAME["same-s"]["bf16"],
-               "w8_bf16": "dec_w8_bf16.trt", "fp8": "dec_fp8.trt", "fp8_fast": "dec_fp8_fast.trt"},
+               "fp8": "dec_fp8.trt", "fp8_fast": "dec_fp8_fast.trt"},
     "same-l": {"canonical": DECODER_ENGINE_FILENAME["same-l"]["fp16mixed"],
-               "w8_bf16": "dec_w8_bf16.trt", "fp8": "dec_fp8.trt"},
+               "fp8": "dec_fp8.trt"},
 }
 ENCODER_TIER_FILENAME = {
     "same-s": {"canonical": "enc_dynamic_bf16.trt",
-               "w8_bf16": "enc_w8_bf16.trt", "fp8": "enc_fp8.trt", "fp8_fast": "enc_fp8_fast.trt"},
+               "fp8": "enc_fp8.trt", "fp8_fast": "enc_fp8_fast.trt"},
     "same-l": {"canonical": "enc_dynamic_triton_swa.trt",
-               "w8_bf16": "enc_w8_bf16.trt", "fp8": "enc_fp8.trt"},
+               "fp8": "enc_fp8.trt"},
 }
-DECODER_TIERS = ("canonical", "w8_bf16", "fp8", "fp8_fast")
+DECODER_TIERS = ("canonical", "fp8", "fp8_fast")
 
 
 def get_decoder_tier_path(decoder_name: str, tier: str = "canonical") -> Path:
@@ -345,7 +347,7 @@ def get_engine_files(dit_name: str, decoder_name: str, precision: str = None,
     """Relative paths (under ARCH_DIR) needed for the chosen pipeline. Pass this
     list to _ensure_files() to auto-download anything missing from HF.
     precision=None resolves to the per-model default (fp16-mixed); dec_tier picks the
-    decoder/encoder quantization tier (canonical / fp8 / w8_bf16 / fp8_fast)."""
+    decoder/encoder quantization tier (canonical / fp8 / fp8_fast)."""
     if precision is None:
         precision = default_precision(dit_name)
     files = list(SHARED_FILES)
@@ -1204,8 +1206,8 @@ def main():
                          "'same-l' pairs with medium (1.2 GB engine). Interactive picker if omitted.")
     ap.add_argument("--dec-precision", choices=list(DECODER_TIERS), default="canonical",
                     help="Decoder/encoder quantization tier (orthogonal to --precision, the DiT): "
-                         "canonical (bf16) | fp8 (~1.14x, near-transparent) | w8_bf16 (int8 weight-only, "
-                         "transparent, smaller) | fp8_fast (SAME-S only, ~1.22x). Auto-downloads from HF.")
+                         "canonical (bf16) | fp8 (~1.14x, near-transparent) | fp8_fast (SAME-S only, "
+                         "~1.22x). Auto-downloads from HF. (For max-fidelity decode use --precision fp32.)")
     ap.add_argument("--precision", choices=list(PRECISIONS), default=None,
                     help="DiT engine precision (default is 'fp16mixed' for every model). "
                          "'fp16mixed' = FP16 trunk + FP32 RMSNorm/RoPE islands with an FMHA-fused "

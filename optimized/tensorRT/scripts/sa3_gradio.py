@@ -89,7 +89,7 @@ def discover_variants(dit_name: str) -> list[tuple[str, Path]]:
 
 def discover_decoder_variants(decoder_name: str) -> list[tuple[str, Path]]:
     """Return [(label, path)] of decoder quantization tiers for this decoder —
-    canonical first. Uses the known tier set (canonical / fp8 / w8_bf16 / fp8_fast;
+    canonical first. Uses the known tier set (canonical / fp8 / fp8_fast;
     see quantize/README.md); engines auto-download from HF on selection if missing.
     Any extra local dec_*.trt not in the known set are appended.
     """

@@ -4,13 +4,18 @@ Train-free quantized variants of the Stable Audio 3 **encoders and decoders**, e
 **self-contained ONNX** derived from the published bf16 export. TensorRT builds the engine; quality is
 preserved by GPTQ weight-error compensation and per-op precision placement (details below).
 
-Two knobs, three tiers:
+Two tiers, both derived from the published bf16 export:
 
-- **`fp8`** names a **compute** format — the GEMM runs on fp8 tensor cores → real speedup.
-- **`w8_bf16`** names a **weight** format — int8 weights, **bf16 compute**. Storage only: smaller file, *no* speedup.
-- **`_fast`** = fp8 pushed into the attention projections too — faster, lower quality.
+- **`fp8`** — fp8 **compute** on the FFN GEMMs (fp8 tensor cores) → real speedup **and** a smaller engine, near-transparent.
+- **`fp8_fast`** — fp8 pushed into the attention projections too (SAME-S only) — faster still, lower quality.
 
-So `dec_fp8` is *faster*; `dec_w8_bf16` is just *smaller*.
+For max fidelity, use the bf16 baseline (or `--precision fp32`).
+
+> **Retired — `w8_bf16` (int8 weight-only).** Its `DequantizeLinear` constant-folds to bf16 at build, so
+> the *engine* came out byte-for-byte the size and speed of the bf16 baseline (only the *ONNX* was
+> smaller) with slightly lossier weights — strictly dominated by bf16. The lesson worth keeping: **ONNX
+> size ≠ engine size.** fp8 stays 1-byte all the way through (small ONNX *and* small engine *and* fp8
+> math); an int8-weight-only tier only shrinks the download, then expands back to bf16 in the engine.
 
 ---
 
@@ -25,7 +30,6 @@ dB/cos is vs **eager** encode (the latent). dB is a heuristic — confirm near-t
 | file | quantized | compute | onnx | speed | dB vs bf16 (music / sfx) |
 |---|---|---|---|---|---|
 | `dec_dynamic_bf16.onnx` | — *(bf16 baseline)* | bf16 | 219 MB | 1.00× | ref (7.25 ms @1292 · 23.2 @4096) |
-| `dec_w8_bf16.onnx` | int8 weights (all linears) | bf16 | 59 MB | 1.00× | 38.2 / 50.0 · transparent |
 | `dec_fp8.onnx` | fp8 weights + activations (FFN) | fp8 FFN GEMM | 58 MB | **1.14×** | 30.9 / 41.0 · near-transparent |
 | `dec_fp8_fast.onnx` | fp8 weights + activations (all linears) | fp8 all GEMMs | 58 MB | **1.22×** | 26.1 / 36.5 · lossy |
 
@@ -34,19 +38,17 @@ dB/cos is vs **eager** encode (the latent). dB is a heuristic — confirm near-t
 | file | quantized | compute | onnx | speed | dB vs bf16 |
 |---|---|---|---|---|---|
 | `dec_dynamic_triton_swa.onnx` | — *(bf16 baseline)* | bf16 | 1193 MB | 1.00× | ref (54.0 ms @1292 · 174.4 @4096) |
-| `dec_w8_bf16.onnx` | int8 weights (FFN) | bf16 | 937 MB | 1.00× | 51.4 · transparent |
 | `dec_fp8.onnx` | fp8 weights + activations (FFN) | fp8 FFN GEMM | 937 MB | **1.15×** | 43.4 · near-transparent |
 
 SAME-L has **no `_fast` tier**: its attention projections are fp32 islands (fp8 there collapses quality — see islands below).
 
 ### SAME-S encoder
 
-The **encoder is cheap** (~1 ms SAME-S, ~7 ms SAME-L), so quant buys **size, not speed** — `w8_bf16` is the useful encoder tier.
+The **encoder is cheap** (~1 ms SAME-S, ~7 ms SAME-L), so quant mostly buys **size** — `fp8` shrinks both the onnx and the engine.
 
 | file | quantized | compute | onnx | speed | dB / cos vs eager |
 |---|---|---|---|---|---|
 | `enc_dynamic_bf16.onnx` | — *(bf16 baseline)* | bf16 | 216 MB | 1.00× | 36.4 / 0.997 (~1 ms) |
-| `enc_w8_bf16.onnx` | int8 weights | bf16 | 54 MB | 1.00× | 36.2 / 0.997 · transparent |
 | `enc_fp8.onnx` | fp8 (FFN) | fp8 FFN GEMM | 54 MB | 1.08× | 29.9 / 0.986 · near-transparent |
 | `enc_fp8_fast.onnx` | fp8 (all linears) | fp8 all GEMMs | 54 MB | 1.14× | 22.3 / 0.924 · lossy |
 
@@ -55,7 +57,6 @@ The **encoder is cheap** (~1 ms SAME-S, ~7 ms SAME-L), so quant buys **size, not
 | file | quantized | compute | onnx | speed | dB / cos vs eager |
 |---|---|---|---|---|---|
 | `enc_dynamic_triton_swa.onnx` | — *(bf16 baseline)* | bf16 | 1192 MB | 1.00× | 46.0 / 0.9997 (~7 ms) |
-| `enc_w8_bf16.onnx` | int8 weights (FFN) | bf16 | 895 MB | 1.02× | 44.5 / 0.9995 · transparent |
 | `enc_fp8.onnx` | fp8 (FFN) | fp8 FFN GEMM | 895 MB | 1.03× | 30.8 / 0.989 · near-transparent |
 
 Encoder input is audio `(1,2,N)`; output latent `(1,256,N/4096)`. **Every encoder onnx carries a
@@ -96,11 +97,6 @@ any length (SAME-L enc cos 0.9995 on a real 285 s track). Chunking is unnecessar
 
 Every decoder block is `latent_proj → [ attn: to_qkv → (QKᵀ·softmax·V) → to_out ] → [ ff: ff.0 → GELU → ff.2 ]`,
 with RMSNorm + RoPE around attention. Each tier touches a different subset:
-
-### `dec_w8_bf16` — int8 weight-only
-- **Weights:** every linear (`ff.0`, `ff.2`, `to_qkv`, `to_out`, `latent_proj`) → int8, per-output-channel scale, **GPTQ**-compensated (Hessian captured from real-audio activations). *(SAME-L: the 24 FFN linears; attention projections stay fp32 islands.)*
-- **Activations / attn core / norms / RoPE:** untouched.
-- Weights dequantize to bf16 at build → **bf16 GEMMs**. int8 is storage only ⇒ smaller download, bf16 speed, the most transparent tier.
 
 ### `dec_fp8` — fp8 on the FFN
 - **FFN** (`ff.0` up-proj, `ff.2` down-proj) `+ latent_proj`: **weight fp8 + activation fp8** (per-tensor clipping scale) → **fp8 GEMM**. Weights GPTQ-compensated.
@@ -148,8 +144,8 @@ The mental model: **activations = speed (and the quality floor); weights = size 
 
 ## Which to pick
 
-- **Smallest + most transparent, speed doesn't matter** → `dec_w8_bf16`
-- **Faster, near-transparent (default)** → `dec_fp8`
+- **Max fidelity** → the bf16 baseline (or `--precision fp32` for bit-exact eager)
+- **Faster + smaller, near-transparent (default quant)** → `dec_fp8`
 - **Fastest, quality-tolerant** → `dec_fp8_fast` (SAME-S)
 
 ## Reducing SAME-L size (optional)
@@ -177,7 +173,7 @@ The quantized ONNX are produced by grafting QDQ / int8 / fp8-stored weights onto
 |---|---|
 | `fp8_gptq.py` | SAME-S `dec_fp8` / `dec_fp8_fast` (fp8-stored + GPTQ, ORT Hessian capture) |
 | `fp8_gptq_samel.py` | SAME-L `dec_fp8` (fp8-stored + GPTQ, eager Hessian capture — SWA blocks ORT) |
-| `gptq_w8.py` / `gptq_samel.py` | `dec_w8_bf16` (int8 weight-only + GPTQ) |
+| `gptq_w8.py` / `gptq_samel.py` | int8 weight-only ONNX — the *retired* `w8_bf16` tier (kept for reference) |
 | `enc_quant_sames.py` / `enc_quant_samel.py` | the encoder tiers |
 | `pad_encoder.py` | adds the silence-pad node so any audio length is accepted |
 

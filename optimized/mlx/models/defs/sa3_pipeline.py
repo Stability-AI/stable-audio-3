@@ -89,15 +89,18 @@ def logsnr_shift(t: mx.array, anchor_logsnr: float = -6.2, logsnr_end: float = 2
 
 def build_pingpong_schedule(steps: int, sigma_max: float = 1.0,
                              use_logsnr_shift: bool = True) -> mx.array:
-    """Linear t from sigma_max → 0 in (steps+1) points, optionally warped by LogSNRShift.
+    """LogSNR schedule of (steps+1) points from sigma_max down to zero.
 
+    Warp the normalized grid before scaling it to sigma_max so audio-to-audio
+    schedules remain monotonic and agree with the init-latent mix.
     Returns mx.array shape (steps+1,) of float32.
     """
-    t = mx.linspace(sigma_max, 0.0, steps + 1, dtype=mx.float32)
+    t = mx.linspace(1.0, 0.0, steps + 1, dtype=mx.float32)
     if use_logsnr_shift:
-        t = logsnr_shift(t)
-        # Re-anchor start to sigma_max
+        t = logsnr_shift(t) * sigma_max
         t = mx.concatenate([mx.array([sigma_max], dtype=mx.float32), t[1:]], axis=0)
+    else:
+        t = t * sigma_max
     return t
 
 

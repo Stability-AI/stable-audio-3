@@ -204,6 +204,45 @@ why **Triton is required at inference on sm_90 but not on sm_120**. Building you
 covered under "Choosing the SAME-L attention kernel" in
 [`build/README.md`](build/README.md).
 
+### SAME-L chunkable engines (canonical)
+
+`--decoder same-l` now resolves to `dec_fp16_chunkable_limiter.trt` / `enc_fp16_chunkable.trt`,
+with `--dec-precision fp8` selecting the fp8 pair. Two things changed.
+
+**Two optimization profiles per engine.** TensorRT commits a context's scratch at
+`create_execution_context()` — sized from the profile ceiling, *before any shape is bound* — so the
+old single-profile decoder reserved **8143 MB whether it decoded five seconds or six minutes**. The
+new engines carry a low band (decoder 256 latents, encoder 64) and a wide band (4096):
+
+| | scratch | decode |
+|---|---|---|
+| `--chunking` (default) | **509 MB** decoder, **130 MB** encoder | 256-latent windows |
+| `--no-chunking` | 8143 MB decoder, 8330 MB encoder | one single-shot call |
+
+Chunking is a **memory** mechanism, not a speed one. It wins on time only at exactly L=256, where
+the whole request is one window; above that, single-shot is 10–20% faster. Whole-pipeline resident
+VRAM for a six-minute render drops from ~21.5 GB to ~3.9 GB.
+
+**A limiter with a runtime ceiling.** The decoder emits already-limited PCM (5.8 ms window,
+sample-peak, ceiling 0.977 = −0.2021 dBFS) in place of the old hard clip. `--limiter-ceiling`
+changes it per call with no rebuild and no recapture; a large value bypasses it and reproduces the
+old behaviour exactly. ⚠ **This changes the audio.** To reproduce renders made before it landed,
+use `--dec-precision legacy`, which resolves to the previous engines — still published, nothing was
+moved.
+
+Also worth knowing when building your own: a profile is `(min, opt, max)`, and the two ends do
+different jobs. **`max` sets VRAM; `opt` sets which shapes get the good kernels** and costs nothing.
+The inherited default of `min(1292, ceiling)` — 1292 latents being exactly 120.0 s — costs 17–23%
+at short L on the wide band while buying nothing at long L. See
+[`build/build_samel_chunkable.py`](build/build_samel_chunkable.py) for the tuned values.
+
+⚠ The old `same-l/enc_fp8.trt` was **removed** from the model repo. Its activation quantisers were
+calibrated with a doubly-conservative percentile plus a `1e-4` floor, putting the clip points at
+0.04–1.22 where the decoder's plain `amax` puts them at 22.4; that cost up to 2.16 dB of round trip
+on clean acoustic material. `enc_fp8_chunkable.trt` is the same weights recalibrated
+([`quantize/recalib_enc_fp8.py`](quantize/recalib_enc_fp8.py)) and measures 30.9 dB of latent SNR
+where the old one measured 18.3.
+
 ## Speed & memory
 
 Measured on **H100 SXM 80 GB** at `--steps 8` (rf-denoiser sweet spot).
@@ -243,6 +282,9 @@ variance once the graph is built).
 | `--init-audio`       | —           | WAV (44.1 kHz, 16-bit PCM) for audio-to-audio / inpaint                        |
 | `--init-noise-level` | 1.0         | σmax; 0.4–0.8 typical for variation, 1.0 = full regen                          |
 | `--inpaint-range`    | —           | `START,END` seconds; regenerate that span, keep the rest                       |
+| `--chunking`         | on          | SAME-L: windowed decode on the low profile (509 MB scratch). `--no-chunking` = single-shot on the wide profile, faster above L=256, ~5.4 GB more resident |
+| `--limiter-ceiling`  | 0.977       | Decoder's output peak ceiling, linear (0.977 = −0.2021 dBFS). Large value = bypass, reproducing the old hard clip |
+| `--dec-precision`    | canonical   | `canonical` (fp16), `fp8`, `fp8_fast` (same-s), or `legacy` (pre-limiter engines, for reproducing old renders) |
 | `--quiet`            | off         | Suppress per-stage prints + NVML probes — saves ~4 ms                          |
 | `--pinned-copy`      | on          | Pinned host buffer + non_blocking DtoH for Stage 5                             |
 | `--free-models`      | off         | Free TRT engine memory after each stage's last use                             |
@@ -278,7 +320,8 @@ optimized/tensorRT/
         ├── sa3-sm-sfx/dit_fp16.trt
         ├── sa3-m/dit_fp16.trt      ← + dit_fp8.trt / dit_fp32.trt if selected
         ├── same-s/{enc,dec}_dynamic_bf16.trt
-        └── same-l/{enc,dec}_dynamic_triton_swa.trt
+        └── same-l/{enc_fp16_chunkable,dec_fp16_chunkable_limiter}.trt
+            (+ the fp8 pair, and the pre-limiter *_dynamic_triton_swa.trt as `legacy`)
 ```
 
 DiT engines support a dynamic L range of **1 → 4096** at `opt=1292`

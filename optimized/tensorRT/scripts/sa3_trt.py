@@ -39,6 +39,7 @@ import numpy as np
 # Reuse everything from the canonical script — including its lazy torch/trt
 # imports, engine path resolution, and all the helper classes.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tensorrt as trt          # windowed decode builds its own contexts
 import sa3_trt_core as canon
 from sa3_trt_core import (
     # Module-level state we touch:
@@ -127,7 +128,18 @@ class FullPipelineGraph:
     """
 
     def __init__(self, t5_runner: TRTRunner, dit: DiTRunner, dec_runner: TRTRunner,
-                 L: int, steps: int, requested_samples: int):
+                 L: int, steps: int, requested_samples: int, dec_chunk_lat: int = 0,
+                 scratch=None, balance: bool = True):
+        # dec_chunk_lat > 0 captures the decode as a sequence of windows instead of one call,
+        # which is what lets the decoder engine be built with a low profile ceiling: scratch is
+        # linear in the ceiling and committed at create_execution_context(), so a 4096-ceiling
+        # engine reserves ~5.5 GB whether it decodes 32 latents or 4096. Chunking inside the graph
+        # keeps every enqueue within `dec_chunk_lat` while the render length stays free.
+        # Addresses are re-pointed per window between enqueues; set_tensor_address is host-side, so
+        # each recorded enqueue bakes the offsets that were current when it was captured.
+        self.dec_chunk_lat = int(dec_chunk_lat or 0)
+        self.dec_balance = bool(balance)
+        self.dec_win_lat = self.dec_chunk_lat   # actual window width (<= chunk once balanced)
         self.t5_runner = t5_runner
         self.dit = dit
         self.dec_runner = dec_runner
@@ -148,8 +160,107 @@ class FullPipelineGraph:
         self.pcm_int16_buf = None       # (T_lat*4096, 2) int16, device
         self.pinned_host_pcm = None     # (T_lat*4096, 2) int16, pinned host
         self.local_add_cond_buf = None  # (1, 257, L) fp32, device (kept zero)
+        self._dec_plan = None           # [(start, size)] windows, when chunking
+        self._shared_scratch = scratch  # SA3Inference._scratch, shared by every engine+graph
+        self._dec_ctx_main = None       # THIS graph's decoder context (never the runner's -- see
+                                        # build(); destroying a context a graph was captured from
+                                        # segfaults that graph's replay)
+        self._dec_ctx_tail = None       # 2nd context for a short tail window (odd L)
+        self._dec_win_i32 = None        # one window's int32 PCM, reused by every window
+        self._dec_win_lat = None        # one window's latents, CONTIGUOUS (see _decode_windows)
+        self._ceiling_buf = None        # persistent scalar for a runtime limiter ceiling
+        self._dec_scratch = None        # shared scratch buffer for the decoder contexts
         self._graph = None
         self._built = False
+
+    def set_limiter_ceiling(self, value: float):
+        """Change the limiter ceiling between graph replays -- a 4-byte write, no recapture.
+
+        canon.LIMITER_BYPASS disables limiting; the graph's +-1.0 clamp still bounds the output.
+        """
+        if self._ceiling_buf is None:
+            raise ValueError("this decoder engine bakes the ceiling in; rebuild with "
+                             "build_ship_capped.py --ceiling-input")
+        self._ceiling_buf.fill_(float(value))
+
+    @staticmethod
+    def _plan_windows(N: int, chunk: int, trim: int = 16, balance: bool = True):
+        """Even-aligned windows covering N. `balance` shrinks them to the smallest uniform size
+        that still covers N, instead of always using the full `chunk`.
+
+        Why balance matters: the stitch requires consecutive starts to be exactly `w - trim`
+        apart, so a fixed-width plan covers only `chunk - trim` = 240 new latents per window. Just
+        above the chunk size that is brutally wasteful -- L=257 pads to 258 and needs TWO full
+        256-windows, decoding 512 latents to produce 258. Measured 25.9 ms against 12.3 ms at
+        L=256: one extra latent for 2.1x the time. The waste decays as 256*n/N (1.99x at 257,
+        1.50x at 512, 1.25x at 1024, 1.06x at 4096), which is exactly the shape of the measured
+        latency curve -- predicted-from-waste tracks measured within 3-7% at every length.
+
+        Balancing picks the smallest n with an even w <= chunk satisfying n*w - (n-1)*trim >= N,
+        which pins the waste at a flat ~1.07x everywhere. Measured recovery, eager, vs the
+        fixed-width plan: L=257 1.68x, 512 1.30x, 1024 1.14x, 1291 1.07x, and nothing at 2048+
+        where the fixed plan was already optimal. Accuracy is UNCHANGED (+-0.1 dB vs the shipped
+        full-length decode at every length) -- the extra SWA edges cost nothing measurable.
+
+        ⚠ `balance` is a property of the CALLER, not of the decoder. A balanced window size varies
+        with N, and on the eager path a varying decoder shape costs ~34-40 ms per switch (which
+        made balanced decoding 22% WORSE on a mixed-length stream -- hence balance=False in
+        canon.decode_chunked). Inside a captured graph the shape is resolved once at capture and
+        replay never rebinds, so the switch is free and only the saved work remains.
+        """
+        w = chunk
+        if balance:
+            for n in range(1, N // 2 + 2):
+                cand = -(-(N + (n - 1) * trim) // n)
+                cand += cand & 1                      # keep every start even (SAME-S parity)
+                if cand <= chunk:
+                    w = cand
+                    break
+        step = (w - trim) // 2 * 2
+        starts = list(range(0, N - w, step))
+        last = -(-(N - w) // 2) * 2
+        if not starts or starts[-1] != last:
+            starts.append(last)
+        return [(st, (N - st) if i == len(starts) - 1 else w)
+                for i, st in enumerate(starts)]
+
+    def _decode_windows(self, capture_stream):
+        """Enqueue the windowed decode, narrowing each window into pcm_int16_buf.
+
+        Interiors are trimmed by half the overlap on each neighbour-facing edge, matching
+        canon.decode_chunked and the repo's encode_chunked. Addresses are re-pointed per window;
+        each enqueue records the offsets current at capture time.
+        """
+        SPL = SAMPLES_PER_LATENT
+        trim = 16
+        half = trim // 2
+        n = len(self._dec_plan)
+        for i, (st, sz) in enumerate(self._dec_plan):
+            ctx = (self._dec_ctx_tail if (self._dec_ctx_tail is not None
+                                           and sz != self.dec_win_lat)
+                   else (self._dec_ctx_main or self.dec_runner.context))
+            # Gather the window into a CONTIGUOUS buffer. Offsetting the latent pointer instead
+            # does not work: decoder_in_buf is (1, 256, L) with the 256 channels strided by L, so
+            # a pointer bumped by `st` latents only shifts within the first channel's row and the
+            # engine reads 256*chunk contiguous elements of the wrong data (measured: cos 0.0027
+            # against the unwindowed decode, 80% of samples wrong). The copy is a kernel, so it
+            # captures fine, and the engine's bound address stays fixed across all windows.
+            self._dec_win_lat[..., :sz].copy_(self.decoder_in_buf[..., st:st + sz])
+            ctx.set_tensor_address("latent", self._dec_win_lat.data_ptr())
+            ctx.set_tensor_address("pcm", self._dec_win_i32.data_ptr())
+            if self._ceiling_buf is not None:
+                # Engines with a runtime limiter ceiling: bind it here, because this loop enqueues
+                # the context directly and never goes through decoder_decode (where the default
+                # lives). Unbound, TRT refuses the enqueue -- and under capture that would drop the
+                # decode stage silently.
+                ctx.set_input_shape("limiter_ceiling", ())
+                ctx.set_tensor_address("limiter_ceiling", self._ceiling_buf.data_ptr())
+            _enqueue(ctx, capture_stream, f"decoder window {i} (mega-graph)")
+            kl = 0 if i == 0 else half
+            kr = sz if i == n - 1 else sz - (trim - half)
+            self.pcm_int16_buf[(st + kl) * SPL:(st + kr) * SPL] = \
+                self._dec_win_i32[0, kl * SPL:kr * SPL, :].clamp(-32767, 32767).to(
+                    canon.torch.int16)
 
     def build(self, sigmas, seconds: float, sigma_max: float):
         """Allocate persistent buffers, prime + warm all engines, capture the graph.
@@ -162,6 +273,17 @@ class FullPipelineGraph:
         L = self.L
         ns = self.steps
         T_full = L * SAMPLES_PER_LATENT
+        # ── Padded DECODE length ──
+        # An odd L cannot be tiled by even-start windows of `dec_chunk_lat` (every start must be
+        # even or that window decodes at cos 0.978), so the tail comes out one latent short and
+        # needs a SECOND bound shape -- a second context, and an in-loop shape transition that
+        # costs ~54 ms on SAME-L. Replicating the final latent makes the length even, at which
+        # point every window is exactly dec_chunk_lat and the tail disappears: measured over
+        # L=257..4096, even lengths need no shape but 256, odd lengths need 255 as well.
+        # The extra latent's audio is decoded and then never returned (run() slices to
+        # requested_samples), exactly as canon.decode_chunked already does on the eager path.
+        self._L_dec = L + 1 if (self.dec_chunk_lat and L > self.dec_chunk_lat and L % 2) else L
+        T_dec = self._L_dec * SAMPLES_PER_LATENT
 
         # We force all three engines to execute on the same stream and capture
         # the whole pipeline on that one stream. Easiest: take the DiT runner's
@@ -217,18 +339,121 @@ class FullPipelineGraph:
         self.latents_out_buf = canon.torch.empty(1, IO_CHANNELS, L,
                                                   dtype=canon.torch.float32, device="cuda")
 
-        # ── Decoder: bind static-L addresses ──
+        # ── Decoder: bind addresses ──
         dec_ctx = self.dec_runner.context
-        dec_ctx.set_input_shape("latent", (1, IO_CHANNELS, L))
+        # A runtime limiter ceiling must be bound BEFORE capture: the window loop enqueues the
+        # context directly rather than through decoder_decode (where the default lives), and an
+        # unbound input makes TRT refuse the enqueue -- which under capture would drop the decode
+        # stage silently. Persistent buffer => set_limiter_ceiling() works between replays with no
+        # recapture, the same way seconds_total does.
+        if "limiter_ceiling" in self.dec_runner.in_dtype:
+            self._ceiling_buf = canon.torch.tensor(
+                canon.DEFAULT_LIMITER_CEILING, dtype=canon.torch.float32, device="cuda")
+        if self.dec_chunk_lat and L > self.dec_chunk_lat:
+            self._dec_plan = self._plan_windows(self._L_dec, self.dec_chunk_lat,
+                                                balance=self.dec_balance)
+            # Every window in a balanced plan is the same width, but that width is <= chunk, so
+            # the buffers and bound shape follow the PLAN rather than the engine ceiling.
+            self.dec_win_lat = max(sz for _, sz in self._dec_plan)
+            sizes = sorted({sz for _, sz in self._dec_plan})
+            # SAME-S tiles latents in PAIRS (17 tokens/latent, 34-token chunks, midpoint-shifted by
+            # one latent), so every window START must be even or that window decodes at cos 0.978.
+            assert all(st % 2 == 0 for st, _ in self._dec_plan), "odd window start"
+            # An odd L cannot be covered by uniform even-start windows, so the tail is shorter and
+            # needs its own shape. A second context is cheap because both share one scratch buffer
+            # (validated bit-identical, and it survives graph capture).
+            assert len(sizes) <= 2, f"expected at most 2 window shapes, got {sizes}"
+            dec_ctx.set_input_shape("latent", (1, IO_CHANNELS, self.dec_win_lat))
+        else:
+            self._dec_plan = None
+            dec_ctx.set_input_shape("latent", (1, IO_CHANNELS, L))
         dec_in_dt = self.dec_runner.in_dtype["latent"]
-        self.decoder_in_buf = canon.torch.empty(1, IO_CHANNELS, L, dtype=dec_in_dt, device="cuda")
+        self.decoder_in_buf = canon.torch.empty(1, IO_CHANNELS, self._L_dec,
+                                                 dtype=dec_in_dt, device="cuda")
         # Auto-detect output flavor like decoder_decode does.
         if "pcm" in self.dec_runner.out_dtype:
             self._dec_out_name = "pcm"
             pcm_dt = self.dec_runner.out_dtype["pcm"]
-            self.pcm_int32_buf = canon.torch.empty(1, T_full, 2, dtype=pcm_dt, device="cuda")
-            dec_ctx.set_tensor_address("latent", self.decoder_in_buf.data_ptr())
-            dec_ctx.set_tensor_address("pcm", self.pcm_int32_buf.data_ptr())
+            if self._dec_plan is not None:
+                # One window-sized int32 buffer, reused by every window, instead of a
+                # full-length one: at L=16384 that is 8 MB rather than 537 MB. The int16
+                # destination already exists (pcm_int16_buf), and the graph clamps to
+                # +-32767 before its int32 cast, so narrowing per window is bit-exact.
+                self._dec_win_i32 = canon.torch.empty(
+                    1, self.dec_win_lat * SAMPLES_PER_LATENT, 2, dtype=pcm_dt, device="cuda")
+                self._dec_win_lat = canon.torch.zeros(
+                    1, IO_CHANNELS, self.dec_win_lat,
+                    dtype=self.dec_runner.in_dtype["latent"], device="cuda")
+                self.pcm_int32_buf = self._dec_win_i32          # stage-5 code reads this name
+                sizes = sorted({sz for _, sz in self._dec_plan})
+                tail = [sz for sz in sizes if sz != self.dec_win_lat]
+                if tail:
+                    # An odd L cannot be tiled by uniform even-start windows, so the tail window is
+                    # shorter and needs its own bound shape -- i.e. a second context.
+                    #
+                    # Both decoder contexts must then SHARE one scratch buffer, and the main
+                    # context has to be REPLACED rather than merely re-pointed: TRTRunner created
+                    # it with the default (STATIC) strategy, so it already owns a full private
+                    # scratch allocation. Adding a shared buffer beside it pays 2x instead of 1x,
+                    # which showed up as odd lengths costing ~350 MiB more than their even
+                    # neighbours (L=323 -> 3004 MiB vs L=256 -> 2650). Building both contexts
+                    # USER_MANAGED against one buffer and dropping the STATIC one leaves a single
+                    # allocation. Sharing is safe because the two run sequentially on one stream --
+                    # verified bit-identical and stable under graph capture.
+                    # get_device_memory_size_for_profile_v2, NOT device_memory_size: on a
+                    # multi-profile engine the latter is the MAX ACROSS PROFILES, so a low-band
+                    # deployment would allocate the wide band's 5778 MB here. That showed up as
+                    # odd lengths peaking at 7854 MiB against 2342 for even ones -- the tail
+                    # context is only created when L is odd.
+                    #
+                    # Both contexts belong to THIS GRAPH and are built here rather than reusing
+                    # (and formerly REPLACING) self.dec_runner.context. A captured CUDA graph's
+                    # recorded launches reference the context they were enqueued from, so handing
+                    # the runner a new context destroys the old one underneath every graph already
+                    # in the LRU cache: the next replay of an earlier graph segfaults. That is not
+                    # hypothetical -- two cached graphs whose lengths both need a tail (e.g. 645
+                    # then 1291) crashed on the first replay after the second capture. Per-graph
+                    # contexts are cheap (a few hundred KB of host state each) because they carry
+                    # no scratch of their own.
+                    eng = self.dec_runner.engine
+                    if self._shared_scratch is not None:
+                        # Preferred: the one buffer _share_scratch() already sized for every
+                        # engine. T5 -> DiT -> decoder run sequentially on one stream, so the
+                        # decoder's windows reuse it with no extra allocation at all.
+                        sptr, sbytes = (self._shared_scratch.data_ptr(),
+                                        self._shared_scratch.numel())
+                    else:
+                        # Standalone use (no shared buffer): one per-graph allocation, sized from
+                        # get_device_memory_size_for_profile_v2, NOT device_memory_size -- on a
+                        # multi-profile engine the latter is the MAX ACROSS PROFILES, so a
+                        # low-band deployment would allocate the wide band's 5778 MB here. That
+                        # showed up as odd lengths peaking at 7854 MiB against 2342 for even ones.
+                        _pi = getattr(self.dec_runner, "profile", 0) or 0
+                        sbytes = eng.get_device_memory_size_for_profile_v2(_pi)
+                        self._dec_scratch = canon.torch.empty(sbytes, dtype=canon.torch.uint8,
+                                                               device="cuda")
+                        sptr = self._dec_scratch.data_ptr()
+                    self._dec_ctx_main = eng.create_execution_context(
+                        trt.ExecutionContextAllocationStrategy.USER_MANAGED)
+                    self._dec_ctx_main.set_device_memory(sptr, sbytes)
+                    self._dec_ctx_main.set_input_shape("latent",
+                                                       (1, IO_CHANNELS, self.dec_win_lat))
+                    dec_ctx = self._dec_ctx_main
+                    self._dec_ctx_tail = eng.create_execution_context(
+                        trt.ExecutionContextAllocationStrategy.USER_MANAGED)
+                    self._dec_ctx_tail.set_device_memory(sptr, sbytes)
+                    self._dec_ctx_tail.set_input_shape("latent", (1, IO_CHANNELS, tail[0]))
+                    self._dec_ctx_tail.set_tensor_address("latent", self._dec_win_lat.data_ptr())
+                    self._dec_ctx_tail.set_tensor_address("pcm", self._dec_win_i32.data_ptr())
+                dec_ctx.set_tensor_address("latent", self.decoder_in_buf.data_ptr())
+                dec_ctx.set_tensor_address("pcm", self._dec_win_i32.data_ptr())
+            else:
+                self.pcm_int32_buf = canon.torch.empty(1, T_full, 2, dtype=pcm_dt, device="cuda")
+                dec_ctx.set_tensor_address("latent", self.decoder_in_buf.data_ptr())
+                dec_ctx.set_tensor_address("pcm", self.pcm_int32_buf.data_ptr())
+                if self._ceiling_buf is not None:
+                    dec_ctx.set_input_shape("limiter_ceiling", ())
+                    dec_ctx.set_tensor_address("limiter_ceiling", self._ceiling_buf.data_ptr())
         else:
             # Legacy fp output — graph-capture supported but the postprocess
             # path is different. Not the production target.
@@ -243,7 +468,7 @@ class FullPipelineGraph:
         # Full (T_full, 2) int16 GPU buffer — kept resident; we narrow with a
         # tensor view at replay time. The DtoH copy goes only to the requested
         # window (first requested_samples).
-        self.pcm_int16_buf = canon.torch.empty(T_full, 2, dtype=canon.torch.int16, device="cuda")
+        self.pcm_int16_buf = canon.torch.empty(T_dec, 2, dtype=canon.torch.int16, device="cuda")
         # Pinned host — pre-pinned, persistent. Exactly the right size for
         # this T_lat. The captured DMA copies from device to here.
         self.pinned_host_pcm = canon.torch.empty(T_full, 2, dtype=canon.torch.int16,
@@ -287,7 +512,12 @@ class FullPipelineGraph:
                 _enqueue(self.dit.runner.context, capture_stream, "dit (mega-graph)")
                 # Decoder with zero latents (matches canon's _w_lat = zeros).
                 self.decoder_in_buf.copy_(zero_latents)
-                _enqueue(self.dec_runner.context, capture_stream, "decoder (mega-graph)")
+                if self._dec_plan is not None:
+                    # Same window sequence the capture will record -- this warmup exists so the
+                    # decoder context's state at capture matches what it saw while warming.
+                    self._decode_windows(capture_stream)
+                else:
+                    _enqueue(self.dec_runner.context, capture_stream, "decoder (mega-graph)")
             # Then canon runs ONE full sampling pass (8 DiT calls, no decoder).
             # Mirror that here so the DiT context's state also matches.
             self.dit._x_buf.copy_(zero_x)
@@ -350,10 +580,24 @@ class FullPipelineGraph:
                     else:
                         self.latents_out_buf.copy_(new_x)
                 # Stage 4: Decoder
-                self.decoder_in_buf.copy_(self.latents_out_buf)
-                _enqueue(self.dec_runner.context, capture_stream, "decoder (mega-graph)")
+                self.decoder_in_buf[..., :L].copy_(self.latents_out_buf)
+                if self._L_dec > L:
+                    # Edge-replicate into the pad slot. A device copy, so it captures like any
+                    # other stage and costs one extra latent of decode.
+                    self.decoder_in_buf[..., L:].copy_(self.latents_out_buf[..., -1:])
+                if self._dec_plan is not None:
+                    self._decode_windows(capture_stream)
+                else:
+                    _enqueue(self.dec_runner.context, capture_stream, "decoder (mega-graph)")
                 # Stage 5a: narrow + cast int32 → int16 (or legacy fp32 → int16)
-                if self._dec_out_name == "pcm":
+                if self._dec_plan is not None:
+                    # Already done per window: _decode_windows narrows each window straight into
+                    # pcm_int16_buf, so there is no full-length int32 buffer to convert here
+                    # (that buffer is window-sized in this path -- 8 MB instead of 537 MB at
+                    # L=16384). Running the copy below would try to write a window over the
+                    # whole output.
+                    pass
+                elif self._dec_out_name == "pcm":
                     # Belt-and-suspenders int16 clamp. New engines (from the
                     # FP32 clip+scale fix in the ONNX producer) already bound
                     # the int32 output to ±32767, so this is a no-op for them.
@@ -450,6 +694,7 @@ class SA3Inference:
                  default_seconds: float = 30.0,
                  models_dir: Path | None = None,
                  with_encoder: bool = False,
+                 chunking: bool = True,
                  quiet: bool = False):
         """Load engines + build a warmup graph.
 
@@ -474,6 +719,13 @@ class SA3Inference:
             models_dir:     override the canonical models/ root (optional)
             with_encoder:   also load the audio encoder TRT engine (needed for
                             future audio-to-audio / inpaint modes)
+            chunking:       True (default) selects the engines' LOW band -- decode in
+                            256-latent windows, encode in 64 -- which is the only thing that
+                            reduces the scratch reservation, because TRT commits scratch from
+                            the profile ceiling before any shape is bound. 509 MB instead of
+                            8143 for the SAME-L decoder. False selects the WIDE band: one
+                            single-shot call, ~10-20% faster above L=256 and ~5.4 GB more
+                            resident. Ignored by single-profile engines.
             quiet:          suppress per-stage print() output from canon helpers
         """
         if dit not in DIT_CHOICES:
@@ -513,6 +765,12 @@ class SA3Inference:
             canon.MODELS_DIR = new_root
             canon.ARCH_DIR = new_arch_dir
 
+        # chunking picks the optimization profile (band), not a runtime code path: profile 0 is
+        # the low-ceiling band, 1 the wide one. A single-profile engine only has 0.
+        self.chunking = bool(chunking)
+        self.dec_profile = 0 if chunking else 1
+        self._scratch = None
+        self._scratch_bytes = 0
         self.dit_name = dit
         self.decoder_name = decoder
         self.precision = precision
@@ -552,10 +810,13 @@ class SA3Inference:
             engine_specs["enc"] = canon.resolve_encoder_engine(decoder, dec_precision)
         t0 = time.time()
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(engine_specs)) as ex:
-            futs = {name: ex.submit(TRTRunner, path) for name, path in engine_specs.items()}
+            futs = {name: ex.submit(TRTRunner, path, None, False,
+                                    self.dec_profile if name in ("dec", "enc") else 0)
+                    for name, path in engine_specs.items()}
             self.runners = {name: fut.result() for name, fut in futs.items()}
         sub(f"{dim(f'engine load (parallel, {len(self.runners)} engines)')} {(time.time()-t0)*1000:.0f} ms")
 
+        self._share_scratch()
         self.dit = DiTRunner(self.runners["dit"])
 
         # 5. Graph cache + lock.
@@ -582,6 +843,78 @@ class SA3Inference:
         """
         return max(1, math.ceil(seconds * SAMPLE_RATE / SAMPLES_PER_LATENT))
 
+    def _share_scratch(self):
+        """One scratch buffer for every engine, sized to what the bound shapes actually need.
+
+        Two independent wins, both pure allocation -- no engine rebuild, no numerical change:
+
+        1. SHAPE-EXACT sizing. `engine.device_memory_size` is the worst case TensorRT commits for
+           the whole profile; `update_device_memory_size_for_shapes()` reports what the bound
+           shapes need. For the LARGE fp16 DiT those differ by 44%: it commits 2064 MiB and needs
+           1147 at EVERY length from 32 to 4096. sm-music and medium show no gap (98-100%), so this
+           is specific to the large engine -- plausibly its FP32 islands admitting a tactic whose
+           worst case never occurs. Verified bit-identical output at the reduced allocation.
+
+        2. SHARING. T5 -> DiT (x8) -> decoder run strictly sequentially on one stream, and the
+           encoder (a2a / inpaint) runs before them, so one buffer serves all of them instead of
+           each reserving its own. Verified bit-identical and stable under CUDA-graph capture.
+
+        The buffer is sized once, at each engine's PROFILE MAX, not at the current render length.
+        That is deliberate: the requirement barely moves with length (1145 MiB at L=32 vs 1151 at
+        L=4096, ~6 MiB over the whole range), while re-sizing later would invalidate an already
+        captured graph. So varying length, CFG (which is two sequential batch-1 DiT calls, not a
+        batched one), and a2a/inpaint all run against the same allocation.
+        """
+        import tensorrt as _trt
+        names = [n for n in ("t5", "dit", "dec", "enc") if n in self.runners]
+        need, ctxs = 0, {}
+        for n in names:
+            r = self.runners[n]
+            e = r.engine
+            ctx = e.create_execution_context(
+                _trt.ExecutionContextAllocationStrategy.USER_MANAGED)
+            idx = getattr(r, "profile", 0) or 0
+            if e.num_optimization_profiles > 1 and idx:
+                ctx.set_optimization_profile_async(idx, canon.torch.cuda.current_stream().cuda_stream)
+                canon.torch.cuda.current_stream().synchronize()
+            for i in range(e.num_io_tensors):
+                tn = e.get_tensor_name(i)
+                if e.get_tensor_mode(tn) != _trt.TensorIOMode.INPUT:
+                    continue
+                _, _, hi = e.get_tensor_profile_shape(tn, idx)
+                ctx.set_input_shape(tn, tuple(hi))    # worst case WITHIN the selected band
+            try:
+                need = max(need, ctx.update_device_memory_size_for_shapes())
+            except Exception:
+                need = max(need, e.device_memory_size)       # fall back to the committed size
+            ctxs[n] = ctx
+        if need <= 0:
+            return
+        if self._scratch is not None and self._scratch_bytes >= need:
+            for n, ctx in ctxs.items():                  # reuse the existing buffer
+                ctx.set_device_memory(self._scratch.data_ptr(), self._scratch_bytes)
+                self.runners[n].context = ctx
+            return
+        self._scratch = canon.torch.empty(need, dtype=canon.torch.uint8, device="cuda")
+        for n, ctx in ctxs.items():
+            ctx.set_device_memory(self._scratch.data_ptr(), need)
+            self.runners[n].context = ctx        # drops the STATIC context and its private scratch
+        self._scratch_bytes = need
+
+    def _dec_min_L(self) -> int:
+        """The loaded decoder engine's real profile floor.
+
+        DECODER_MIN_L (32) is the SHIPPED engines' floor and was a build-time convention, not a
+        model limit -- the DiT's floor is 1, and an engine rebuilt with `--min-l 1` decodes L=1
+        natively at cos 0.9993 (SAME-L) against eager, where padding up to 32 is out-of-
+        distribution and measures 0.82-0.92. So the guard has to ask the engine, not a constant.
+        """
+        try:
+            lo, _ = canon.profile_bounds(self.runners["dec"], "latent")
+            return int(lo[-1])
+        except Exception:
+            return DECODER_MIN_L
+
     def get_graph(self, T_lat: int, steps: int, seconds: float) -> FullPipelineGraph:
         """Return the cached graph for (T_lat, steps), building on miss.
 
@@ -591,13 +924,14 @@ class SA3Inference:
         # Hard length cap (see DIT_MAX_L). Reject cleanly here so the library path
         # fails with a clear message rather than a cryptic TRT profile error deep
         # in graph build. For fp8 this is a real correctness limit (baked RoPE table).
-        if T_lat < DECODER_MIN_L:
-            min_s = DECODER_MIN_L * SAMPLES_PER_LATENT / SAMPLE_RATE
+        dec_min = self._dec_min_L()
+        if T_lat < dec_min:
+            min_s = dec_min * SAMPLES_PER_LATENT / SAMPLE_RATE
             raise ValueError(
-                f"T_lat={T_lat} is below the {self.decoder} decoder's profile minimum of "
-                f"{DECODER_MIN_L} (~{min_s:.2f}s). The DiT accepts it but the decoder "
-                f"refuses the shape, so it is rejected here instead of failing obscurely "
-                f"further in.")
+                f"T_lat={T_lat} is below this decoder engine's profile minimum of "
+                f"{dec_min} (~{min_s:.2f}s). The DiT accepts it but the decoder refuses the "
+                f"shape, so it is rejected here instead of failing obscurely further in. "
+                f"Rebuild the decoder with a lower floor (build_capped.py --min-l 1) to go below.")
         if not (self.DIT_MIN_L <= T_lat <= self.DIT_MAX_L):
             max_s = self.DIT_MAX_L * SAMPLES_PER_LATENT / SAMPLE_RATE
             reason = ("the fp8 baked RoPE table (sized to L=4096; a longer render needs a "
@@ -620,8 +954,11 @@ class SA3Inference:
         # to the actual requested samples, so one graph per (T_lat, steps)
         # serves any seconds within that T_lat's range.
         max_samples = T_lat * SAMPLES_PER_LATENT
+        _, dec_hi = canon.profile_bounds(self.runners["dec"], "latent")
+        chunk = dec_hi if T_lat > dec_hi else 0
         graph = FullPipelineGraph(self.runners["t5"], self.dit, self.runners["dec"],
-                                   T_lat, steps, max_samples)
+                                   T_lat, steps, max_samples, dec_chunk_lat=chunk,
+                                   scratch=self._scratch)
         graph.build(sigmas, seconds, sigma_max)
         canon.torch.cuda.synchronize()
 
@@ -634,6 +971,13 @@ class SA3Inference:
             del self._graphs[evict]
         return graph
 
+    # ── Eager path: CFG / negative prompt / audio-to-audio / inpaint ──────
+    #
+    # Same math as sa3_trt_core.main()'s eager branch (sequential dual-pass CFG with
+    # APG, linear init-latent mix for audio-to-audio, keep-mask local_add_cond +
+    # paste-back for inpaint), but driven from the already-loaded engines instead of
+    # a second process, and on its own execution contexts so the captured mega-graph
+    # stays valid (see _SecondContext).
     def generate(self, prompt: str, *,
                  seconds: float = 30.0, steps: int = 8,
                  seed: int | None = None,
@@ -745,6 +1089,19 @@ def main():
     ap.add_argument("--pinned-copy", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--out", default="out.wav")
+    ap.add_argument("--chunking", action=argparse.BooleanOptionalAction, default=True,
+                    help="SAME-L only. On (default): decode in 256-latent windows and encode in "
+                         "64, using the engines' LOW optimization profile -- 509 MB of decoder "
+                         "scratch instead of 8143, because TRT commits scratch from the profile "
+                         "ceiling before any shape is bound. Off: one single-shot call on the WIDE "
+                         "profile, ~10-20%% faster above L=256 and ~5.4 GB more resident. Chunking "
+                         "is a MEMORY mechanism, not a speed one: it only wins on time at exactly "
+                         "L=256, where the whole request is one window.")
+    ap.add_argument("--limiter-ceiling", type=float, default=None,
+                    help="Peak ceiling the decoder's built-in limiter holds, linear (default "
+                         "0.977 = -0.2021 dBFS). Pass a large value (e.g. 1e6) to bypass it, "
+                         "which reproduces the old hard-clip behaviour exactly. Runtime input on "
+                         "the chunkable engines -- no rebuild, no recapture.")
     ap.add_argument("--mega-graph", action=argparse.BooleanOptionalAction, default=True,
                     help="Capture the entire pipeline in one CUDA graph (T5+DiT+decoder+narrow+DtoH). "
                          "On by default. Falls back to eager path for cfg≠1.0, inpaint, or audio-to-audio.")
@@ -891,8 +1248,14 @@ def main():
     if args.init_audio:
         engine_specs["enc"] = canon.resolve_encoder_engine(args.decoder, args.dec_precision)
     t0 = time.time()
+    # The decoder/encoder carry two profiles: 0 = low ceiling (chunked, minimum scratch),
+    # 1 = wide (single-shot). Selecting it at context creation is what makes the saving real --
+    # a context created on the default profile reserves the MAX across profiles.
+    _band = 0 if args.chunking else 1
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(engine_specs)) as ex:
-        futs = {name: ex.submit(TRTRunner, path) for name, path in engine_specs.items()}
+        futs = {name: ex.submit(TRTRunner, path, None, False,
+                                _band if name in ("dec", "enc") else 0)
+                for name, path in engine_specs.items()}
         runners = {name: fut.result() for name, fut in futs.items()}
     sub(f"{dim(f'engine load (parallel, {len(runners)} engines)')} {(time.time()-t0)*1000:.0f} ms")
 
@@ -909,9 +1272,16 @@ def main():
         requested_samples = int(round(args.seconds * SAMPLE_RATE))
         # The graph copies the full pinned-host buffer up to requested_samples;
         # the WAV save reads the same buffer.
+        # Windowed decode when the request exceeds the decoder's bound ceiling. profile_bounds
+        # reports the ACTIVE profile, so --no-chunking (wide band) reports 4096 and takes the
+        # single-shot path while the default (low band) reports 256 and windows.
+        _, _dec_hi = canon.profile_bounds(runners["dec"], "latent")
         mega = FullPipelineGraph(runners["t5"], dit, runners["dec"],
-                                  T_lat, args.steps, requested_samples)
+                                  T_lat, args.steps, requested_samples,
+                                  dec_chunk_lat=(_dec_hi if T_lat > _dec_hi else 0))
         mega.build(sigmas, args.seconds, sigma_max)
+        if args.limiter_ceiling is not None:
+            mega.set_limiter_ceiling(args.limiter_ceiling)
         torch.cuda.synchronize()
         sub(f"{dim(f'warmup + capture')} {(time.time()-t0)*1000:.0f} ms")
         print()

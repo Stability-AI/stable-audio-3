@@ -131,7 +131,7 @@ def _save_wav(pcm, out_path):
 # Each cached entry holds 5-15 GB of VRAM (engines + persistent graph buffers).
 # H100 80GB fits ~5 sm-music or ~3 medium combos before OOM. We LRU-evict to
 # stay under that limit. Switching back to an evicted variant re-loads (~5-7s).
-_inference_cache: dict[tuple[str, str, str, str], SA3Inference] = {}
+_inference_cache: dict[tuple[str, str, str, str, bool], SA3Inference] = {}
 _inference_lru: list[tuple[str, str, str, str]] = []  # MRU at end
 _INFERENCE_CACHE_MAX = 2
 
@@ -160,17 +160,27 @@ def _evict_inference(key):
         pass
 
 
+# Set once from --chunking in main(). A module-level default keeps it out of every call site
+# and out of the UI, which is right: it is a deployment choice (memory vs speed), not a per-render
+# one -- switching it means selecting a different optimization profile, so the engines reload.
+_CHUNKING = True
+
+
 def get_inference(dit: str, decoder: str, dit_variant_path: str,
                    dec_variant_path: str,
                    default_T_lat: int, default_steps: int,
-                   default_seconds: float, quiet: bool) -> SA3Inference:
+                   default_seconds: float, quiet: bool,
+                   chunking: bool | None = None) -> SA3Inference:
     """Return a warm SA3Inference, building (and caching) if not yet loaded.
 
     The cache key is (dit, decoder, dit_variant_path, dec_variant_path) so
     swapping either the DiT *or* the decoder variant triggers a fresh load.
     LRU eviction caps the cache at _INFERENCE_CACHE_MAX entries.
     """
-    key = (dit, decoder, dit_variant_path, dec_variant_path)
+    chunking = _CHUNKING if chunking is None else chunking
+    # chunking is part of the key: it selects the profile, so the two modes are different
+    # contexts with different scratch and cannot share a cached SA3Inference.
+    key = (dit, decoder, dit_variant_path, dec_variant_path, chunking)
     if key in _inference_cache:
         if key in _inference_lru:
             _inference_lru.remove(key)
@@ -193,6 +203,7 @@ def get_inference(dit: str, decoder: str, dit_variant_path: str,
           f"dec={Path(dec_variant_path).name}, tier={dec_tier})")
     inf = SA3Inference(dit, decoder,
                         dec_precision=dec_tier,
+                        chunking=chunking,
                         default_T_lat=default_T_lat,
                         default_steps=default_steps,
                         default_seconds=default_seconds,
@@ -438,8 +449,14 @@ def main():
     ap.add_argument("--default-steps", type=int, default=8)
     ap.add_argument("--share", action=argparse.BooleanOptionalAction, default=True,
                     help="Create a public gradio.live URL (default on)")
+    ap.add_argument("--chunking", action=argparse.BooleanOptionalAction, default=True,
+                    help="SAME-L: decode/encode in windows on the engines' low profile "
+                         "(509 MB of decoder scratch instead of 8143). --no-chunking uses the "
+                         "wide profile: single-shot, faster above L=256, ~5.4 GB more resident.")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
+    global _CHUNKING
+    _CHUNKING = args.chunking
 
     if args.decoder is None:
         args.decoder = DEFAULT_DECODERS[args.dit]

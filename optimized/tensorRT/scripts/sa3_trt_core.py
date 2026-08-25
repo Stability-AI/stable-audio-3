@@ -115,7 +115,7 @@ DECODER_FILES = {
 }
 ENCODER_FILES = {
     "same-s": ["same-s/enc_dynamic_bf16.trt"],
-    "same-l": ["same-l/enc_dynamic_triton_swa.trt"],
+    "same-l": ["same-l/enc_fp16_chunkable.trt"],
 }
 SHARED_FILES = [
     # T5Gemma engine — downloaded from HF per-arch. (The tokenizer.json is
@@ -132,13 +132,20 @@ DIT_CHOICES = {
     "medium":   {"engine": ARCH_DIR / "sa3-m" / "dit_fp16.trt",  # medium default
                  "default_decoder": "same-l"},
 }
+# SAME-L now points at the CHUNKABLE engines. Each carries two optimization profiles -- a
+# 256-latent (decoder) / 64-latent (encoder) low band for minimum VRAM, and a 4096 wide band for
+# single-shot -- plus, on the decoder, the shipped limiter with its ceiling as a runtime input.
+# Scratch is committed per profile, so the low band costs 509 MB where the old single-profile
+# engine reserved 8143 MB regardless of render length. The previous engines remain on the model
+# repo and are reachable through the "legacy" tier below; nothing was moved or deleted, so an
+# older checkout still resolves its own filenames.
 DECODER_PATHS = {
     "same-s": ARCH_DIR / "same-s" / "dec_dynamic_bf16.trt",
-    "same-l": ARCH_DIR / "same-l" / "dec_dynamic_triton_swa.trt",
+    "same-l": ARCH_DIR / "same-l" / "dec_fp16_chunkable_limiter.trt",
 }
 ENCODER_PATHS = {
     "same-s": ARCH_DIR / "same-s" / "enc_dynamic_bf16.trt",
-    "same-l": ARCH_DIR / "same-l" / "enc_dynamic_triton_swa.trt",
+    "same-l": ARCH_DIR / "same-l" / "enc_fp16_chunkable.trt",
 }
 
 
@@ -221,10 +228,12 @@ DECODER_MIN_L = 32
 
 DECODER_ENGINE_FILENAME = {
     "same-l": {
-        # fp8 is a DiT-only recipe → decoder reuses its canonical fp16 engine.
-        # (dec_dynamic_bf16.trt keeps its name — it's the same-s canonical engine.)
-        "fp8":  "dec_dynamic_triton_swa.trt",
-        "fp16": "dec_dynamic_triton_swa.trt",
+        # The DiT precision selects the DECODER only through this map. Both fp8 and fp16 DiTs
+        # get the fp16 chunkable decoder; an fp8 DECODER is a separate choice made with
+        # --dec-precision fp8 (see DECODER_TIER_FILENAME), because it is a quantisation of the
+        # decoder itself rather than a consequence of the DiT's precision.
+        "fp8":  "dec_fp16_chunkable_limiter.trt",
+        "fp16": "dec_fp16_chunkable_limiter.trt",
         "fp32": "dec_dynamic_fp32.trt",
     },
     "same-s": {
@@ -254,16 +263,27 @@ def normalize_precision(precision):
 DECODER_TIER_FILENAME = {
     "same-s": {"canonical": DECODER_ENGINE_FILENAME["same-s"]["fp16"],
                "fp8": "dec_fp8.trt", "fp8_fast": "dec_fp8_fast.trt"},
-    "same-l": {"canonical": DECODER_ENGINE_FILENAME["same-l"]["fp16"],
-               "fp8": "dec_fp8.trt"},
+    # ⚠ "legacy" is the pre-chunkable engine, kept reachable so renders made before the limiter
+    # landed can be reproduced exactly -- the limiter CHANGES the audio, so a same-name swap
+    # would silently alter old output. It is still on the model repo; nothing was moved.
+    "same-l": {"canonical": "dec_fp16_chunkable_limiter.trt",
+               "fp8": "dec_fp8_chunkable_limiter.trt",
+               "legacy": "dec_dynamic_triton_swa.trt"},
 }
 ENCODER_TIER_FILENAME = {
     "same-s": {"canonical": "enc_dynamic_bf16.trt",
                "fp8": "enc_fp8.trt", "fp8_fast": "enc_fp8_fast.trt"},
-    "same-l": {"canonical": "enc_dynamic_triton_swa.trt",
-               "fp8": "enc_fp8.trt"},
+    # ⚠ the old same-l enc_fp8.trt was REMOVED from the model repo: its activation quantisers
+    # were calibrated with p99.9-within-clip → p90-across-clips → a 1e-4 floor, putting the clip
+    # points at 0.04-1.22 where the decoder's plain amax puts them at 22.4. That cost up to
+    # 2.16 dB of round trip on clean acoustic material. enc_fp8_chunkable.trt is the same weights
+    # recalibrated with amax (build/recalib_enc_fp8.py) and measures 30.9 dB where the old one
+    # measured 18.3.
+    "same-l": {"canonical": "enc_fp16_chunkable.trt",
+               "fp8": "enc_fp8_chunkable.trt",
+               "legacy": "enc_dynamic_triton_swa.trt"},
 }
-DECODER_TIERS = ("canonical", "fp8", "fp8_fast")
+DECODER_TIERS = ("canonical", "fp8", "fp8_fast", "legacy")
 
 
 def get_decoder_tier_path(decoder_name: str, tier: str = "canonical") -> Path:
@@ -482,7 +502,19 @@ class TRTRunner:
     # attribute because torch/trt aren't imported until main() runs.
     _DT = None
 
-    def __init__(self, engine_path: Path, logger_level=None):
+    def __init__(self, engine_path: Path, logger_level=None, user_managed: bool = False,
+                 profile: int = 0):
+        """user_managed=True creates the execution context WITHOUT its own scratch allocation.
+
+        TensorRT commits a context's scratch at create_execution_context(), sized from the
+        selected profile -- so on a multi-profile engine a DEFAULT context reserves the MAX
+        ACROSS profiles and a low-memory band saves nothing. USER_MANAGED lets the caller
+        allocate exactly get_device_memory_size_for_profile_v2(profile) and, where several
+        engines run sequentially on one stream, share a single buffer between them.
+
+        profile selects the optimization profile (band). The SAME-L engines ship two: 0 is the
+        low-ceiling chunked band, 1 is the wide single-shot band.
+        """
         if logger_level is None:
             logger_level = trt.Logger.ERROR
         if TRTRunner._DT is None:
@@ -501,7 +533,16 @@ class TRTRunner:
             self.engine = runtime.deserialize_cuda_engine(f.read())
         if self.engine is None:
             raise RuntimeError(f"failed to deserialize {engine_path}")
-        self.context = self.engine.create_execution_context()
+        self.profile = int(profile or 0)
+        if user_managed:
+            self.context = self.engine.create_execution_context(
+                trt.ExecutionContextAllocationStrategy.USER_MANAGED)
+        else:
+            self.context = self.engine.create_execution_context()
+        if self.profile and self.engine.num_optimization_profiles > 1:
+            st = torch.cuda.current_stream()
+            self.context.set_optimization_profile_async(self.profile, st.cuda_stream)
+            st.synchronize()
         self.stream = torch.cuda.Stream()
         # I/O dtype/name maps
         self.in_dtype = {}
@@ -596,6 +637,55 @@ def t5gemma_encode(runner: TRTRunner, tokenizer, prompt: str):
     return out.float(), mask
 
 
+def profile_bounds(runner: "TRTRunner", tensor: str) -> tuple[int, int]:
+    """(min, max) for `tensor` on the runner's ACTIVE profile, not profile 0.
+
+    With one band per setting, reading profile 0 would report the low band's ceiling even when the
+    wide band is selected -- and the windowing decision is derived from that number.
+    """
+    idx = getattr(runner, "profile", 0) or 0
+    lo, _, hi = runner.engine.get_tensor_profile_shape(tensor, idx)
+    return int(lo[-1]), int(hi[-1])
+
+
+def _window_owners(starts, sizes, N):
+    """Which window should supply each position: the one holding it FURTHEST from its own edges.
+
+    The fixed half-overlap trim (keep [s+half, s+chunk-half)) assumes every window overlaps its
+    neighbour by exactly `overlap`. When the final hop is irregular -- covering N=646 with 50-latent
+    windows at hop 42 leaves a last hop of 8 -- the tail window overwrites a wide region using
+    near-edge estimates, discarding better central ones from the previous window. That showed up as
+    a single latent (index 126 at T_lat=645) with 0.364 relative error against a 0.0158 median.
+
+    Centrality is min(pos, size-1-pos) within a window; the winner per position is unimodal per
+    window, so each window ends up owning ONE contiguous run and the writes stay slice-shaped.
+    Window STARTS are untouched, so the even-alignment (SAME-S pair grid) still holds.
+
+    Returns [(dst_lo, dst_hi, src_lo, src_hi)] per window, empty runs dropped.
+    """
+    best = [-1] * N
+    owner = [-1] * N
+    for i, (st, sz) in enumerate(zip(starts, sizes)):
+        for j in range(sz):
+            x = st + j
+            if x >= N:
+                break
+            c = j if j < sz - 1 - j else sz - 1 - j
+            if c > best[x]:
+                best[x] = c
+                owner[x] = i
+    runs = []
+    for i, (st, sz) in enumerate(zip(starts, sizes)):
+        idx = [x for x in range(st, min(st + sz, N)) if owner[x] == i]
+        if not idx:
+            runs.append(None)
+            continue
+        lo, hi = idx[0], idx[-1] + 1
+        assert hi - lo == len(idx), f"window {i} owns a non-contiguous run"
+        runs.append((lo, hi, lo - st, hi - st))
+    return runs
+
+
 def encoder_encode(runner: TRTRunner, audio: torch.Tensor) -> torch.Tensor:
     """SAME-S/L encoder, single-shot. audio: (1, 2, T_samples). Returns (1, 256, L).
 
@@ -612,7 +702,21 @@ def encoder_encode(runner: TRTRunner, audio: torch.Tensor) -> torch.Tensor:
     in_dt = runner.in_dtype["audio"]
     out_dt = runner.out_dtype["latent"]
     a = audio.to(in_dt).contiguous()
-    ctx.set_input_shape("audio", tuple(a.shape))
+    if not ctx.set_input_shape("audio", tuple(a.shape)):
+        # Same silent-failure class as the decoder: a refused shape leaves the context on whatever
+        # it last held, so the call returns the previous request's latents instead of raising.
+        # A capped encoder is the normal case now -- its ceiling is deliberately near
+        # encode_chunked's 50-latent window, because single-shot long encodes are ALREADY wrong
+        # (see the warning above: SAME-L NaNs past ~200 latents, SAME-S drifts to cos ~0.4 past
+        # ~108). So this guard mostly catches callers that should be using encode_chunked().
+        idx = getattr(ctx, "active_optimization_profile", 0) or 0
+        lo, _, hi = runner.engine.get_tensor_profile_shape("audio", idx)
+        raise ValueError(
+            f"encoder: audio length {a.shape[-1]} samples "
+            f"({a.shape[-1] // SAMPLES_PER_LATENT} latents) is outside the engine profile "
+            f"[{lo[-1] // SAMPLES_PER_LATENT}, {hi[-1] // SAMPLES_PER_LATENT}] latents "
+            f"(profile {idx}). Use encode_chunked() -- it windows to a safe length, which long "
+            f"single-shot encodes require for CORRECTNESS as well as memory.")
     out_shape = tuple(ctx.get_tensor_shape("latent"))
     out = torch.empty(out_shape, dtype=out_dt, device="cuda")
     ctx.set_tensor_address("audio", a.data_ptr())
@@ -631,7 +735,8 @@ DEFAULT_ENCODER_OVERLAP_LAT = 8   # 4 latents trimmed from each interior edge
 def encode_chunked(runner: TRTRunner, audio: torch.Tensor, *,
                     chunk_lat: int = DEFAULT_ENCODER_CHUNK_LAT,
                     overlap_lat: int = DEFAULT_ENCODER_OVERLAP_LAT,
-                    warmup_passes: int = 2) -> torch.Tensor:
+                    warmup_passes: int = 2,
+                    balance: bool = False, max_chunk: int = 0) -> torch.Tensor:
     """Chunked SAME-S/L encode. Equivalent to encoder_encode for short audio,
     but reliably accurate at any length.
 
@@ -648,6 +753,14 @@ def encode_chunked(runner: TRTRunner, audio: torch.Tensor, *,
                     trimmed from each interior edge).
       warmup_passes: zero-audio calls at chunk_lat before the real chunks,
                     to stabilise engine state. Default 2.
+      balance:      shrink/grow every window to the smallest uniform width that still covers the
+                    request. Total work is T_lat + (n-1)*overlap_lat, so the cheapest plan is the
+                    one with the FEWEST windows -- and since every stitch is a small error, it is
+                    also the most accurate. Measured on SAME-L: bit-exact wherever the request
+                    fits in one call (fixed-50 splits the same request in two and lands 50-59 dB
+                    away), and +0.02 to +0.04 dB of round trip beyond that.
+      max_chunk:    widest window balancing may use. 0 = read the engine's profile ceiling, which
+                    is the right answer and needs no constant.
 
     Returns: (1, 256, T_lat) where T_lat = T_samples // 4096.
     """
@@ -662,35 +775,229 @@ def encode_chunked(runner: TRTRunner, audio: torch.Tensor, *,
             _ = encoder_encode(runner, warm)
         return encoder_encode(runner, audio)
 
+    if balance:
+        # Every interior boundary costs one `overlap_lat` of re-encoded audio, so total work is
+        # T_lat + (n-1)*overlap_lat and the cheapest plan is simply the one with the FEWEST
+        # windows -- i.e. the widest window allowed. Balancing then shrinks that width back to the
+        # smallest value that still covers the request, which changes nothing about the cost but
+        # spreads the work evenly and avoids a nearly-empty final window.
+        #
+        # `max_chunk` is the allowance and defaults to chunk_lat, so by default balancing only
+        # REDISTRIBUTES. Raising it to the engine ceiling also cuts the window count -- but
+        # chunk_lat=50 was chosen for ACCURACY (cos >= 0.998 vs PT eager), not for the profile, so
+        # a wider window is a quality decision and has to be measured, not assumed.
+        #
+        # Balance BEFORE the pre-warm below: warming at a width the real windows do not use
+        # reintroduces exactly the in-loop shape transition the warm-up exists to prevent.
+        # Derive the allowance from the ENGINE rather than a constant. The widest window an
+        # engine can take is its profile ceiling, and that is exactly the width that minimises
+        # window count -- so there is nothing left to hardcode. (The old default, 50 latents, was
+        # picked when windows were fixed-width; balancing supersedes it, and for every realistic
+        # length the balanced width lands at 58-64 on a 64-ceiling encoder, never 50.)
+        if max_chunk:
+            cap = max(chunk_lat, int(max_chunk))
+        else:
+            try:
+                cap = max(chunk_lat, profile_bounds(runner, "audio")[1] // SAMPLES_PER_LATENT_)
+            except Exception:
+                cap = chunk_lat
+        T_pad = T_lat + (T_lat & 1)
+        for n in range(1, T_pad + 1):
+            w = -(-(T_pad + (n - 1) * overlap_lat) // n)
+            w += w & 1                      # even width keeps every start even
+            if w <= cap:
+                chunk_lat = max(w, overlap_lat + 2)
+                break
+
     # Pre-warm at chunk_lat (zero audio, same shape as real chunks)
     warm = torch.zeros(1, 2, chunk_lat * SAMPLES_PER_LATENT_,
                         device=audio.device, dtype=torch.float32)
     for _ in range(warmup_passes):
         _ = encoder_encode(runner, warm)
 
-    # Chunk start positions; last chunk anchored to the end
+    # Chunk start positions. EVERY start must be EVEN: the encoder is the same
+    # TransformerResamplingBlock as the decoder (stride 16, chunk_size 32, chunk_midpoint_shift,
+    # 17 tokens per latent => 34-token = 2-latent transformer chunks), so a window starting on an
+    # odd latent has that entire grid shifted by one and encodes measurably worse -- 0.988-0.990
+    # against 0.9985-0.9996 for even starts.
+    #
+    # `step` is even (50-8=42), so interior starts are even; the TAIL is the trap. Anchoring it at
+    # T_lat - chunk_lat is odd whenever T_lat is odd, which degraded the final ~46 latents (~4 s)
+    # of every odd-length encode to cos 0.9922 vs 0.9998. Rounding the tail start DOWN to even and
+    # letting that one window grow to reach the end restores 0.9996.
+    # Pad an ODD latent count to even, so every window is exactly chunk_lat and the engine sees
+    # ONE shape. Growing the tail to chunk_lat+1 instead (the previous fix for the odd-start parity
+    # problem) keeps starts even but introduces an in-loop SHAPE TRANSITION, and that costs +74 ms
+    # on the SAME-L encoder (107.0 ms vs 33.1 at T_lat=323) and +2.9 ms on SAME-S. Same failure the
+    # docstring's "all chunks same shape => stable engine state" is guarding against. One
+    # replicated latent of audio is cheaper than the transition, and the extra latent is sliced off.
+    T_req = T_lat
+    if T_lat % 2:
+        audio = torch.cat([audio, audio[..., -SAMPLES_PER_LATENT_:]], dim=-1)
+        T_lat += 1
     step = chunk_lat - overlap_lat
     starts = list(range(0, T_lat - chunk_lat, step))
-    if not starts or starts[-1] != T_lat - chunk_lat:
-        starts.append(T_lat - chunk_lat)
+    last = T_lat - chunk_lat               # even now, since T_lat and chunk_lat both are
+    if not starts or starts[-1] != last:
+        starts.append(last)
+    assert last % 2 == 0, f"odd tail start {last} would break SAME-S pair alignment"
+    tail_len = chunk_lat                   # uniform: one shape for every window
 
     # Run all chunks (all same shape ⇒ stable engine state)
     chunks = []
-    for s in starts:
-        chunk_audio = audio[..., s * SAMPLES_PER_LATENT_ : (s + chunk_lat) * SAMPLES_PER_LATENT_].contiguous()
+    for i, s in enumerate(starts):
+        sz = tail_len if i == len(starts) - 1 else chunk_lat
+        chunk_audio = audio[..., s * SAMPLES_PER_LATENT_ : (s + sz) * SAMPLES_PER_LATENT_].contiguous()
         chunks.append((s, encoder_encode(runner, chunk_audio)))
 
     # Stitch: take the interior of each chunk (first/last include their outer edge)
     out = torch.zeros(1, 256, T_lat, device=audio.device, dtype=torch.float32)
-    half = overlap_lat // 2
-    for i, (s, z) in enumerate(chunks):
-        kl = 0 if i == 0 else half
-        kr = chunk_lat if i == len(chunks) - 1 else chunk_lat - (overlap_lat - half)
-        out[..., s + kl : s + kr] = z[..., kl:kr]
+    runs = _window_owners([s for s, _ in chunks], [chunk_lat]*len(chunks), T_lat)
+    for (s, z), run in zip(chunks, runs):
+        if run is None:
+            continue
+        dlo, dhi, slo, shi = run
+        out[..., dlo:dhi] = z[..., slo:shi]
+    return out[..., :T_req]                # drop the replicated latent
+
+
+# The limiter ceiling, when the decoder exposes it as a runtime input. TensorRT has NO default
+# for a graph input -- an unbound address makes enqueue fail outright ("Address is not set for
+# input tensor limiter_ceiling") -- so the default lives here and decoder_decode binds it unless
+# the caller overrides. 0.977 = -0.2021 dBFS, the setting decided by the 21,600-cell sweep.
+# A value far above 1 makes the gain identically 1.0, bypassing the limiter and letting the
+# graph's +-1.0 clamp reproduce the old hard-clip behaviour.
+DEFAULT_LIMITER_CEILING = 0.977
+
+
+DEFAULT_DECODER_CHUNK_LAT = 256   # 0.36 GB of scratch for SAME-S, 0.51 GB for SAME-L
+DEFAULT_DECODER_TRIM_LAT = 16     # dropped from each interior edge; must be EVEN
+
+
+def decode_chunked(runner: TRTRunner, latents: torch.Tensor, *,
+                   chunk_lat: int = DEFAULT_DECODER_CHUNK_LAT,
+                   trim_lat: int = DEFAULT_DECODER_TRIM_LAT,
+                   warmup_passes: int = 2, balance: bool = True,
+                   limiter_ceiling: float | None = None) -> torch.Tensor:
+    """Chunked SAME-S/L decode, so the engine's PROFILE CEILING can be lowered.
+
+    Decoder scratch is linear in the profile ceiling (SAME-S 1.40 MB per latent of ceiling,
+    SAME-L 1.99) and is committed at create_execution_context() -- before any shape is bound.
+    A 4096-ceiling decoder therefore reserves 5.72 GB (SAME-S) / 8.14 GB (SAME-L) whether you
+    decode 6 minutes or 5 seconds. Decoding in windows lets the engine be built with a ceiling
+    of `chunk_lat` instead, which is the only thing that reduces that reservation.
+
+    ⚠ EVERY CHUNK START MUST BE EVEN. The latent->audio path carries a stride-2 structure:
+    a window starting at an even latent decodes at the noise floor, and one starting at an ODD
+    latent collapses to cos 0.978 against the single-shot decode. The failure is binary (no
+    gradation between even and odd) and CANNOT be recovered by overlap or by left warm-up
+    context -- 0 through 192 latents of warm-up all measure identically wrong. The natural way
+    to hit it is the final chunk: anchoring the tail at N-chunk_lat gives an odd start whenever
+    N is odd, so the tail start is rounded UP to even here and the last window is simply shorter.
+
+    Measured against a single-shot decode, chunked output lands on SAME-S's own noise floor
+    (~0.9989, set by its RandomNormalLike bottleneck -- i.e. as close as two decodes of the same
+    latent get to each other) at every length from 12 s to 6 min and every chunk size 64..2048.
+    SAME-L is bit-deterministic and chunks to ~0.9998; its residual is a sliding-window edge
+    effect that more trim does not remove (trim 16/32/64 all measure the same).
+
+    Args:
+      latents:       (1, 256, N)
+      chunk_lat:     the engine's profile ceiling -- the LARGEST window allowed. With
+                     balance=True the actual window shrinks to spread the work evenly, which
+                     never costs VRAM and avoids decoding up to 1.59x the needed latents.
+      trim_lat:      dropped from each interior edge (half per side). Must be even to keep
+                     every start even.
+      warmup_passes: zero-latent calls at chunk_lat before the real windows, matching
+                     encode_chunked -- these engines dislike in-loop shape transitions.
+
+    Returns: same flavor as decoder_decode -- (1, L*4096, 2) int32 pcm, or (1, 2, L*4096) audio.
+    """
+    if trim_lat % 2:
+        raise ValueError(f"trim_lat must be even to keep chunk starts even, got {trim_lat}")
+    N_req = latents.shape[-1]
+    if N_req <= chunk_lat:
+        # Pass the ceiling THROUGH. Dropping it here silently re-enabled the limiter for every
+        # request short enough to fit one window, so a caller asking for LIMITER_BYPASS got
+        # bypass above the chunk size and 0.977 below it -- which reads as a length-dependent
+        # quality cliff in any A/B that spans the boundary.
+        return decoder_decode(runner, latents, limiter_ceiling=limiter_ceiling)
+
+    # Pad an ODD length to even before planning. With N odd the balanced plan cannot give every
+    # window the same size -- L=1291 yields five windows of 230 and a tail of 229 -- and that single
+    # in-loop SHAPE TRANSITION costs ~54 ms on SAME-L (126.8 ms vs 72.2 ms for L=1292, same window
+    # count). It is the instability the repo's encode_chunked already guards against by holding one
+    # shape and pre-warming. One replicated latent makes every window identical; the extra audio is
+    # sliced off at the end. (A single odd-length window is NOT slow on its own -- 169 vs 170
+    # latents measures 8.82 vs 8.72 ms -- so this is the transition, not the shape.)
+    if N_req % 2:
+        latents = torch.cat([latents, latents[..., -1:]], dim=-1)
+    N = latents.shape[-1]
+
+    if balance:
+        # chunk_lat is the engine's CEILING; the actual window may be smaller. Anchoring a
+        # fixed-size tail wastes work whenever N sits just above a multiple of the window:
+        # covering N=646 with 512-windows decodes 1024 latents (1.59x the work) because the
+        # last window overlaps the first by 378. Spreading the same number of windows evenly
+        # costs 1.03x instead -- same chunk count, same VRAM, ~35% less decoding. Chunk count
+        # is what the ceiling forces; only the size within it is free.
+        n = max(1, -(-(N - trim_lat) // (chunk_lat - trim_lat)))
+        chunk_lat = min(chunk_lat, -(-(N + (n - 1) * trim_lat) // n // 2) * 2)
+        if chunk_lat <= trim_lat:
+            raise ValueError(f"balanced chunk {chunk_lat} <= trim {trim_lat}")
+
+    step = (chunk_lat - trim_lat) // 2 * 2
+    starts = list(range(0, N - chunk_lat, step))
+    last = -(-(N - chunk_lat) // 2) * 2          # round UP -> stays even, covers the final latent
+    if not starts or starts[-1] != last:
+        starts.append(last)
+
+    warm = torch.zeros(1, IO_CHANNELS, chunk_lat, device=latents.device, dtype=latents.dtype)
+    for _ in range(warmup_passes):
+        decoder_decode(runner, warm, limiter_ceiling=limiter_ceiling)
+
+    first = decoder_decode(runner, latents[..., starts[0]:starts[0] + chunk_lat].contiguous(),
+                           limiter_ceiling=limiter_ceiling)
+    pcm_flavor = (first.dim() == 3 and first.shape[1] >= first.shape[2])   # (1, T, 2) int32
+    # Accumulate PCM in int16, not the engine's int32. The graph already clamps to +-32767 before
+    # its int32 cast (TRT cannot emit int16), and every caller narrows to int16 immediately, so the
+    # full-length int32 buffer is 2x larger than anything needs. It is also the ONLY term here that
+    # scales with length: at L=16384 it is 537 MB of a 2818 MiB peak, halved to 268 MB. Narrowing
+    # per window keeps the wide dtype confined to one chunk. `.to(torch.int16)` in existing callers
+    # stays valid -- it is a no-op on an int16 tensor.
+    acc_dtype = torch.int16 if (pcm_flavor and first.dtype == torch.int32) else first.dtype
+    out = torch.zeros((1, N * SAMPLES_PER_LATENT, 2) if pcm_flavor
+                      else (1, 2, N * SAMPLES_PER_LATENT),
+                      dtype=acc_dtype, device=first.device)
+
+    def _place(dst_lo, dst_hi, src, src_lo, src_hi):
+        a, b = dst_lo * SAMPLES_PER_LATENT, dst_hi * SAMPLES_PER_LATENT
+        c, d = src_lo * SAMPLES_PER_LATENT, src_hi * SAMPLES_PER_LATENT
+        if pcm_flavor:
+            out[:, a:b, :] = src[:, c:d, :].to(acc_dtype)
+        else:
+            out[:, :, a:b] = src[:, :, c:d]
+
+    sizes = [(N - st) if i == len(starts) - 1 else chunk_lat for i, st in enumerate(starts)]
+    runs = _window_owners(starts, sizes, N)
+    for i, s in enumerate(starts):
+        end = s + sizes[i]
+        piece = (first if i == 0 else
+                 decoder_decode(runner, latents[..., s:end].contiguous(),
+                                limiter_ceiling=limiter_ceiling))
+        run = runs[i]
+        if run is None:
+            continue
+        dlo, dhi, slo, shi = run
+        _place(dlo, dhi, piece, slo, shi)
+    if N != N_req:                       # drop the replicated latent's audio
+        keep = N_req * SAMPLES_PER_LATENT
+        out = out[:, :keep, :] if pcm_flavor else out[:, :, :keep]
     return out
 
 
-def decoder_decode(runner: TRTRunner, latents: torch.Tensor) -> torch.Tensor:
+def decoder_decode(runner: TRTRunner, latents: torch.Tensor, *,
+                   limiter_ceiling: float | None = None) -> torch.Tensor:
     """SAME-S/L decoder.
 
     Two engine flavors are supported (auto-detected by output tensor name):
@@ -715,7 +1022,33 @@ def decoder_decode(runner: TRTRunner, latents: torch.Tensor) -> torch.Tensor:
     out_name = "pcm" if "pcm" in runner.out_dtype else "audio"
     out_dt = runner.out_dtype[out_name]
     lat = latents.to(in_dt).contiguous()
-    ctx.set_input_shape("latent", tuple(lat.shape))
+    if "limiter_ceiling" in runner.in_dtype:
+        # Engines built with the ceiling promoted to an input. Bind the shipped default so these
+        # engines are drop-in for callers that know nothing about the parameter; pass
+        # limiter_ceiling=LIMITER_BYPASS to disable limiting (the clamp still bounds the output).
+        cv = DEFAULT_LIMITER_CEILING if limiter_ceiling is None else float(limiter_ceiling)
+        if not hasattr(runner, "_ceil_buf") or float(runner._ceil_buf.item()) != cv:
+            runner._ceil_buf = torch.tensor(cv, dtype=torch.float32, device="cuda")
+        ctx.set_input_shape("limiter_ceiling", ())
+        ctx.set_tensor_address("limiter_ceiling", runner._ceil_buf.data_ptr())
+    elif limiter_ceiling is not None:
+        raise ValueError("this decoder engine has the limiter ceiling baked in; rebuild with "
+                         "build_ship_capped.py --ceiling-input to make it settable")
+    if not ctx.set_input_shape("latent", tuple(lat.shape)):
+        # An out-of-profile shape is REFUSED but does not raise: the context keeps whatever shape
+        # it last held, so the decode returns the previous request's length filled with plausible
+        # audio. Measured: asking a 4096-ceiling engine for 5168 latents returned 4,194,304 samples
+        # (the prior 1024-latent shape) at absmax 32767, and asking for L=1 returned 995,328
+        # samples (the prior window). Both look like healthy audio and are wrong, so this has to be
+        # an error rather than a silent truncation.
+        idx = getattr(ctx, "active_optimization_profile", 0) or 0
+        lo, _, hi = runner.engine.get_tensor_profile_shape("latent", idx)
+        raise ValueError(
+            f"decoder: latent length {lat.shape[-1]} is outside the engine profile "
+            f"[{lo[-1]}, {hi[-1]}] (profile {idx}). Above the ceiling, decode in windows with "
+            f"decode_chunked(); below the floor, rebuild the engine with a lower profile minimum "
+            f"(build_capped.py --min-l 1) -- padding up to the floor is out-of-distribution and "
+            f"measures 0.82-0.97 against a native short decode.")
     out_shape = tuple(ctx.get_tensor_shape(out_name))
     out = torch.empty(out_shape, dtype=out_dt, device="cuda")
     ctx.set_tensor_address("latent", lat.data_ptr())

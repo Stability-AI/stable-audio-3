@@ -425,16 +425,34 @@ def build_ui(initial_dit: str, initial_decoder: str, *,
 
     CTRL = None  # bound after the widgets exist
 
+    def _sig(ctrl):
+        """What the queued take was rendered FROM.
+
+        A pre-rendered take is only reusable while the controls still describe it. Serving
+        it blind means the click after any edit silently returns the OLD settings: generate
+        30 s, drag Seconds to 380, hit Generate, and you get 30 s of audio back. Everything
+        in CTRL is a str/float/bool/None (audio inputs are filepaths), so str() over the
+        tuple is a sound identity -- and it fails CLOSED, since anything it cannot compare
+        simply looks different and forces a fresh render.
+        """
+        return tuple(str(c) for c in ctrl)
+
+    _BLANK = {"current": None, "queued": None, "queued_sig": None, "history": []}
+
     def generate(*args):
         *ctrl, opts, state = args
-        state = dict(state or {"current": None, "queued": None, "history": []})
+        state = dict(state or _BLANK)
         q = state.get("queued")
-        if q is not None:                      # a pre-rendered take is waiting: show it instantly
-            state["queued"] = None
+        if q is not None and state.get("queued_sig") == _sig(ctrl):
+            # still the same request — show the pre-rendered take instantly
+            state["queued"] = state["queued_sig"] = None
             state["current"] = q
             state["history"] = ([q] + state.get("history", []))[:24]
             return _present(state, q, opts, render_queue_status(generating=True),
                             force_autoplay=True)
+        # a control moved since it was queued: that take answers a question no longer
+        # being asked, so drop it and render what the controls say now.
+        state["queued"] = state["queued_sig"] = None
         entry, err = _entry(*ctrl)
         if err:
             return ("", "", f"<span style='color:#f88'>error: {html_lib.escape(err)}</span>",
@@ -446,15 +464,17 @@ def build_ui(initial_dit: str, initial_decoder: str, *,
     def pregen(*args):
         """Render the NEXT take in the background so the following click is instant."""
         *ctrl, opts, state = args
-        state = dict(state or {"current": None, "queued": None, "history": []})
-        if state.get("queued") is not None:
+        state = dict(state or _BLANK)
+        sig = _sig(ctrl)
+        if state.get("queued") is not None and state.get("queued_sig") == sig:
             return render_queue_status(state["queued"]), state
         entry, err = _entry(*ctrl)
         state["queued"] = entry if not err else None
+        state["queued_sig"] = sig if not err else None
         return render_queue_status(state.get("queued")), state
 
     with gr.Blocks(title="SA3 · TensorRT", css=_css) as demo:
-        st = gr.State({"current": None, "queued": None, "history": []})
+        st = gr.State(dict(_BLANK))
         with gr.Row():
             with gr.Column(scale=3):
                 with gr.Row():

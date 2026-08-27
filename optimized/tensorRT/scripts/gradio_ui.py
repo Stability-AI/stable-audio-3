@@ -7,17 +7,14 @@ renderers and filename helpers -- so the two copies only need to be reconciled w
 itself changes.
 """
 from __future__ import annotations
-import base64
 import html as html_lib
-import math
-import os
 import re
 import time
 import urllib.parse
 import wave
-from pathlib import Path
 
-import numpy as np
+
+SAMPLE_RATE = 44100   # every SA3 codec is 44.1 kHz stereo
 
 _JS_FIX_SLIDERS = (
     "() => setTimeout(() => {"
@@ -83,6 +80,11 @@ _JS_TRY_PLAY = (
 # beyond the new clip's duration -> start at zero. Guarded (hsd) so it applies
 # once, on whichever of loadedmetadata/canplay fires first.
 
+_JS_HOTSWAP = ("if(this.isConnected&&this.dataset.hs==='1'&&!this.dataset.hsd&&this.duration){"
+               "this.dataset.hsd=1;var s=window._sa3Pos;"
+               "this.dataset.dbg=s?(s.playing?'playing@'+s.t.toFixed(2):'notplaying@'+s.t.toFixed(2)):'noledger';"
+               "if(s&&s.playing){var tt=s.t+(Date.now()-s.ts)/1000;"
+               "this.currentTime=(tt<this.duration)?tt:0;" + _JS_TRY_PLAY + "}}")
 _JS_SEEK = ("var a=this.closest('.blk').querySelector('audio');"
             "var r=this.getBoundingClientRect();"
             "if(a&&a.duration){a.currentTime=(event.clientX-r.left)/r.width*a.duration;a.play();}")
@@ -147,12 +149,6 @@ def _save_wav(pcm_int16, out_path):
         w.setframerate(SAMPLE_RATE)
         w.writeframes(pcm_int16.tobytes())
 
-
-# ── Model caches (unified memory; ~0.9-2.8 GB per DiT, 0.2-1.7 GB per codec) ──
-# The MLX DiT bakes RoPE/mask lengths at load, so the DiT cache key includes
-# T_lat. Everything else is length-independent and cached by name.
-_t5: T5Gemma | None = None
-_dit_lru: list[tuple[str, int]] = []
 
 def _meta_suffix(entry) -> str:
     """' · cfg 1.5 · noise 0.92 · audio2audio · inpainting' — only the non-defaults.

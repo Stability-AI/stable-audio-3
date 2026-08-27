@@ -900,6 +900,9 @@ class SA3Inference:
         self.dit_name = dit
         self.decoder_name = decoder
         self.precision = precision
+        # _encoder_runner() resolves the encoder by this tier; without it audio-to-audio
+        # and inpainting died on the first attribute read.
+        self.dec_precision = dec_precision
         self.with_encoder = with_encoder
         self.quiet = quiet
 
@@ -972,10 +975,61 @@ class SA3Inference:
         return max(1, math.ceil(seconds * SAMPLE_RATE / SAMPLES_PER_LATENT))
 
     def _share_scratch(self):
-        """One scratch buffer for every loaded engine (see canon.share_scratch)."""
+        """One scratch buffer for every engine loaded at construction (see canon.share_scratch).
+
+        ⚠ Call this ONCE, from __init__, before any execution context or CUDA graph exists.
+        canon.share_scratch() REPLACES each runner's execution context and frees the previous
+        scratch allocation, so calling it again after a render would leave the captured
+        mega-graph and the eager path's contexts pointing at destroyed objects -- a segfault
+        with no Python traceback. That is why the lazily-loaded encoder gets its OWN scratch
+        (see _encoder_runner) instead of being folded in here.
+        """
         buf = canon.share_scratch(self.runners)
         if buf is not None:
             self._scratch, self._scratch_bytes = buf, buf.numel()
+
+    def close(self):
+        """Tear the instance down in the ONE order that is safe on the GPU.
+
+        A captured mega-graph holds raw pointers into the execution contexts it was
+        captured against and into the shared scratch buffer; so do the eager path's
+        _SecondContext objects. Free the runners first and destroying those graphs
+        afterwards touches memory that is already gone -- which surfaces as
+        `CUDA error: an illegal memory access was encountered` on the NEXT render, in
+        a different instance, because a poisoned CUDA context stays poisoned. (That is
+        what the gradio LRU eviction used to do, so switching models twice bricked the
+        server.) Python's own GC order over __dict__ is arbitrary, so relying on
+        refcounting to get this right is not an option: it has to be explicit.
+
+        Idempotent — safe to call twice, and safe on a half-constructed instance.
+        """
+        t = canon.torch
+        try:
+            t.cuda.synchronize()          # nothing may still be in flight
+        except Exception:
+            pass
+        # 1. graphs, 2. eager contexts, 3. runner contexts + engines, 4. the buffer they shared
+        for attr in ("_graphs", "_graph_lru"):
+            try:
+                getattr(self, attr).clear()
+            except Exception:
+                pass
+        self._eager = self._eager_dit = None
+        for _, runner in list(getattr(self, "runners", {}).items()):
+            try:
+                runner.free()
+            except Exception:
+                pass
+        try:
+            self.runners.clear()
+        except Exception:
+            pass
+        self._scratch, self._scratch_bytes = None, 0
+        try:
+            t.cuda.synchronize()
+            t.cuda.empty_cache()
+        except Exception:
+            pass
 
     def _dec_min_L(self) -> int:
         """The loaded decoder engine's real profile floor.
@@ -1072,12 +1126,33 @@ class SA3Inference:
         """The SAME-S/L encoder engine — only needed for audio-to-audio / inpaint."""
         if "enc" not in self.runners:
             _ensure_files(ENCODER_FILES[self.decoder_name])
-            self.runners["enc"] = TRTRunner(
+            # The encoder arrives long after construction -- the first audio-to-audio or
+            # inpaint of a session -- by which point the mega-graph is captured and the
+            # eager contexts exist. Re-running canon.share_scratch() to fold it in would
+            # swap those contexts out and free the buffer underneath them: a segfault with
+            # no traceback, reachable as "generate, audio-to-audio, generate".
+            #
+            # So bind the encoder ALONE. If the buffer the other engines already share is
+            # big enough it costs nothing extra -- the encoder runs before them on the same
+            # stream under the same lock, exactly the sequential-reuse assumption
+            # canon.share_scratch() is built on -- and no other context is touched. Only
+            # when the encoder needs more does it fall back to its own allocation, which is
+            # still strictly additive rather than disruptive.
+            enc = TRTRunner(
                 canon.resolve_encoder_engine(self.decoder_name, self.dec_precision),
                 None, True)
-            # Fold the encoder into the shared buffer, growing it only if the encoder needs more
-            # (a capped encoder needs ~94-130 MB, far below the DiT, so it usually does not).
-            self._share_scratch()
+            need = enc.engine.get_device_memory_size_for_profile_v2(enc.profile)
+            if self._scratch is not None and self._scratch.numel() >= need:
+                enc.context.set_device_memory(self._scratch.data_ptr(), self._scratch.numel())
+            else:
+                enc._scratch = canon.torch.empty(need, dtype=canon.torch.uint8, device="cuda")
+                enc.context.set_device_memory(enc._scratch.data_ptr(), need)
+                if not self.quiet:
+                    sub(dim(f"encoder scratch {need / 2**20:.0f} MiB (own buffer — larger than "
+                            f"the {self._scratch.numel() / 2**20:.0f} MiB shared one)"
+                            if self._scratch is not None else
+                            f"encoder scratch {need / 2**20:.0f} MiB"))
+            self.runners["enc"] = enc
         return self.runners["enc"]
 
     @staticmethod

@@ -510,8 +510,11 @@ def build_ui(initial_dit: str, initial_decoder: str, *,
                     negative_prompt = gr.Textbox(label="Negative prompt", lines=1)
                     chunking = gr.Checkbox(
                         label="Chunked decode (low VRAM)", value=True,
-                        info="On: 256-latent windows, ~509 MB of decoder scratch. Off: single-shot "
-                             "on the wide profile — 10-20% faster above L=256, ~5.4 GB more resident.")
+                        info="On: 256-latent windows — 485 MB of decoder scratch on SAME-L, 346 MB "
+                             "on SAME-S. Off: single-shot on the wide profile — only 2-5% faster "
+                             "end-to-end (the DiT dominates), but 5-7 GB more resident. The scratch "
+                             "is a profile-ceiling reservation, so switching it off costs the same "
+                             "at 30 s as at 380 s.")
                 with gr.Accordion("Audio-to-audio (guide the whole clip)", open=False):
                     a2a_audio = gr.Audio(label="Guide audio — generation starts from its latents",
                                          type="filepath")

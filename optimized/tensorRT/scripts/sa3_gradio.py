@@ -303,8 +303,10 @@ def build_ui(initial_dit: str, initial_decoder: str, *,
     def _entry(dit_name, decoder_name, variant_path, dec_variant_path, prompt, negative_prompt,
                seconds, steps, seed_text, cfg, apg, sigma_max, chunking, fmt,
                a2a_path, a2a_sigma, inpaint_path, inp_start, inp_end):
-        if not prompt or not prompt.strip():
-            return None, "empty prompt"
+        # An empty prompt is a legitimate request, not an error: it generates
+        # unconditionally. The encoder takes the empty string happily, and both
+        # renderers already caption it "(no prompt)".
+        prompt = (prompt or "").strip()
         try:
             seed = int(seed_text.strip()) if seed_text and seed_text.strip() else None
         except ValueError:
@@ -364,14 +366,15 @@ def build_ui(initial_dit: str, initial_decoder: str, *,
         elif neg:
             notes.append("negative prompt ignored — it only applies when CFG > 1")
         try:
-            pcm, t = inf.generate(prompt.strip(), seconds=float(seconds), steps=int(steps),
+            pcm, t = inf.generate(prompt, seconds=float(seconds), steps=int(steps),
                                   seed=seed, **kw)
         except NotImplementedError as e:
             return None, f"not supported by this engine: {e}"
         except Exception as e:
             return None, f"{type(e).__name__}: {e}"
 
-        base = verbose_basename(prompt, neg, float(cfg), float(sigma_max), t["seed"])
+        base = verbose_basename(prompt or "unconditional", neg,
+                                float(cfg), float(sigma_max), t["seed"])
         out_path = OUTPUT_DIR / f"{base}.wav"
         _save_wav(pcm, out_path)
         if fmt in ("flac", "mp3"):
@@ -400,7 +403,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *,
             "neg": neg, "cfg": float(cfg), "smx": float(sigma_max),
             "path": str(out_path), "mime": mime, "name": out_path.name,
             "size_mb": out_path.stat().st_size / 1e6, "mode": mode,
-            "prompt": prompt.strip(), "seed": t["seed"],
+            "prompt": prompt, "seed": t["seed"],
             "lora": "",                       # kept for the shared renderer's contract
             "spec_b64": spec_b64, "timing": timing,
         }, None

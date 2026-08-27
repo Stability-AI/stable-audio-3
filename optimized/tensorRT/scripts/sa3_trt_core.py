@@ -10,7 +10,7 @@ Usage:
 If --dit or --decoder is omitted, the script prompts the user interactively.
 """
 from __future__ import annotations
-import argparse, math, os, random, sys, termios, time, tty, wave
+import argparse, math, os, random, subprocess, sys, termios, time, tty, wave
 from pathlib import Path
 
 import numpy as np
@@ -425,6 +425,75 @@ def sub(text: str):
 
 
 # ─── Lazy download from HuggingFace ──────────────────────────────────────
+# Autoencoder engines the local build script knows how to produce. Anything else
+# (DiT, T5Gemma) has to come from the model repo or build_from_onnx.py.
+_BUILDABLE_PREFIXES = ("same-l/", "same-s/")
+
+
+def _build_autoencoders(targets: list[str]) -> None:
+    """Run build/build_autoencoders.py for the missing autoencoder engines."""
+    script = Path(__file__).resolve().parent.parent / "build" / "build_autoencoders.py"
+    if not script.exists():
+        raise FileNotFoundError(f"build script not found at {script}")
+    # One invocation per MODEL, not per (model, kind): the decoder check is an
+    # encode->decode round trip, so asking for --kind dec alone leaves it unverifiable.
+    # Engines that already exist are skipped by the build script anyway, so covering both
+    # kinds costs nothing when only one is actually missing.
+    models = []
+    for t in targets:
+        model = t.split("/", 1)[0]
+        if model not in models:
+            models.append(model)
+    for model in models:
+        cmd = [sys.executable, str(script), "--model", model]
+        print(f"\n  {dim('$')} {' '.join(cmd[1:])}", flush=True)
+        rc = subprocess.call(cmd)
+        if rc != 0:
+            raise RuntimeError(f"build_autoencoders.py --model {model} exited {rc}")
+
+
+def _build_or_die(absent: list[str], missing: list[str]) -> None:
+    """Offer to build what is missing; raise with instructions if we cannot.
+
+    Prebuilt engines exist only for the architectures we have hardware to build and
+    verify on. On anything else the autoencoders are a ~10 minute local build, so ask
+    rather than dumping a 404 — and ask BEFORE downloading, so nobody pays 3 GB for a
+    DiT only to hit a missing decoder afterwards.
+    """
+    arch = Path(HF_SUBDIR).name
+    buildable = [a for a in absent if a.startswith(_BUILDABLE_PREFIXES)]
+    other = [a for a in absent if a not in buildable]
+    print(f"\n  {bold(f'No prebuilt engines for {arch}')} — "
+          f"{len(absent)} of the {len(missing)} file(s) this configuration needs "
+          f"are not published:")
+    for a in absent:
+        print(f"    {a}" + ("" if a in buildable else dim("   (not locally buildable)")))
+    if other:
+        raise FileNotFoundError(
+            f"{len(other)} engine(s) cannot be built by build_autoencoders.py: "
+            + ", ".join(other)
+            + f"\n  Build them with optimized/tensorRT/build/build_from_onnx.py, or pick a "
+              f"configuration whose engines are published for {arch}.")
+    print(f"\n  These are autoencoders — buildable here from the published ONNX in about "
+          f"10 minutes.")
+    if not sys.stdin.isatty():
+        raise FileNotFoundError(
+            f"cannot prompt (stdin is not a terminal). Build them with:\n"
+            f"    python optimized/tensorRT/build/build_autoencoders.py\n"
+            f"  They land in optimized/tensorRT/models/{arch}/ and are picked up "
+            f"automatically.")
+    try:
+        ans = input(f"  Build them now for {arch}? [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = "n"
+    if ans in ("", "y", "yes"):
+        _build_autoencoders(buildable)
+    else:
+        raise FileNotFoundError(
+            f"declined. Build them later with:\n"
+            f"    python optimized/tensorRT/build/build_autoencoders.py")
+
+
 def _ensure_files(rel_paths: list[str]) -> None:
     """Download any of these (relative to ARCH_DIR) that don't exist locally.
 
@@ -455,17 +524,21 @@ def _ensure_files(rel_paths: list[str]) -> None:
     if published is not None:
         absent = [r for r in missing if f"{HF_SUBDIR}/{r}" not in published]
         if absent:
-            arch = Path(HF_SUBDIR).name
-            raise FileNotFoundError(
-                f"no prebuilt engines for {arch} — {len(absent)} of the {len(missing)} file(s) "
-                f"this configuration needs are not published:\n"
-                + "".join(f"    {a}\n" for a in absent)
-                + f"\n  Prebuilt engines are published only for the architectures we have "
-                  f"hardware to build and verify on. Build them for {arch} with:\n"
-                  f"    python optimized/tensorRT/build/build_autoencoders.py\n"
-                  f"  (autoencoders; ~10 min) and build_from_onnx.py for any missing DiT.\n"
-                  f"  They land in optimized/tensorRT/models/{arch}/ and are picked up "
-                  f"automatically.")
+            _build_or_die(absent, missing)
+            missing = [p for p in missing if not (ARCH_DIR / p).exists() or
+                                             (ARCH_DIR / p).stat().st_size == 0]
+            # Anything still absent locally AND absent from the Hub would otherwise fall
+            # into the download loop below and 404 — the exact bare traceback this whole
+            # path exists to avoid.
+            still = [r for r in missing if f"{HF_SUBDIR}/{r}" not in published]
+            if still:
+                raise FileNotFoundError(
+                    "the build finished but these engines are still missing, and they are "
+                    "not on the Hub either:\n"
+                    + "".join(f"    {r}\n" for r in still)
+                    + "  Check the build output above for the failure.")
+            if not missing:
+                return
 
     print(f"  {dim('downloading')} {len(missing)} missing file(s) from {HF_REPO_ID}/{HF_SUBDIR}")
     for rel in missing:

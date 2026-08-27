@@ -214,6 +214,17 @@ def verify(built: dict, out_root: Path) -> bool:
             else:
                 enc_key = key.replace("dec", "enc")
                 ep = out_root / TARGETS[enc_key]["out"]
+                if not ep.exists():
+                    # The decoder check is a round trip, so it needs the matching encoder.
+                    # Building with --kind dec alone is legitimate (the encoder may already
+                    # be deployed elsewhere), so say what is missing instead of reporting a
+                    # failure the engine is not responsible for. No synthetic latent stands
+                    # in here: a fabricated signal would not exercise the decoder the way
+                    # real content does, and a green tick from one would be worse than none.
+                    print(f"  {spec['out']:>40s}  SKIP  needs {TARGETS[enc_key]['out']} for "
+                          f"the round trip — build without --kind, or --kind enc first",
+                          flush=True)
+                    continue
                 x = torch.from_numpy(_test_signal(L)).unsqueeze(0).cuda()
                 z, _ = run(ep, 0, "audio", x)
                 zt = torch.from_numpy(z).cuda()

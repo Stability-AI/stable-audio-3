@@ -107,14 +107,14 @@ DIT_ENGINE_FILES = {
 }
 DECODER_FILES = {
     "same-s": [
-        "same-s/dec_dynamic_bf16.trt",
+        "same-s/dec_bf16_chunkable_limiter.trt",
     ],
     "same-l": [
         "same-l/dec_dynamic_triton_swa.trt",
     ],
 }
 ENCODER_FILES = {
-    "same-s": ["same-s/enc_dynamic_bf16.trt"],
+    "same-s": ["same-s/enc_bf16_chunkable.trt"],
     "same-l": ["same-l/enc_fp16_chunkable.trt"],
 }
 SHARED_FILES = [
@@ -140,11 +140,11 @@ DIT_CHOICES = {
 # repo and are reachable through the "legacy" tier below; nothing was moved or deleted, so an
 # older checkout still resolves its own filenames.
 DECODER_PATHS = {
-    "same-s": ARCH_DIR / "same-s" / "dec_dynamic_bf16.trt",
+    "same-s": ARCH_DIR / "same-s" / "dec_bf16_chunkable_limiter.trt",
     "same-l": ARCH_DIR / "same-l" / "dec_fp16_chunkable_limiter.trt",
 }
 ENCODER_PATHS = {
-    "same-s": ARCH_DIR / "same-s" / "enc_dynamic_bf16.trt",
+    "same-s": ARCH_DIR / "same-s" / "enc_bf16_chunkable.trt",
     "same-l": ARCH_DIR / "same-l" / "enc_fp16_chunkable.trt",
 }
 
@@ -261,8 +261,12 @@ def normalize_precision(precision):
 #  the engine was byte-for-byte the size/speed of the bf16 baseline with slightly lossier weights —
 #  strictly dominated. For a max-fidelity decoder use --precision fp32.)
 DECODER_TIER_FILENAME = {
-    "same-s": {"canonical": DECODER_ENGINE_FILENAME["same-s"]["fp16"],
-               "fp8": "dec_fp8.trt", "fp8_fast": "dec_fp8_fast.trt"},
+    # ⚠ SAME-S is BF16 -- SAME-L is the fp16 one. Its chunkable decoder is also the DETERMINISTIC
+    # rebuild: the legacy engine has a RandomNormalLike at its bottleneck, so two runs of it differ
+    # by ~0.9989 and any A/B against it is floored there.
+    "same-s": {"canonical": "dec_bf16_chunkable_limiter.trt",
+               "fp8": "dec_fp8.trt", "fp8_fast": "dec_fp8_fast.trt",
+               "legacy": "dec_dynamic_bf16.trt"},
     # ⚠ "legacy" is the pre-chunkable engine, kept reachable so renders made before the limiter
     # landed can be reproduced exactly -- the limiter CHANGES the audio, so a same-name swap
     # would silently alter old output. It is still on the model repo; nothing was moved.
@@ -271,8 +275,9 @@ DECODER_TIER_FILENAME = {
                "legacy": "dec_dynamic_triton_swa.trt"},
 }
 ENCODER_TIER_FILENAME = {
-    "same-s": {"canonical": "enc_dynamic_bf16.trt",
-               "fp8": "enc_fp8.trt", "fp8_fast": "enc_fp8_fast.trt"},
+    "same-s": {"canonical": "enc_bf16_chunkable.trt",
+               "fp8": "enc_fp8.trt", "fp8_fast": "enc_fp8_fast.trt",
+               "legacy": "enc_dynamic_bf16.trt"},
     # ⚠ the old same-l enc_fp8.trt was REMOVED from the model repo: its activation quantisers
     # were calibrated with p99.9-within-clip → p90-across-clips → a 1e-4 floor, putting the clip
     # points at 0.04-1.22 where the decoder's plain amax puts them at 22.4. That cost up to

@@ -204,10 +204,12 @@ why **Triton is required at inference on sm_90 but not on sm_120**. Building you
 covered under "Choosing the SAME-L attention kernel" in
 [`build/README.md`](build/README.md).
 
-### SAME-L chunkable engines (canonical)
+### Chunkable engines (canonical, both decoders)
 
 `--decoder same-l` now resolves to `dec_fp16_chunkable_limiter.trt` / `enc_fp16_chunkable.trt`,
-with `--dec-precision fp8` selecting the fp8 pair. Two things changed.
+and `--decoder same-s` to `dec_bf16_chunkable_limiter.trt` / `enc_bf16_chunkable.trt`, with
+`--dec-precision fp8` selecting SAME-L's fp8 pair. (SAME-S is **bf16** — SAME-L is the fp16 one.)
+Two things changed.
 
 **Two optimization profiles per engine.** TensorRT commits a context's scratch at
 `create_execution_context()` — sized from the profile ceiling, *before any shape is bound* — so the
@@ -216,8 +218,9 @@ new engines carry a low band (decoder 256 latents, encoder 64) and a wide band (
 
 | | scratch | decode |
 |---|---|---|
-| `--chunking` (default) | **509 MB** decoder, **130 MB** encoder | 256-latent windows |
-| `--no-chunking` | 8143 MB decoder, 8330 MB encoder | one single-shot call |
+| `--chunking` (default), SAME-L | **509 MB** decoder, **521 MB** encoder | 256-latent windows |
+| `--chunking` (default), SAME-S | **363 MB** decoder, **365 MB** encoder | 256-latent windows |
+| `--no-chunking` | 8143 / 8330 MB (SAME-L), 5780 / 5800 (SAME-S) | one single-shot call |
 
 Chunking is a **memory** mechanism, not a speed one. It wins on time only at exactly L=256, where
 the whole request is one window; above that, single-shot is 10–20% faster. Whole-pipeline resident
@@ -229,6 +232,13 @@ changes it per call with no rebuild and no recapture; a large value bypasses it 
 old behaviour exactly. ⚠ **This changes the audio.** To reproduce renders made before it landed,
 use `--dec-precision legacy`, which resolves to the previous engines — still published, nothing was
 moved.
+
+The low band's ceiling is 256 latents on both decoders and both encoders. It is a real dial:
+raising it costs scratch and cuts the window count, lowering it does the reverse. On SAME-S the
+choice carries no quality axis at all — windowed decode there is *bit-identical* to single-shot,
+because its receptive field fits inside the 16-latent trim. On SAME-L it does: encode accuracy
+improves monotonically with window width, which is why the encoder's low band is 256 and not the
+64 it originally shipped with (1.3&ndash;1.5&times; faster and cos 0.99969 against 0.99831).
 
 Also worth knowing when building your own: a profile is `(min, opt, max)`, and the two ends do
 different jobs. **`max` sets VRAM; `opt` sets which shapes get the good kernels** and costs nothing.

@@ -87,13 +87,20 @@ def discover_variants(dit_name: str) -> list[tuple[str, Path]]:
     return out
 
 
+# Pre-chunkable engines. Removed from the model repo's download path and hidden from the picker.
+RETIRED_DECODERS = {"dec_dynamic_bf16.trt", "dec_dynamic_triton_swa.trt", "dec_dynamic_fp32.trt",
+                    "dec_fp8.trt", "dec_fp8_fast.trt"}
+
+
 def discover_decoder_variants(decoder_name: str) -> list[tuple[str, Path]]:
     """Return [(label, path)] of decoder quantization tiers for this decoder —
-    canonical first. Uses the known tier set (canonical / fp8 / fp8_fast;
-    see quantize/README.md); engines auto-download from HF on selection if missing.
-    Any extra local dec_*.trt not in the known set are appended.
+    canonical first. Uses the known tier set (canonical / fp8; see quantize/README.md); engines
+    auto-download from HF on selection if missing. Any extra local dec_*.trt not in the known set
+    are appended, so a self-built variant shows up — except the RETIRED pre-chunkable engines,
+    which are filtered out. A leftover copy of one of those in models/ would otherwise appear in
+    the picker and silently serve pre-limiter audio with a 5.7-8.1 GB scratch reservation.
     """
-    out, known = [], set()
+    out, known = [], set(RETIRED_DECODERS)
     for tier, fname in canon.DECODER_TIER_FILENAME.get(decoder_name, {}).items():
         label = f"{tier} (canonical)" if tier == "canonical" else tier
         out.append((label, canon.ARCH_DIR / decoder_name / fname))
@@ -204,6 +211,12 @@ def get_inference(dit: str, decoder: str, dit_variant_path: str,
     inf = SA3Inference(dit, decoder,
                         dec_precision=dec_tier,
                         chunking=chunking,
+                        # pass the picked files explicitly -- mutating canon.DIT_CHOICES /
+                        # DECODER_PATHS above does not reach the resolver, so the dropdowns
+                        # were silently ignored for the DiT.
+                        dit_engine=(None if str(dit_variant_path).startswith("<")
+                                    else dit_variant_path),
+                        dec_engine=dec_variant_path,
                         default_T_lat=default_T_lat,
                         default_steps=default_steps,
                         default_seconds=default_seconds,

@@ -231,8 +231,8 @@ VRAM for a six-minute render drops from ~21.5 GB to ~3.9 GB.
 the `('latent', 'pcm')` signature of the pre-limiter builds and drop straight in — a baked engine
 is bit-exact against a runtime-input one and about 4% faster. Rebuild with `--ceiling-input` if you
 want it settable per call. ⚠ **This changes the audio.** To reproduce renders made before it landed,
-use `--dec-precision legacy`, which resolves to the previous engines — still published, nothing was
-moved.
+the pre-limiter engines are no longer reachable from the runtime — rebuild one from the pristine
+`onnx/same-*/dec_dynamic_*.onnx` if you need it.
 
 The low band's ceiling is 256 latents on both decoders and both encoders. It is a real dial:
 raising it costs scratch and cuts the window count, lowering it does the reverse. On SAME-S the
@@ -295,7 +295,7 @@ variance once the graph is built).
 | `--inpaint-range`    | —           | `START,END` seconds; regenerate that span, keep the rest                       |
 | `--chunking`         | on          | SAME-L: windowed decode on the low profile (509 MB scratch). `--no-chunking` = single-shot on the wide profile, faster above L=256, ~5.4 GB more resident |
 | `--limiter-ceiling`  | baked 0.977 | Only for engines built `--ceiling-input`; the shipped ones bake it |
-| `--dec-precision`    | canonical   | `canonical` (fp16 for SAME-L, bf16 for SAME-S), `fp8`, or `legacy` (pre-limiter engines, for reproducing old renders) |
+| `--dec-precision`    | canonical   | `canonical` (fp16 for SAME-L, bf16 for SAME-S) or `fp8`. Both are chunkable and carry the limiter |
 | `--quiet`            | off         | Suppress per-stage prints + NVML probes — saves ~4 ms                          |
 | `--pinned-copy`      | on          | Pinned host buffer + non_blocking DtoH for Stage 5                             |
 | `--free-models`      | off         | Free TRT engine memory after each stage's last use                             |

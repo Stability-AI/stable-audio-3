@@ -110,7 +110,7 @@ DECODER_FILES = {
         "same-s/dec_bf16_chunkable_limiter.trt",
     ],
     "same-l": [
-        "same-l/dec_dynamic_triton_swa.trt",
+        "same-l/dec_fp16_chunkable_limiter.trt",
     ],
 }
 ENCODER_FILES = {
@@ -234,12 +234,12 @@ DECODER_ENGINE_FILENAME = {
         # decoder itself rather than a consequence of the DiT's precision.
         "fp8":  "dec_fp16_chunkable_limiter.trt",
         "fp16": "dec_fp16_chunkable_limiter.trt",
-        "fp32": "dec_dynamic_fp32.trt",
+        "fp32": "dec_fp16_chunkable_limiter.trt",
     },
     "same-s": {
-        "fp8":  "dec_dynamic_bf16.trt",
-        "fp16": "dec_dynamic_bf16.trt",
-        "fp32": "dec_dynamic_fp32.trt",
+        "fp8":  "dec_bf16_chunkable_limiter.trt",
+        "fp16": "dec_bf16_chunkable_limiter.trt",
+        "fp32": "dec_bf16_chunkable_limiter.trt",
     },
 }
 PRECISIONS = ("fp8", "fp16", "fp32")
@@ -253,8 +253,11 @@ def normalize_precision(precision):
 
 # ── Decoder / encoder quantization TIERS (orthogonal to the DiT --precision) ──
 # Train-free fp8 tiers grafted onto the bf16 export (see quantize/README.md).
-# "canonical" = the shipped default decoder engine. The others are downloaded from HF on demand
-# (tensorRT/<arch>/<same-*>/dec_*.trt) — the same wide-profile engines built by quantize/build_tiers.py.
+# "canonical" = the shipped default decoder engine. Both tiers are CHUNKABLE: two optimization
+# profiles (a 256-latent low band for minimum scratch, a 4096 wide band for single-shot) and a
+# baked limiter. The pre-chunkable engines are no longer reachable from the runtime -- they have
+# no limiter, reserve 5.7-8.1 GB regardless of render length, and SAME-S's was stochastic. Build
+# them with build/build_autoencoders.py, not by hand.
 #   fp8       fp8 FFN GEMMs (near-transparent, ~1.14×) — the speed pick
 # (the SAME-S-only "fp8_fast" tier — fp8 on the attention projections too — is RETIRED. It put fp8
 #  compute on exactly the layers with the outlier activations, and measured 9.21 dB against eager
@@ -267,19 +270,13 @@ DECODER_TIER_FILENAME = {
     # rebuild: the legacy engine has a RandomNormalLike at its bottleneck, so two runs of it differ
     # by ~0.9989 and any A/B against it is floored there.
     "same-s": {"canonical": "dec_bf16_chunkable_limiter.trt",
-               "fp8": "dec_fp8_chunkable_limiter.trt",
-               "legacy": "dec_dynamic_bf16.trt"},
-    # ⚠ "legacy" is the pre-chunkable engine, kept reachable so renders made before the limiter
-    # landed can be reproduced exactly -- the limiter CHANGES the audio, so a same-name swap
-    # would silently alter old output. It is still on the model repo; nothing was moved.
+               "fp8": "dec_fp8_chunkable_limiter.trt"},
     "same-l": {"canonical": "dec_fp16_chunkable_limiter.trt",
-               "fp8": "dec_fp8_chunkable_limiter.trt",
-               "legacy": "dec_dynamic_triton_swa.trt"},
+               "fp8": "dec_fp8_chunkable_limiter.trt"},
 }
 ENCODER_TIER_FILENAME = {
     "same-s": {"canonical": "enc_bf16_chunkable.trt",
-               "fp8": "enc_fp8_chunkable.trt",
-               "legacy": "enc_dynamic_bf16.trt"},
+               "fp8": "enc_fp8_chunkable.trt"},
     # ⚠ the old same-l enc_fp8.trt was REMOVED from the model repo: its activation quantisers
     # were calibrated with p99.9-within-clip → p90-across-clips → a 1e-4 floor, putting the clip
     # points at 0.04-1.22 where the decoder's plain amax puts them at 22.4. That cost up to
@@ -287,10 +284,9 @@ ENCODER_TIER_FILENAME = {
     # recalibrated with amax (build/recalib_enc_fp8.py) and measures 30.9 dB where the old one
     # measured 18.3.
     "same-l": {"canonical": "enc_fp16_chunkable.trt",
-               "fp8": "enc_fp8_chunkable.trt",
-               "legacy": "enc_dynamic_triton_swa.trt"},
+               "fp8": "enc_fp8_chunkable.trt"},
 }
-DECODER_TIERS = ("canonical", "fp8", "legacy")
+DECODER_TIERS = ("canonical", "fp8")
 
 
 def get_decoder_tier_path(decoder_name: str, tier: str = "canonical") -> Path:
@@ -541,15 +537,25 @@ class TRTRunner:
         if self.engine is None:
             raise RuntimeError(f"failed to deserialize {engine_path}")
         self.profile = int(profile or 0)
-        if user_managed:
-            self.context = self.engine.create_execution_context(
-                trt.ExecutionContextAllocationStrategy.USER_MANAGED)
-        else:
-            self.context = self.engine.create_execution_context()
+        self._scratch = None
+        # ⚠ NEVER create_execution_context() with no strategy on a multi-profile engine. A DEFAULT
+        # context reserves `device_memory_size`, which is the MAX ACROSS PROFILES -- on the
+        # two-profile autoencoders that is the wide band, 8143 MB where the low band needs 509, so
+        # selecting the low profile would save exactly nothing. Measured: a default context on the
+        # SAME-L decoder took 9608 MiB where the same engine on profile 0 takes 1840.
+        self.context = self.engine.create_execution_context(
+            trt.ExecutionContextAllocationStrategy.USER_MANAGED)
         if self.profile and self.engine.num_optimization_profiles > 1:
             st = torch.cuda.current_stream()
             self.context.set_optimization_profile_async(self.profile, st.cuda_stream)
             st.synchronize()
+        if not user_managed:
+            # Own exactly the selected profile's requirement. user_managed=True means the caller
+            # supplies the buffer instead (see SA3Inference._share_scratch, which gives one
+            # allocation to every engine because they run sequentially on one stream).
+            need = self.engine.get_device_memory_size_for_profile_v2(self.profile)
+            self._scratch = torch.empty(need, dtype=torch.uint8, device="cuda")
+            self.context.set_device_memory(self._scratch.data_ptr(), need)
         self.stream = torch.cuda.Stream()
         # I/O dtype/name maps
         self.in_dtype = {}
@@ -565,8 +571,58 @@ class TRTRunner:
     def free(self):
         """Best-effort engine teardown — frees device memory back to CUDA."""
         del self.context
+        self._scratch = None          # release the scratch this runner owns, if any
         del self.engine
         torch.cuda.empty_cache()
+
+
+def share_scratch(runners: dict, order=("t5", "dit", "dec", "enc")):
+    """Give every engine ONE scratch buffer, sized to what the bound shapes actually need.
+
+    Two independent wins, both pure allocation -- no rebuild, no numerical change:
+
+    1. SHAPE-EXACT sizing. `device_memory_size` is the worst case TRT commits for a whole profile;
+       `update_device_memory_size_for_shapes()` reports what the bound shapes need. On the large
+       fp16 DiT those differ by 44%.
+    2. SHARING. T5 -> DiT (xN) -> decoder run strictly sequentially on one stream, and the encoder
+       runs before them, so one buffer serves all of them instead of each holding its own.
+
+    ⚠ The per-engine fallback is get_device_memory_size_for_profile_v2(idx), NOT
+    device_memory_size: on a multi-profile engine the latter is the MAX ACROSS PROFILES, so a
+    low-band deployment would size the buffer for the wide band and save nothing.
+
+    Returns the buffer; keep a reference alive for as long as the runners are used.
+    """
+    names = [n for n in order if n in runners]
+    need, ctxs = 0, {}
+    for n in names:
+        r = runners[n]
+        e = r.engine
+        ctx = e.create_execution_context(trt.ExecutionContextAllocationStrategy.USER_MANAGED)
+        idx = getattr(r, "profile", 0) or 0
+        if e.num_optimization_profiles > 1 and idx:
+            st = torch.cuda.current_stream()
+            ctx.set_optimization_profile_async(idx, st.cuda_stream)
+            st.synchronize()
+        for i in range(e.num_io_tensors):
+            tn = e.get_tensor_name(i)
+            if e.get_tensor_mode(tn) != trt.TensorIOMode.INPUT:
+                continue
+            _, _, hi = e.get_tensor_profile_shape(tn, idx)
+            ctx.set_input_shape(tn, tuple(hi))
+        try:
+            need = max(need, ctx.update_device_memory_size_for_shapes())
+        except Exception:
+            need = max(need, e.get_device_memory_size_for_profile_v2(idx))
+        ctxs[n] = ctx
+    if need <= 0:
+        return None
+    buf = torch.empty(need, dtype=torch.uint8, device="cuda")
+    for n, ctx in ctxs.items():
+        ctx.set_device_memory(buf.data_ptr(), need)
+        runners[n].context = ctx   # drops the runner's own context + its private scratch
+        runners[n]._scratch = None
+    return buf
 
 
 def _run_engine(runner: "TRTRunner", ctx, what: str) -> None:
@@ -886,6 +942,23 @@ DEFAULT_DECODER_CHUNK_LAT = 256   # 0.36 GB of scratch for SAME-S, 0.51 GB for S
 DEFAULT_DECODER_TRIM_LAT = 16     # dropped from each interior edge; must be EVEN
 
 
+def decode_auto(runner: "TRTRunner", latents: torch.Tensor, **kw) -> torch.Tensor:
+    """decoder_decode, or decode_chunked when the request exceeds the runner's bound ceiling.
+
+    The shipped decoders carry two profiles; whichever one the runner selected fixes the largest
+    latent count a single enqueue may bind. Calling decoder_decode past that does not silently
+    truncate -- TRT refuses the shape and the enqueue fails -- so every caller that does not know
+    the render length in advance should come through here.
+    """
+    try:
+        _, hi = profile_bounds(runner, "latent")
+    except Exception:
+        hi = 0
+    if hi and latents.shape[-1] > hi:
+        return decode_chunked(runner, latents, chunk_lat=hi, balance=True, **kw)
+    return decoder_decode(runner, latents, **kw)
+
+
 def decode_chunked(runner: TRTRunner, latents: torch.Tensor, *,
                    chunk_lat: int = DEFAULT_DECODER_CHUNK_LAT,
                    trim_lat: int = DEFAULT_DECODER_TRIM_LAT,
@@ -923,7 +996,11 @@ def decode_chunked(runner: TRTRunner, latents: torch.Tensor, *,
       warmup_passes: zero-latent calls at chunk_lat before the real windows, matching
                      encode_chunked -- these engines dislike in-loop shape transitions.
 
-    Returns: same flavor as decoder_decode -- (1, L*4096, 2) int32 pcm, or (1, 2, L*4096) audio.
+    Returns: same LAYOUT as decoder_decode, but for pcm-flavour engines the accumulator is
+    **int16, not int32** -- the values are already clamped to int16 range and holding the
+    full-length output in int32 would double the one buffer chunking exists to shrink. Callers
+    must therefore test for an INTEGER dtype, not specifically int32: treating int16 pcm as float
+    audio scales it by 32767 a second time and saturates every sample (rms 0.9997, exit 0).
     """
     if trim_lat % 2:
         raise ValueError(f"trim_lat must be even to keep chunk starts even, got {trim_lat}")
@@ -1799,11 +1876,11 @@ def main():
     for _ in range(WARMUP_PASSES):
         _ = t5gemma_encode(runners["t5"], tokenizer, " ")
         _ = dit.step(_w_x, _w_t, _w_h, _w_m, 30.0, _w_l)
-        dec_out = decoder_decode(runners["dec"], _w_lat)
+        dec_out = decode_auto(runners["dec"], _w_lat)
         # Also warm the Stage-5 narrow+DtoH path — first inference used to
         # spend ~10 ms here on cold-launch overhead. Mirror the production
         # path exactly.
-        if dec_out.dtype == torch.int32:
+        if dec_out.dtype in (torch.int32, torch.int16):   # pcm-baked; see decode_chunked
             pcm_w = dec_out[0].to(torch.int16)
             if _pinned_pcm is not None:
                 _pinned_pcm.copy_(pcm_w, non_blocking=True)
@@ -1812,7 +1889,8 @@ def main():
         else:
             _ = dec_out.cpu().numpy()
         if _w_audio is not None:
-            _ = encoder_encode(runners["enc"], _w_audio)
+            _ = encode_chunked(runners["enc"], _w_audio, warmup_passes=0,
+                               balance=True)
 
     # One full sampling-loop pass: primes sample_flow_pingpong's per-step body
     # (t_curr.unsqueeze, the in-loop torch.randn(generator=g) variant, the
@@ -1998,11 +2076,11 @@ def main():
 
     # ── 4. Decoder ──
     t0 = time.time()
-    audio = decoder_decode(runners["dec"], latents)
+    audio = decode_auto(runners["dec"], latents)
     if args.free_models:
         runners["dec"].free(); del runners["dec"]
     decode_ms = (time.time() - t0) * 1000
-    _pcm_baked = audio.dtype == torch.int32
+    _pcm_baked = audio.dtype in (torch.int32, torch.int16)   # see decode_chunked
     stage("[4/5]", f"Decoder ({args.decoder})", decode_ms)
     sub(f"audio {tuple(audio.shape)} {audio.dtype}"
         f"{'  (pcm baked-in)' if _pcm_baked else ''}")

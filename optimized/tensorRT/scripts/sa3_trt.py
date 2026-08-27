@@ -695,6 +695,8 @@ class SA3Inference:
                  models_dir: Path | None = None,
                  with_encoder: bool = False,
                  chunking: bool = True,
+                 dit_engine: "Path | str | None" = None,
+                 dec_engine: "Path | str | None" = None,
                  quiet: bool = False):
         """Load engines + build a warmup graph.
 
@@ -719,6 +721,14 @@ class SA3Inference:
             models_dir:     override the canonical models/ root (optional)
             with_encoder:   also load the audio encoder TRT engine (needed for
                             future audio-to-audio / inpaint modes)
+            dit_engine:     explicit DiT engine path, overriding the precision-derived default.
+                            ⚠ Needed by any caller that picks an engine FILE rather than a
+                            precision: get_dit_engine_path() rebuilds the path from
+                            <arch>/<subdir>/dit_<precision>.trt and ignores DIT_CHOICES[...]
+                            ["engine"], so mutating that global silently had no effect -- the
+                            gradio variant dropdown was a no-op and every render used the fp16
+                            engine whatever the user chose.
+            dec_engine:     same, for the decoder.
             chunking:       True (default) selects the engines' LOW band -- decode in
                             256-latent windows, encode in 64 -- which is the only thing that
                             reduces the scratch reservation, because TRT commits scratch from
@@ -803,14 +813,16 @@ class SA3Inference:
         import concurrent.futures
         engine_specs = {
             "t5":  canon.T5GEMMA_PATH,
-            "dit": canon.get_dit_engine_path(dit, precision),
-            "dec": canon.resolve_decoder_engine(decoder, precision, dec_precision),
+            "dit": Path(dit_engine) if dit_engine else canon.get_dit_engine_path(dit, precision),
+            "dec": (Path(dec_engine) if dec_engine else
+                    canon.resolve_decoder_engine(decoder, precision, dec_precision)),
         }
         if with_encoder:
             engine_specs["enc"] = canon.resolve_encoder_engine(decoder, dec_precision)
         t0 = time.time()
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(engine_specs)) as ex:
-            futs = {name: ex.submit(TRTRunner, path, None, False,
+            # user_managed=True -- _share_scratch() immediately below owns the allocation.
+            futs = {name: ex.submit(TRTRunner, path, None, True,
                                     self.dec_profile if name in ("dec", "enc") else 0)
                     for name, path in engine_specs.items()}
             self.runners = {name: fut.result() for name, fut in futs.items()}
@@ -844,62 +856,10 @@ class SA3Inference:
         return max(1, math.ceil(seconds * SAMPLE_RATE / SAMPLES_PER_LATENT))
 
     def _share_scratch(self):
-        """One scratch buffer for every engine, sized to what the bound shapes actually need.
-
-        Two independent wins, both pure allocation -- no engine rebuild, no numerical change:
-
-        1. SHAPE-EXACT sizing. `engine.device_memory_size` is the worst case TensorRT commits for
-           the whole profile; `update_device_memory_size_for_shapes()` reports what the bound
-           shapes need. For the LARGE fp16 DiT those differ by 44%: it commits 2064 MiB and needs
-           1147 at EVERY length from 32 to 4096. sm-music and medium show no gap (98-100%), so this
-           is specific to the large engine -- plausibly its FP32 islands admitting a tactic whose
-           worst case never occurs. Verified bit-identical output at the reduced allocation.
-
-        2. SHARING. T5 -> DiT (x8) -> decoder run strictly sequentially on one stream, and the
-           encoder (a2a / inpaint) runs before them, so one buffer serves all of them instead of
-           each reserving its own. Verified bit-identical and stable under CUDA-graph capture.
-
-        The buffer is sized once, at each engine's PROFILE MAX, not at the current render length.
-        That is deliberate: the requirement barely moves with length (1145 MiB at L=32 vs 1151 at
-        L=4096, ~6 MiB over the whole range), while re-sizing later would invalidate an already
-        captured graph. So varying length, CFG (which is two sequential batch-1 DiT calls, not a
-        batched one), and a2a/inpaint all run against the same allocation.
-        """
-        import tensorrt as _trt
-        names = [n for n in ("t5", "dit", "dec", "enc") if n in self.runners]
-        need, ctxs = 0, {}
-        for n in names:
-            r = self.runners[n]
-            e = r.engine
-            ctx = e.create_execution_context(
-                _trt.ExecutionContextAllocationStrategy.USER_MANAGED)
-            idx = getattr(r, "profile", 0) or 0
-            if e.num_optimization_profiles > 1 and idx:
-                ctx.set_optimization_profile_async(idx, canon.torch.cuda.current_stream().cuda_stream)
-                canon.torch.cuda.current_stream().synchronize()
-            for i in range(e.num_io_tensors):
-                tn = e.get_tensor_name(i)
-                if e.get_tensor_mode(tn) != _trt.TensorIOMode.INPUT:
-                    continue
-                _, _, hi = e.get_tensor_profile_shape(tn, idx)
-                ctx.set_input_shape(tn, tuple(hi))    # worst case WITHIN the selected band
-            try:
-                need = max(need, ctx.update_device_memory_size_for_shapes())
-            except Exception:
-                need = max(need, e.device_memory_size)       # fall back to the committed size
-            ctxs[n] = ctx
-        if need <= 0:
-            return
-        if self._scratch is not None and self._scratch_bytes >= need:
-            for n, ctx in ctxs.items():                  # reuse the existing buffer
-                ctx.set_device_memory(self._scratch.data_ptr(), self._scratch_bytes)
-                self.runners[n].context = ctx
-            return
-        self._scratch = canon.torch.empty(need, dtype=canon.torch.uint8, device="cuda")
-        for n, ctx in ctxs.items():
-            ctx.set_device_memory(self._scratch.data_ptr(), need)
-            self.runners[n].context = ctx        # drops the STATIC context and its private scratch
-        self._scratch_bytes = need
+        """One scratch buffer for every loaded engine (see canon.share_scratch)."""
+        buf = canon.share_scratch(self.runners)
+        if buf is not None:
+            self._scratch, self._scratch_bytes = buf, buf.numel()
 
     def _dec_min_L(self) -> int:
         """The loaded decoder engine's real profile floor.
@@ -1255,10 +1215,16 @@ def main():
     # a context created on the default profile reserves the MAX across profiles.
     _band = 0 if args.chunking else 1
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(engine_specs)) as ex:
-        futs = {name: ex.submit(TRTRunner, path, None, False,
+        # user_managed=True: allocate NO private scratch. share_scratch() below hands every
+        # engine one buffer. Letting each runner commit its own first and freeing it afterwards
+        # leaves both resident at peak -- measured 11924 MiB where this path takes 8946.
+        futs = {name: ex.submit(TRTRunner, path, None, True,
                                 _band if name in ("dec", "enc") else 0)
                 for name, path in engine_specs.items()}
         runners = {name: fut.result() for name, fut in futs.items()}
+    # One scratch buffer for every engine: they run sequentially on a single stream, so holding
+    # a private allocation each costs several GB for nothing.
+    _shared_scratch = canon.share_scratch(runners)   # keep alive for the process lifetime
     sub(f"{dim(f'engine load (parallel, {len(runners)} engines)')} {(time.time()-t0)*1000:.0f} ms")
 
     # ── Warmup + graph build ──

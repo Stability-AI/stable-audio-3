@@ -332,18 +332,18 @@ SHARED=(
 # Only TRT engines are downloaded from HF.
 MEDIUM=(
     "${HF_SUBDIR}/sa3-m/dit_fp16.trt"
-    "${HF_SUBDIR}/same-l/enc_dynamic_triton_swa.trt"
-    "${HF_SUBDIR}/same-l/dec_dynamic_triton_swa.trt"
+    "${HF_SUBDIR}/same-l/enc_fp16_chunkable.trt"
+    "${HF_SUBDIR}/same-l/dec_fp16_chunkable_limiter.trt"
 )
 SM_MUSIC=(
     "${HF_SUBDIR}/sa3-sm-music/dit_fp16.trt"
-    "${HF_SUBDIR}/same-s/enc_dynamic_bf16.trt"
-    "${HF_SUBDIR}/same-s/dec_dynamic_bf16.trt"
+    "${HF_SUBDIR}/same-s/enc_bf16_chunkable.trt"
+    "${HF_SUBDIR}/same-s/dec_bf16_chunkable_limiter.trt"
 )
 SM_SFX=(
     "${HF_SUBDIR}/sa3-sm-sfx/dit_fp16.trt"
-    "${HF_SUBDIR}/same-s/enc_dynamic_bf16.trt"
-    "${HF_SUBDIR}/same-s/dec_dynamic_bf16.trt"
+    "${HF_SUBDIR}/same-s/enc_bf16_chunkable.trt"
+    "${HF_SUBDIR}/same-s/dec_bf16_chunkable_limiter.trt"
 )
 
 FILES=()

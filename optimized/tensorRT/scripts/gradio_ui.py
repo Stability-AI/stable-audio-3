@@ -275,19 +275,36 @@ def render_history(hist, advance=False, loop=False):
             f'padding-right:6px">{boot}{items}</div>')
 
 def render_queue_status(entry=None, generating=False):
-    """Subdued status chip for the Infinite Radio queue — no audio/spectrogram,
-    just Generating…/Ready (the swap uses the entry held in server state)."""
+    """Status chip for the pre-rendered next take.
+
+    Once a take is ready the chip is a CONTROL, not a label: clicking it promotes the
+    queued render and plays it immediately. It fires the same hidden #sa3-promote button
+    radio's onended uses, so both routes go through one handler — and because the click
+    is a real user gesture, the browser's autoplay policy lets the audio start.
+
+    While a take is still rendering there is nothing to promote, so the chip stays inert.
+    """
     if generating:
-        body = "generating…"
+        body, ready = "generating…", False
     elif entry is not None:
         p = html_lib.escape(entry["prompt"]) or "<i>(no prompt)</i>"
         body = f"ready — {p}{_neg_disp(entry)} · seed {entry['seed']}{_meta_suffix(entry)}"
+        ready = True
     else:
         return ""
-    return (f'<div style="margin-top:2px; padding:6px 10px; '
-            f'background:rgba(127,127,127,0.12); border-radius:6px; '
-            f'color:#888; font-size:0.85em">'
-            f'<b>Queued next</b> · {body}</div>')
+    style = ("margin-top:2px; padding:6px 10px; background:rgba(127,127,127,0.12); "
+             "border-radius:6px; color:#888; font-size:0.85em")
+    if not ready:
+        return f'<div style="{style}"><b>Queued next</b> · {body}</div>'
+    # Enter/Space as well as click, so it behaves like the button it now is.
+    keys = ("if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();"
+            + _JS_PROMOTE + "}")
+    return (f'<div class="sa3-queued" role="button" tabindex="0" '
+            f'title="Play this take now" '
+            f'style="{style}; cursor:pointer; user-select:none" '
+            f'onclick="{_JS_PROMOTE}" onkeydown="{keys}">'
+            f'<b>Queued next</b> · {body}'
+            f'<span style="float:right; opacity:0.75">▶ play now</span></div>')
 
 
 # ── Gradio UI ──────────────────────────────────────────────────────────────

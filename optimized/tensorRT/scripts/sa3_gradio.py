@@ -240,7 +240,11 @@ def get_inference(dit: str, decoder: str, dit_variant_path: str,
 # ── Gradio UI ──────────────────────────────────────────────────────────────
 _css = ("#sa3-promote{display:none !important}"
             "#sa3-out{gap:4px !important}"
-            "#sa3-out .html-container{padding:0 !important; margin:0 !important}")
+            "#sa3-out .html-container{padding:0 !important; margin:0 !important}"
+            # the queued chip is clickable once a take is ready — say so on hover/focus
+            ".sa3-queued{transition:background 0.12s, color 0.12s}"
+            ".sa3-queued:hover,.sa3-queued:focus{background:rgba(127,127,127,0.22) !important;"
+            "color:#bbb !important; outline:none}")
 
 
 def build_ui(initial_dit: str, initial_decoder: str, *,

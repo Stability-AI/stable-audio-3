@@ -441,6 +441,32 @@ def _ensure_files(rel_paths: list[str]) -> None:
         sys.exit("error: huggingface_hub not installed. "
                  "Re-run install.sh (or pip install huggingface-hub).")
     import shutil
+
+    # Pre-flight the whole list against the repo before fetching a byte. Prebuilt engines
+    # exist only for the architectures we publish; on anything else (sm_120, sm_89, ...)
+    # some or all of them are absent. Downloading first means the user pays 3+ GB for
+    # T5Gemma and the DiT and THEN gets a bare hf_hub_download 404 traceback naming one
+    # file, with no hint that building locally is the supported path.
+    try:
+        from huggingface_hub import HfApi
+        published = {f for f in HfApi().list_repo_files(HF_REPO_ID)}
+    except Exception:
+        published = None          # offline or API trouble: fall through to per-file errors
+    if published is not None:
+        absent = [r for r in missing if f"{HF_SUBDIR}/{r}" not in published]
+        if absent:
+            arch = Path(HF_SUBDIR).name
+            raise FileNotFoundError(
+                f"no prebuilt engines for {arch} — {len(absent)} of the {len(missing)} file(s) "
+                f"this configuration needs are not published:\n"
+                + "".join(f"    {a}\n" for a in absent)
+                + f"\n  Prebuilt engines are published only for the architectures we have "
+                  f"hardware to build and verify on. Build them for {arch} with:\n"
+                  f"    python optimized/tensorRT/build/build_autoencoders.py\n"
+                  f"  (autoencoders; ~10 min) and build_from_onnx.py for any missing DiT.\n"
+                  f"  They land in optimized/tensorRT/models/{arch}/ and are picked up "
+                  f"automatically.")
+
     print(f"  {dim('downloading')} {len(missing)} missing file(s) from {HF_REPO_ID}/{HF_SUBDIR}")
     for rel in missing:
         hf_path = f"{HF_SUBDIR}/{rel}"

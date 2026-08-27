@@ -1031,6 +1031,35 @@ class SA3Inference:
         except Exception:
             pass
 
+    def engine_footprint(self) -> dict:
+        """Per-engine resident VRAM: weights (the deserialised engine) + scratch.
+
+        Scratch is read per PROFILE, never device_memory_size_v2 -- on the two-profile
+        autoencoders the latter reports the MAX ACROSS profiles, so a chunked deployment
+        would be blamed for the wide band's 7.8 GB it never reserves.
+
+        `shared` marks the engines folded into one buffer by canon.share_scratch: their
+        scratch is the SAME allocation, so summing the column double-counts.
+        """
+        out = {}
+        for name, r in self.runners.items():
+            try:
+                prof = getattr(r, "profile", 0) or 0
+                scratch = r.engine.get_device_memory_size_for_profile_v2(prof)
+            except Exception:
+                scratch = 0
+            # TRT exposes no API for an engine's weight allocation; the serialised file
+            # size is the faithful proxy, since weights dominate it.
+            try:
+                weights = Path(r.engine_path).stat().st_size
+            except Exception:
+                weights = 0
+            out[name] = {"weights": weights, "scratch": scratch,
+                         "profile": getattr(r, "profile", 0) or 0,
+                         "shared": r._scratch is None}
+        out["_shared_scratch"] = (self._scratch.numel() if self._scratch is not None else 0)
+        return out
+
     def _dec_min_L(self) -> int:
         """The loaded decoder engine's real profile floor.
 
@@ -1205,11 +1234,24 @@ class SA3Inference:
 
         with self._lock:
             t_start = time.time()
+            # Per-stage peaks for the debug view. reset_peak_memory_stats is free when
+            # nobody reads it, and the numbers are torch-side allocations only: TRT weights
+            # and scratch are reported separately by engine_footprint(), because they are
+            # resident for the whole process rather than attributable to one stage.
+            _vram = {}
+            def _mark(k, base):
+                # transient working set for this stage: everything above the resting
+                # allocation. Without subtracting the base, every stage just reports
+                # the persistent shared scratch and they all look identical.
+                _vram[k] = max(0, torch.cuda.max_memory_allocated() - base)
+            def _base():
+                torch.cuda.reset_peak_memory_stats()
+                return torch.cuda.memory_allocated()
             R = self._eager_runners()
             dit = self._eager_dit
 
             # 1. T5 (+ the uncond branch when CFG is on)
-            t0 = time.time()
+            t0 = time.time(); _b = _base()
             embeds, mask = t5gemma_encode(R["t5"], self.tokenizer, prompt)
             null_embeds = null_mask = None
             if cfg != 1.0:
@@ -1222,12 +1264,13 @@ class SA3Inference:
                     null_embeds = torch.zeros_like(embeds)
                     null_mask = torch.zeros_like(mask)
             t5_ms = (time.time() - t0) * 1000
+            _mark('t5', _b)
 
             # 2. init audio → latents (audio-to-audio / inpaint)
             init_latents = None
             encode_ms = 0.0
             if init_audio_path:
-                t0 = time.time()
+                t0 = time.time(); _b = _base()
                 a = self._read_audio_any(init_audio_path)
                 target = T_lat * SAMPLES_PER_LATENT
                 a = (a[:, :target] if a.shape[-1] >= target
@@ -1236,6 +1279,7 @@ class SA3Inference:
                     self._encoder_runner(),
                     torch.from_numpy(np.ascontiguousarray(a)).unsqueeze(0).cuda())
                 encode_ms = (time.time() - t0) * 1000
+                _mark('encode', _b)
 
             # 3. schedule + initial latent
             sigmas = build_pingpong_schedule(steps, sigma_max=sigma_max,
@@ -1302,14 +1346,15 @@ class SA3Inference:
                 cfg_d = cond_d + (cfg - 1.0) * cfg_diff
                 return ((x.float() - cfg_d) / sigma).to(x.dtype)
 
-            t0 = time.time()
+            t0 = time.time(); _b = _base()
             latents = sample_flow_pingpong(model_fn, noise, sigmas, seed=int(seed) + 1,
                                             paste_back=paste_back)
             torch.cuda.synchronize()
             sampling_ms = (time.time() - t0) * 1000
+            _mark('dit', _b)
 
             # 5. decode
-            t0 = time.time()
+            t0 = time.time(); _b = _base()
             # Eager path serves CFG / APG / a2a / inpaint, which the mega-graph does not cover.
             # It must window the decode for the same reason the graph does: a capped decoder engine
             # refuses any length above its profile ceiling, and that refusal used to surface as the
@@ -1327,6 +1372,7 @@ class SA3Inference:
                 pcm_full = (out.clamp(-1, 1) * 32767.0).to(torch.int16
                             ).squeeze(0).T.contiguous().cpu().numpy()
             decode_ms = (time.time() - t0) * 1000
+            _mark('decode', _b)
 
         actual_samples = int(round(seconds * SAMPLE_RATE))
         pcm = pcm_full[:actual_samples].copy()
@@ -1341,6 +1387,7 @@ class SA3Inference:
             "t5_ms": t5_ms, "encode_ms": encode_ms,
             "sampling_ms": sampling_ms, "decode_ms": decode_ms,
             "mode": mode, "cfg": cfg, "sigma_max": sigma_max, "eager": True,
+            "stage_vram": _vram, "steps": int(steps),
         }
 
     def generate(self, prompt: str, *,

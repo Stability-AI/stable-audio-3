@@ -536,6 +536,9 @@ class TRTRunner:
             self.engine = runtime.deserialize_cuda_engine(f.read())
         if self.engine is None:
             raise RuntimeError(f"failed to deserialize {engine_path}")
+        # Kept for reporting: TRT exposes no API for an engine's weight allocation, so the
+        # serialised file size is the proxy the debug view uses.
+        self.engine_path = Path(engine_path)
         self.profile = int(profile or 0)
         self._scratch = None
         # ⚠ NEVER create_execution_context() with no strategy on a multi-profile engine. A DEFAULT

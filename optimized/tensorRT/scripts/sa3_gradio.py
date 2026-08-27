@@ -156,6 +156,77 @@ _inference_lru: list[tuple[str, str, str, str]] = []  # MRU at end
 _INFERENCE_CACHE_MAX = 2
 
 
+def _mb(b):
+    return f"{b / 2**20:,.0f} MB" if b else "—"
+
+
+def render_debug(inf, t_fused, t_stage):
+    """Per-stage ms + VRAM, and what the fused mega-graph costs by comparison.
+
+    ⚠ The stage split is measured on the UNFUSED path, because a captured CUDA graph
+    cannot be instrumented from inside: torch rejects Event.record() during capture, and
+    even cudaEventRecordWithFlags(..., cudaEventRecordExternal) is accepted only to fail
+    at capture_end(). Adding timers would mean splitting the mega-graph into per-stage
+    graphs, which would change the very thing being measured. So debug mode times the
+    same engines run stage-by-stage and reports the fused total beside it — the gap
+    between the two IS the fusion win.
+
+    VRAM is split the same way it is actually paid: engine weights and scratch are
+    resident for the whole process, while `transient` is what a stage allocates on top.
+    """
+    fp = inf.engine_footprint()
+    sv = t_stage.get("stage_vram", {})
+    rows = [("encoder", t_stage.get("encode_ms", 0.0), sv.get("encode"), fp.get("enc")),
+            ("T5Gemma", t_stage.get("t5_ms", 0.0),     sv.get("t5"),     fp.get("t5")),
+            (f"DiT x{t_stage.get('steps', 0)}",
+             t_stage.get("sampling_ms", 0.0), sv.get("dit"), fp.get("dit")),
+            ("decoder", t_stage.get("decode_ms", 0.0), sv.get("decode"), fp.get("dec"))]
+    th = ("padding:3px 10px 3px 0; text-align:right; font-weight:600; "
+          "border-bottom:1px solid rgba(127,127,127,0.3)")
+    td = "padding:2px 10px 2px 0; text-align:right; font-variant-numeric:tabular-nums"
+    out = ['<div style="font-size:0.82em; margin-top:6px">',
+           '<table style="border-collapse:collapse">',
+           f'<tr><th style="{th}; text-align:left">stage</th><th style="{th}">ms</th>'
+           f'<th style="{th}">transient</th><th style="{th}">weights</th>'
+           f'<th style="{th}">scratch</th></tr>']
+    for name, ms, tv, f in rows:
+        if f is None and not ms:
+            continue                              # encoder absent unless a2a/inpaint ran
+        sc = _mb(f["scratch"]) + (" (shared)" if f and f["shared"] else "") if f else "—"
+        out.append(f'<tr><td style="{td}; text-align:left">{html_lib.escape(name)}</td>'
+                   f'<td style="{td}">{ms:,.1f}</td><td style="{td}">{_mb(tv)}</td>'
+                   f'<td style="{td}">{_mb(f["weights"]) if f else "—"}</td>'
+                   f'<td style="{td}">{sc}</td></tr>')
+    # Whatever the four stages do not account for: schedule build, noise, the int16 cast
+    # and the GPU->CPU copy. Shown rather than hidden, so the column sums to the total.
+    unfused = t_stage.get("inference_ms", 0.0)
+    other = unfused - sum(r[1] for r in rows)
+    if other > 0.5:
+        out.append(f'<tr><td style="{td}; text-align:left; opacity:0.7">other '
+                   f'<span style="opacity:0.7">(schedule, noise, int16 cast, GPU→CPU)</span>'
+                   f'</td><td style="{td}; opacity:0.7">{other:,.1f}</td>'
+                   f'<td style="{td}">—</td><td style="{td}">—</td>'
+                   f'<td style="{td}">—</td></tr>')
+    out.append("</table>")
+    shared = fp.get("_shared_scratch", 0)
+    note = []
+    if t_fused.get("eager"):
+        note.append("this render used the eager path (CFG / audio-to-audio / inpaint), "
+                    "so the breakdown IS the render — no second pass was run")
+    else:
+        fused = t_fused.get("inference_ms", 0.0)
+        gain = f"{unfused / fused:.2f}x faster" if fused > 0 else ""
+        note.append(f"unfused {unfused:,.1f} ms &nbsp;·&nbsp; "
+                    f"<b>fused mega-graph {fused:,.1f} ms</b> ({gain})")
+    note.append(f"shared scratch {_mb(shared)} — one buffer for every engine above, so the "
+                f"scratch column does not sum")
+    note.append("a captured graph allocates nothing at replay, so the mega-graph's peak "
+                "VRAM equals its resident footprint")
+    out += [f'<div style="color:#888; margin-top:4px">{n}</div>' for n in note]
+    out.append("</div>")
+    return "".join(out)
+
+
 def _evict_inference(key):
     """Free the engines + caches held by a cached SA3Inference before dropping it.
 
@@ -302,7 +373,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *,
     # ── one generation, packaged as a history entry ──────────────────────────────────────────
     def _entry(dit_name, decoder_name, variant_path, dec_variant_path, prompt, negative_prompt,
                seconds, steps, seed_text, cfg, apg, sigma_max, chunking, fmt,
-               a2a_path, a2a_sigma, inpaint_path, inp_start, inp_end):
+               a2a_path, a2a_sigma, inpaint_path, inp_start, inp_end, debug=False):
         # An empty prompt is a legitimate request, not an error: it generates
         # unconditionally. The encoder takes the empty string happily, and both
         # renderers already caption it "(no prompt)".
@@ -373,6 +444,25 @@ def build_ui(initial_dit: str, initial_decoder: str, *,
         except Exception as e:
             return None, f"{type(e).__name__}: {e}"
 
+        debug_html = ""
+        if debug:
+            try:
+                # Reuse the seed so the second pass is the same take, then hand both timing
+                # dicts to the renderer. When the render already went eager there is nothing
+                # to compare against, so skip the extra pass entirely.
+                if not t.get("eager") and not getattr(inf, "_debug_warmed", False):
+                    # First eager call on this instance builds the _SecondContext set and its
+                    # buffers. Timing that pass charges ~600 ms of one-off setup to "unfused"
+                    # and makes the fusion win look far bigger than it is. Burn one pass.
+                    inf.generate_eager(prompt, seconds=float(seconds), steps=int(steps),
+                                       seed=t["seed"], **kw)
+                    inf._debug_warmed = True
+                t_stage = t if t.get("eager") else inf.generate_eager(
+                    prompt, seconds=float(seconds), steps=int(steps), seed=t["seed"], **kw)[1]
+                debug_html = render_debug(inf, t, t_stage)
+            except Exception as e:
+                debug_html = (f"<div style='color:#e8a33d; font-size:0.82em'>debug pass failed: "
+                              f"{html_lib.escape(type(e).__name__)}: {html_lib.escape(str(e))}</div>")
         base = verbose_basename(prompt or "unconditional", neg,
                                 float(cfg), float(sigma_max), t["seed"])
         out_path = OUTPUT_DIR / f"{base}.wav"
@@ -398,7 +488,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *,
                   f"seed : {t['seed']} &nbsp;·&nbsp; T_lat : {t['T_lat']} &nbsp;·&nbsp; "
                   f"samples : {t['samples']} &nbsp;·&nbsp; spec {spec_ms:.0f} ms")
         return {
-            "notes": notes,
+            "notes": notes, "debug_html": debug_html,
             "key": f"k{time.time_ns()}", "ts": time.time(), "dit": dit_name,
             "neg": neg, "cfg": float(cfg), "smx": float(sigma_max),
             "path": str(out_path), "mime": mime, "name": out_path.name,
@@ -419,7 +509,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *,
         note_html = "".join(
             f"<div style='color:#e8a33d;font-size:0.85em'>note: {html_lib.escape(n)}</div>"
             for n in (entry.get("notes") or [])) if entry else ""
-        return (player, (entry.get("timing", "") + note_html) if entry else "", "",
+        return (player, (entry.get("timing", "") + note_html
+                         + entry.get("debug_html", "")) if entry else "", "",
                 render_history(hist, advance=radio, loop=loop),
                 queued_panel, state)
 
@@ -465,6 +556,10 @@ def build_ui(initial_dit: str, initial_decoder: str, *,
         """Render the NEXT take in the background so the following click is instant."""
         *ctrl, opts, state = args
         state = dict(state or _BLANK)
+        if ctrl[-1]:
+            # Debug mode already renders twice (fused + unfused). Pre-rendering on top would
+            # make it four renders per click for a take whose numbers may never be looked at.
+            return "", state
         sig = _sig(ctrl)
         if state.get("queued") is not None and state.get("queued_sig") == sig:
             return render_queue_status(state["queued"]), state
@@ -508,6 +603,13 @@ def build_ui(initial_dit: str, initial_decoder: str, *,
                         sigma_global = gr.Slider(label="sigma_max", minimum=0.05, maximum=1.0,
                                                  step=0.05, value=1.0)
                     negative_prompt = gr.Textbox(label="Negative prompt", lines=1)
+                    debug = gr.Checkbox(
+                        label="Debug: per-stage ms + VRAM", value=False,
+                        info="Adds a stage table under the timings. The mega-graph cannot be "
+                             "instrumented from inside (a captured graph rejects event records), "
+                             "so the split is measured by re-running the same engines unfused — "
+                             "which roughly doubles the render. The fused total is shown beside "
+                             "it, so the gap is the fusion win.")
                     chunking = gr.Checkbox(
                         label="Chunked decode (low VRAM)", value=True,
                         info="On: 256-latent windows — 485 MB of decoder scratch on SAME-L, 346 MB "
@@ -549,7 +651,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *,
 
         CTRL = [dit_dd, dec_dd, var_dd, dec_var_dd, prompt, negative_prompt, seconds, steps,
                 seed, cfg, apg, sigma_global, chunking, file_format,
-                a2a_audio, a2a_sigma, inpaint_audio, inp_start, inp_end]
+                a2a_audio, a2a_sigma, inpaint_audio, inp_start, inp_end, debug]
         main_out = [output_player, timing, error_box, history_html, queued_html, st]
         # ⚠ js= takes a JS *function expression* ("() => ...") — gradio evaluates it as one.
         # _JS_TRY_PLAY is an inline-attribute body (bare statements, `this` = the <audio>),

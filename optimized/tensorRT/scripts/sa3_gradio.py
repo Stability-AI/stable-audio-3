@@ -43,8 +43,7 @@ from gradio_ui import (  # backend-agnostic UI layer, forked from optimized/mlx
     # The other _JS_* constants (promote / pause-others / scroll / playhead) are wired
     # inside render_player and render_history themselves, so they stay private to that
     # module; only the two this file attaches to its own events are imported.
-    _JS_FIX_SLIDERS, _JS_TRY_PLAY,
-    _save_wav, render_history, render_player, render_queue_status, verbose_basename,
+    _JS_FIX_SLIDERS, _save_wav, render_history, render_player, render_queue_status, verbose_basename,
 )
 
 MODELS_ROOT = SCRIPTS_DIR.parent / "models" / canon.ARCH
@@ -315,20 +314,51 @@ def build_ui(initial_dit: str, initial_decoder: str, *,
         except Exception as e:
             return None, f"load failed: {type(e).__name__}: {e}"
 
-        # Precedence: inpainting needs a reference AND a range; audio-to-audio needs a guide.
-        kw, mode = {}, "text-to-audio"
-        if inpaint_path and float(inp_end) > float(inp_start):
-            kw = dict(init_audio_path=inpaint_path,
-                      inpaint_range=(float(inp_start), float(inp_end)))
+        # Which reference wins, and -- just as important -- SAY SO when something the user
+        # supplied is being dropped. Silently falling through to a different mode is the
+        # worst outcome here: upload an inpaint reference, forget the range sliders, and a
+        # bare if/elif quietly runs audio-to-audio instead.
+        #
+        # The engines take ONE reference (generate_eager reads a single init_audio_path and
+        # derives the inpaint keep-mask from its latents), so inpaint and audio-to-audio
+        # cannot use two different files the way the MLX backend can.
+        kw, mode, notes = {}, "text-to-audio", []
+        sec = float(seconds)
+        rng = None
+        if inpaint_path and float(inp_end) > float(inp_start) and float(inp_start) < sec:
+            if float(inp_end) > sec:
+                notes.append(f"inpaint end clamped to the clip length ({sec:g}s)")
+            rng = (float(inp_start), float(min(float(inp_end), sec)))
+        elif inpaint_path and float(inp_end) <= float(inp_start):
+            notes.append("inpainting ignored — set the start/end range sliders")
+        elif inpaint_path:
+            notes.append(f"inpainting ignored — start ({float(inp_start):g}s) is past "
+                         f"the end of the clip ({sec:g}s)")
+        elif float(inp_end) > float(inp_start):
+            notes.append("inpaint range ignored — no reference audio uploaded")
+
+        if rng is not None:
+            kw = dict(init_audio_path=inpaint_path, inpaint_range=rng,
+                      init_noise_level=float(sigma_max))
             mode = "inpaint"
+            if a2a_path:
+                notes.append("using the inpaint reference — one reference per render, and "
+                             "inpainting needs it to keep the untouched part")
         elif a2a_path:
+            # a2a's own slider IS the schedule start (parent-repo semantics), so it
+            # overrides sigma_max rather than stacking with it.
             kw = dict(init_audio_path=a2a_path, init_noise_level=float(a2a_sigma))
             mode = "audio-to-audio"
+            if float(sigma_max) != 1.0:
+                notes.append(f"sigma_max {float(sigma_max):g} ignored — audio-to-audio uses "
+                             f"its own noise level ({float(a2a_sigma):g})")
         elif float(sigma_max) != 1.0:
             kw = dict(init_noise_level=float(sigma_max))
         neg = (negative_prompt or "").strip()
         if float(cfg) != 1.0:
             kw.update(cfg=float(cfg), apg=float(apg), negative_prompt=neg or None)
+        elif neg:
+            notes.append("negative prompt ignored — it only applies when CFG > 1")
         try:
             pcm, t = inf.generate(prompt.strip(), seconds=float(seconds), steps=int(steps),
                                   seed=seed, **kw)
@@ -361,6 +391,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *,
                   f"seed : {t['seed']} &nbsp;·&nbsp; T_lat : {t['T_lat']} &nbsp;·&nbsp; "
                   f"samples : {t['samples']} &nbsp;·&nbsp; spec {spec_ms:.0f} ms")
         return {
+            "notes": notes,
             "key": f"k{time.time_ns()}", "ts": time.time(), "dit": dit_name,
             "neg": neg, "cfg": float(cfg), "smx": float(sigma_max),
             "path": str(out_path), "mime": mime, "name": out_path.name,
@@ -378,7 +409,10 @@ def build_ui(initial_dit: str, initial_decoder: str, *,
         hist = state.get("history", [])
         player = render_player(entry, autoplay=auto, radio=radio, advance=radio, loop=loop,
                                autodl=("Auto-download" in (opts or []))) if entry else ""
-        return (player, entry.get("timing", "") if entry else "", "",
+        note_html = "".join(
+            f"<div style='color:#e8a33d;font-size:0.85em'>note: {html_lib.escape(n)}</div>"
+            for n in (entry.get("notes") or [])) if entry else ""
+        return (player, (entry.get("timing", "") + note_html) if entry else "", "",
                 render_history(hist, advance=radio, loop=loop),
                 queued_panel, state)
 
@@ -487,14 +521,16 @@ def build_ui(initial_dit: str, initial_decoder: str, *,
                 seed, cfg, apg, sigma_global, chunking, file_format,
                 a2a_audio, a2a_sigma, inpaint_audio, inp_start, inp_end]
         main_out = [output_player, timing, error_box, history_html, queued_html, st]
-        generate_btn.click(generate, inputs=CTRL + [output_opts, st], outputs=main_out
-                           ).then(None, js=_JS_TRY_PLAY
-                           ).then(pregen, inputs=CTRL + [output_opts, st],
-                                  outputs=[queued_html, st])
-        promote_btn.click(generate, inputs=CTRL + [output_opts, st], outputs=main_out
-                          ).then(None, js=_JS_TRY_PLAY
-                          ).then(pregen, inputs=CTRL + [output_opts, st],
-                                 outputs=[queued_html, st])
+        # ⚠ js= takes a JS *function expression* ("() => ...") — gradio evaluates it as one.
+        # _JS_TRY_PLAY is an inline-attribute body (bare statements, `this` = the <audio>),
+        # so passing it here is a syntax error that kills the whole frontend: the config
+        # fails to evaluate and the page sits on "Loading..." forever with zero controls.
+        # The autoplay rescue belongs where it already is — render_player's oncanplay.
+        for btn in (generate_btn, promote_btn):
+            btn.click(generate, inputs=CTRL + [output_opts, st], outputs=main_out
+                      ).then(pregen, inputs=CTRL + [output_opts, st],
+                             outputs=[queued_html, st]
+                      ).then(None, js=_JS_FIX_SLIDERS)
         gr.Markdown("Renders are written to `output/`. **Radio** auto-advances to the next take as "
                     "each finishes; the next one is pre-rendered while you listen.")
 

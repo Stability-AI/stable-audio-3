@@ -69,7 +69,7 @@ def discover_variants(dit_name: str) -> list[tuple[str, Path]]:
     d = MODELS_ROOT / subdir
     if not d.exists():
         return []
-    files = sorted(d.glob("dit_*.trt"))
+    files = [f for f in sorted(d.glob("dit_*.trt")) if f.name not in RETIRED_DITS]
     canonical_name = "dit_fp16.trt"
     canonical = [f for f in files if f.name == canonical_name]
     others = [f for f in files if f.name != canonical_name]
@@ -89,7 +89,18 @@ def discover_variants(dit_name: str) -> list[tuple[str, Path]]:
 
 # Pre-chunkable engines. Removed from the model repo's download path and hidden from the picker.
 RETIRED_DECODERS = {"dec_dynamic_bf16.trt", "dec_dynamic_triton_swa.trt", "dec_dynamic_fp32.trt",
-                    "dec_fp8.trt", "dec_fp8_fast.trt"}
+                    "dec_fp8.trt", "dec_fp8_fast.trt", "dec_dynamic_fp16mixed.trt"}
+# Experimental DiT engines that are not part of the shipped set. "fp16mixed" is the retired name
+# for plain fp16 -- every tier is mixed-precision, so the qualifier only ever meant "old".
+RETIRED_DITS = {"dit_fp16mixed.trt", "dit_fp16_bands4096_32768.trt", "dit_fp16_maxL32768.trt"}
+
+
+def _precision_of(filename: str) -> str:
+    """Pull the precision token out of an engine filename: dec_fp16_chunkable_limiter -> fp16."""
+    for tok in ("fp32", "fp16", "bf16", "fp8"):
+        if f"_{tok}" in filename:
+            return tok
+    return ""
 
 
 def discover_decoder_variants(decoder_name: str) -> list[tuple[str, Path]]:
@@ -102,7 +113,10 @@ def discover_decoder_variants(decoder_name: str) -> list[tuple[str, Path]]:
     """
     out, known = [], set(RETIRED_DECODERS)
     for tier, fname in canon.DECODER_TIER_FILENAME.get(decoder_name, {}).items():
-        label = f"{tier} (canonical)" if tier == "canonical" else tier
+        # Name the tier by the precision it actually is -- SAME-L canonical is fp16, SAME-S is
+        # bf16 -- rather than rendering "canonical (canonical)".
+        prec = _precision_of(fname)
+        label = f"{prec} (canonical)" if tier == "canonical" else (prec or tier)
         out.append((label, canon.ARCH_DIR / decoder_name / fname))
         known.add(fname)
     d = canon.ARCH_DIR / decoder_name

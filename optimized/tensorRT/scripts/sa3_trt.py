@@ -97,6 +97,119 @@ def _delegate_to_eager(args) -> None:
 
 
 # ─── Full-pipeline CUDA-graph runner ─────────────────────────────────────
+class _SecondContext:
+    """A second TRT execution context on an ALREADY-LOADED engine.
+
+    The eager path (CFG / audio-to-audio / inpaint / σmax≠1) has to call
+    set_input_shape + set_tensor_address on every step, at whatever L the request
+    asks for. Doing that on the same context the mega-graph captured is unsafe:
+    DiTRunner._setup() reallocates its velocity buffer when L changes, and the
+    captured graph still launches kernels pointing at the OLD allocation — which
+    torch is then free to hand to someone else. The failure is silent (garbage or
+    stale audio on the next fast-path replay), so the eager path gets its own
+    context instead.
+
+    Costs activation memory only — the engine's weights are shared, not re-loaded.
+    """
+
+    def __init__(self, runner: TRTRunner, scratch=None):
+        """scratch: optional shared device buffer (see SA3Inference._share_scratch).
+
+        A separate CONTEXT is required (the reason is above), but the separate SCRATCH is not: the
+        eager path and the captured graph never run concurrently -- the inference lock serialises
+        them -- and TRT device memory is pure scratch, re-derived on every execution rather than
+        carried between calls. Left STATIC, each eager context re-added the engine's full private
+        worst case (~980 MiB on `large`), giving back most of what sharing just saved.
+        """
+        torch = canon.torch
+        self.engine = runner.engine
+        if scratch is not None:
+            import tensorrt as _trt
+            self.context = runner.engine.create_execution_context(
+                _trt.ExecutionContextAllocationStrategy.USER_MANAGED)
+            self.context.set_device_memory(scratch.data_ptr(), scratch.numel())
+        else:
+            self.context = runner.engine.create_execution_context()
+        self.stream = torch.cuda.Stream()
+        self.in_dtype = dict(runner.in_dtype)
+        self.out_dtype = dict(runner.out_dtype)
+
+    def free(self):
+        del self.context
+
+
+class BatchedDiT:
+    """Batch-N DiT forward on a var-batch engine (one enqueue, not N).
+
+    The canonical engine bakes batch=1, so CFG has to run cond and uncond as two sequential
+    calls. The var-batch engine (traced with axis 0 dynamic, built `--batches 1,2`) carries
+    one optimization profile per batch size, so the pair goes through as a single batch-2
+    call with tactics tuned for that shape.
+
+    `attach()` returns None when the engine has no profile covering this batch, so callers
+    fall back to the sequential dual pass without inspecting TRT themselves.
+    """
+
+    def __init__(self, engine, batch, profile_index):
+        torch = canon.torch
+        self.engine = engine
+        self.batch = batch
+        self.profile_index = profile_index
+        self.context = engine.create_execution_context()
+        self.stream = torch.cuda.Stream()
+        self.context.set_optimization_profile_async(profile_index, self.stream.cuda_stream)
+        self.stream.synchronize()
+        self._L = None
+        self._vel = None
+
+    @classmethod
+    def attach(cls, runner, batch=2):
+        eng = runner.engine
+        for p in range(eng.num_optimization_profiles):
+            try:
+                mn, _opt, mx = eng.get_tensor_profile_shape("x", p)
+            except Exception:
+                continue
+            if mn[0] <= batch <= mx[0]:
+                return cls(eng, batch, p)
+        return None
+
+    def _setup(self, L):
+        if L == self._L:
+            return
+        torch = canon.torch
+        b, ctx = self.batch, self.context
+        ctx.set_input_shape("x", (b, IO_CHANNELS, L))
+        ctx.set_input_shape("t", (b,))
+        ctx.set_input_shape("t5_hidden", (b, T5_MAX_LEN, COND_DIM))
+        ctx.set_input_shape("t5_mask", (b, T5_MAX_LEN))
+        ctx.set_input_shape("seconds_total", (b,))
+        ctx.set_input_shape("local_add_cond", (b, 257, L))
+        self._vel = torch.empty(tuple(ctx.get_tensor_shape("velocity")),
+                                dtype=torch.float32, device="cuda")
+        self._L = L
+
+    def step(self, x, t, t5_hidden, t5_mask, seconds, local_add_cond):
+        """All inputs batch-N on cuda. Returns velocity (N, 256, L)."""
+        torch = canon.torch
+        self._setup(x.shape[-1])
+        ctx = self.context
+        held = []                                   # keep the contiguous copies alive
+        for name, ten in (("x", x), ("t", t), ("t5_hidden", t5_hidden),
+                          ("t5_mask", t5_mask), ("seconds_total", seconds),
+                          ("local_add_cond", local_add_cond)):
+            c = ten.float().contiguous()
+            held.append(c)
+            ctx.set_tensor_address(name, c.data_ptr())
+        ctx.set_tensor_address("velocity", self._vel.data_ptr())
+        self.stream.wait_stream(torch.cuda.current_stream())
+        if not ctx.execute_async_v3(self.stream.cuda_stream):
+            raise RuntimeError(f"batched DiT enqueue failed (batch={self.batch}, "
+                               f"L={x.shape[-1]})")
+        self.stream.synchronize()
+        return self._vel.clone()
+
+
 class FullPipelineGraph:
     """Captures T5 + DiT-loop + decoder + narrow + DtoH in ONE CUDA graph.
 
@@ -781,6 +894,9 @@ class SA3Inference:
         self.dec_profile = 0 if chunking else 1
         self._scratch = None
         self._scratch_bytes = 0
+        self._eager = None
+        self._eager_dit = None
+        self._cfg_batched = None
         self.dit_name = dit
         self.decoder_name = decoder
         self.precision = precision
@@ -938,6 +1054,220 @@ class SA3Inference:
     # paste-back for inpaint), but driven from the already-loaded engines instead of
     # a second process, and on its own execution contexts so the captured mega-graph
     # stays valid (see _SecondContext).
+    def _eager_runners(self):
+        if self._eager is None:
+            self._eager = {n: _SecondContext(self.runners[n], self._scratch)
+                           for n in ("t5", "dit", "dec")}
+            self._eager_dit = DiTRunner(self._eager["dit"])
+            # Var-batch engine? Then CFG's cond+uncond pair goes through as one batch-2 call.
+            self._cfg_batched = BatchedDiT.attach(self.runners["dit"], batch=2)
+            if not self.quiet:
+                sub(dim("CFG dual-pass: " + ("batched (var-batch engine, profile "
+                                             f"{self._cfg_batched.profile_index})"
+                                             if self._cfg_batched else
+                                             "sequential (engine is batch-1 only)")))
+        return self._eager
+
+    def _encoder_runner(self):
+        """The SAME-S/L encoder engine — only needed for audio-to-audio / inpaint."""
+        if "enc" not in self.runners:
+            _ensure_files(ENCODER_FILES[self.decoder_name])
+            self.runners["enc"] = TRTRunner(
+                canon.resolve_encoder_engine(self.decoder_name, self.dec_precision),
+                None, True)
+            # Fold the encoder into the shared buffer, growing it only if the encoder needs more
+            # (a capped encoder needs ~94-130 MB, far below the DiT, so it usually does not).
+            self._share_scratch()
+        return self.runners["enc"]
+
+    @staticmethod
+    def _read_audio_any(path: str) -> np.ndarray:
+        """Any soundfile-readable audio → (2, T) float32 @ 44.1 kHz, in [-1, 1].
+
+        canon.read_wav() only accepts 16-bit PCM at 44.1 kHz; the gradio file picker
+        will happily hand over 24-bit, 48 kHz, mono, or mp3.
+        """
+        import soundfile as sf
+        data, sr = sf.read(path, dtype="float32", always_2d=True)   # (T, C)
+        a = data.T                                                   # (C, T)
+        if a.shape[0] == 1:
+            a = np.repeat(a, 2, axis=0)
+        elif a.shape[0] > 2:
+            a = a[:2]
+        if sr != SAMPLE_RATE:
+            import torch as _t
+            import torchaudio
+            a = torchaudio.functional.resample(_t.from_numpy(np.ascontiguousarray(a)),
+                                                sr, SAMPLE_RATE).numpy()
+        return np.ascontiguousarray(a, dtype=np.float32)
+
+    def generate_eager(self, prompt: str, *,
+                       seconds: float = 30.0, steps: int = 8,
+                       seed: int | None = None,
+                       cfg: float = 1.0, apg: float = 1.0,
+                       negative_prompt: str | None = None,
+                       init_audio_path: str | None = None,
+                       init_noise_level: float = 1.0,
+                       inpaint_range: tuple[float, float] | None = None,
+                       ) -> tuple[np.ndarray, dict]:
+        """Advanced-mode render (no mega-graph). Returns (pcm_int16 (T,2), timing)."""
+        torch = canon.torch
+        T_lat = self.resolve_T_lat(seconds, self.decoder_name)
+        dec_min = self._dec_min_L()
+        if T_lat < dec_min:
+            raise ValueError(f"T_lat={T_lat} is below the {self.decoder_name} decoder engine's "
+                             f"profile minimum of {dec_min} "
+                             f"(~{dec_min * SAMPLES_PER_LATENT / SAMPLE_RATE:.2f}s)")
+        if not (self.DIT_MIN_L <= T_lat <= self.DIT_MAX_L):
+            raise ValueError(f"T_lat={T_lat} out of range [{self.DIT_MIN_L}, {self.DIT_MAX_L}]")
+        sigma_max = float(init_noise_level)
+        if not (0.0 < sigma_max <= 1.0):
+            raise ValueError(f"init_noise_level must be in (0, 1], got {sigma_max}")
+        if inpaint_range is not None and init_audio_path is None:
+            raise ValueError("inpaint needs init audio to keep the un-inpainted part of")
+        if seed is None:
+            seed = random.randint(0, 2**31 - 1)
+
+        with self._lock:
+            t_start = time.time()
+            R = self._eager_runners()
+            dit = self._eager_dit
+
+            # 1. T5 (+ the uncond branch when CFG is on)
+            t0 = time.time()
+            embeds, mask = t5gemma_encode(R["t5"], self.tokenizer, prompt)
+            null_embeds = null_mask = None
+            if cfg != 1.0:
+                null_embeds, null_mask = t5gemma_encode(
+                    R["t5"], self.tokenizer, negative_prompt or "")
+                if not (negative_prompt or "").strip():
+                    # No negative prompt → all-zero hidden + all-zero mask, which the
+                    # engine's bundled conditioner turns into the learned padding
+                    # embedding at every position (canon's "zero cross-attn" uncond).
+                    null_embeds = torch.zeros_like(embeds)
+                    null_mask = torch.zeros_like(mask)
+            t5_ms = (time.time() - t0) * 1000
+
+            # 2. init audio → latents (audio-to-audio / inpaint)
+            init_latents = None
+            encode_ms = 0.0
+            if init_audio_path:
+                t0 = time.time()
+                a = self._read_audio_any(init_audio_path)
+                target = T_lat * SAMPLES_PER_LATENT
+                a = (a[:, :target] if a.shape[-1] >= target
+                     else np.pad(a, ((0, 0), (0, target - a.shape[-1]))))
+                init_latents = canon.encode_chunked(
+                    self._encoder_runner(),
+                    torch.from_numpy(np.ascontiguousarray(a)).unsqueeze(0).cuda())
+                encode_ms = (time.time() - t0) * 1000
+
+            # 3. schedule + initial latent
+            sigmas = build_pingpong_schedule(steps, sigma_max=sigma_max,
+                                              dist_shift=self.dist_shift, latent_len=T_lat)
+            g = torch.Generator(device="cuda")
+            g.manual_seed(int(seed))
+            pure_noise = torch.randn(1, IO_CHANNELS, T_lat, device="cuda",
+                                      dtype=torch.float32, generator=g)
+            lat_range = None
+            if inpaint_range is not None:
+                s_sec, e_sec = inpaint_range
+                if not (0 <= s_sec < e_sec <= seconds):
+                    raise ValueError(f"inpaint range {s_sec},{e_sec} must satisfy "
+                                     f"0 <= start < end <= {seconds}")
+                lat_range = (max(0, int(round(s_sec * SAMPLE_RATE / SAMPLES_PER_LATENT))),
+                             min(T_lat, int(round(e_sec * SAMPLE_RATE / SAMPLES_PER_LATENT))))
+            if init_latents is not None and lat_range is None:
+                noise = init_latents * (1.0 - sigma_max) + pure_noise * sigma_max
+            else:
+                noise = pure_noise
+
+            # 4. local_add_cond: zeros, or the inpaint keep-mask + masked input
+            if lat_range is not None:
+                s0, s1 = lat_range
+                keep = torch.ones((1, 1, T_lat), device="cuda", dtype=torch.float32)
+                keep[:, :, s0:s1] = 0.0
+                local_add_cond = torch.cat([keep, init_latents * keep], dim=1).contiguous()
+                paste_back = (init_latents, keep)
+            else:
+                local_add_cond = torch.zeros((1, 257, T_lat), device="cuda", dtype=torch.float32)
+                paste_back = None
+
+            batched = self._cfg_batched if cfg != 1.0 else None
+            if batched is not None:
+                cat = torch.cat
+                h2 = cat([embeds.float(), null_embeds.float()], 0)
+                m2 = cat([mask.float(), null_mask.float()], 0)
+                lac2 = cat([local_add_cond, local_add_cond], 0)
+                sec2 = torch.full((2,), float(seconds), device="cuda")
+
+            def model_fn(x, t):
+                if cfg == 1.0:
+                    return dit.step(x, t, embeds, mask, seconds, local_add_cond)
+                if batched is not None:
+                    tv = float(t.item() if torch.is_tensor(t) else t)
+                    v2 = batched.step(cat([x, x], 0), torch.full((2,), tv, device="cuda"),
+                                      h2, m2, sec2, lac2)
+                    v_cond, v_uncond = v2[0:1], v2[1:2]
+                else:
+                    v_cond = dit.step(x, t, embeds, mask, seconds, local_add_cond)
+                    v_uncond = dit.step(x, t, null_embeds, null_mask, seconds, local_add_cond)
+                sigma = t.reshape(-1, 1, 1).float()
+                cond_d = x.float() - v_cond.float() * sigma
+                uncond_d = x.float() - v_uncond.float() * sigma
+                diff = cond_d - uncond_d
+                if apg <= 0.0:
+                    cfg_diff = diff
+                else:
+                    norm = torch.sqrt((cond_d * cond_d).sum(dim=(-2, -1), keepdim=True))
+                    unit = cond_d / torch.clamp(norm, min=1e-8)
+                    parallel = (diff * unit).sum(dim=(-2, -1), keepdim=True) * unit
+                    orth = diff - parallel
+                    cfg_diff = orth if apg >= 1.0 else (apg * orth + (1.0 - apg) * diff)
+                cfg_d = cond_d + (cfg - 1.0) * cfg_diff
+                return ((x.float() - cfg_d) / sigma).to(x.dtype)
+
+            t0 = time.time()
+            latents = sample_flow_pingpong(model_fn, noise, sigmas, seed=int(seed) + 1,
+                                            paste_back=paste_back)
+            torch.cuda.synchronize()
+            sampling_ms = (time.time() - t0) * 1000
+
+            # 5. decode
+            t0 = time.time()
+            # Eager path serves CFG / APG / a2a / inpaint, which the mega-graph does not cover.
+            # It must window the decode for the same reason the graph does: a capped decoder engine
+            # refuses any length above its profile ceiling, and that refusal used to surface as the
+            # previous request's buffer rather than an error.
+            _, _dec_hi = canon.profile_bounds(R["dec"], "latent")
+            out = (canon.decode_chunked(R["dec"], latents, chunk_lat=_dec_hi)
+                   if latents.shape[-1] > _dec_hi else decoder_decode(R["dec"], latents))
+            # ⚠ int16 too: decode_chunked accumulates in int16 (see its docstring). Testing only
+            # for int32 sends chunked output down the float branch, where it is clamped to ±1 and
+            # multiplied by 32767 a second time -- saturating every sample AND transposing to
+            # (2, T). Any render past the decoder's chunk ceiling hit this.
+            if out.dtype in (torch.int32, torch.int16):
+                pcm_full = out[0].to(torch.int16).cpu().numpy()
+            else:
+                pcm_full = (out.clamp(-1, 1) * 32767.0).to(torch.int16
+                            ).squeeze(0).T.contiguous().cpu().numpy()
+            decode_ms = (time.time() - t0) * 1000
+
+        actual_samples = int(round(seconds * SAMPLE_RATE))
+        pcm = pcm_full[:actual_samples].copy()
+        inference_ms = (time.time() - t_start) * 1000
+        mode = ("inpaint" if lat_range is not None else
+                "audio-to-audio" if init_latents is not None else "text-to-audio")
+        return pcm, {
+            "inference_ms": inference_ms,
+            "graph_build_ms": 0.0,
+            "realtime": (seconds * 1000.0) / inference_ms if inference_ms > 0 else 0.0,
+            "seed": int(seed), "T_lat": T_lat, "samples": len(pcm),
+            "t5_ms": t5_ms, "encode_ms": encode_ms,
+            "sampling_ms": sampling_ms, "decode_ms": decode_ms,
+            "mode": mode, "cfg": cfg, "sigma_max": sigma_max, "eager": True,
+        }
+
     def generate(self, prompt: str, *,
                  seconds: float = 30.0, steps: int = 8,
                  seed: int | None = None,
@@ -945,6 +1275,7 @@ class SA3Inference:
                  init_noise_level: float = 1.0,
                  negative_prompt: str | None = None,
                  cfg: float = 1.0,
+                 apg: float = 1.0,
                  init_audio_path: str | None = None,
                  inpaint_range: tuple[float, float] | None = None,
                  ) -> tuple[np.ndarray, dict]:
@@ -955,17 +1286,16 @@ class SA3Inference:
             timing: dict with 'inference_ms', 'graph_build_ms' (0 if cache hit),
                     'realtime', 'seed', 'T_lat', 'samples'
         """
-        # MVP scope gate. These all raise; SA3Inference is wired for them on
-        # the API surface but the implementations route through the eager
-        # path in sa3_trt_core (TBD).
-        if cfg != 1.0:
-            raise NotImplementedError("CFG support not yet wired through SA3Inference")
-        if init_audio_path is not None:
-            raise NotImplementedError("audio-to-audio not yet wired through SA3Inference")
-        if inpaint_range is not None:
-            raise NotImplementedError("inpaint not yet wired through SA3Inference")
-        if init_noise_level != 1.0:
-            raise NotImplementedError("non-unity init_noise_level not yet wired")
+        # Anything the mega-graph cannot serve -- CFG's dual pass, an init latent to mix or paste
+        # back, sigma_max != 1 -- routes to the eager sampler. It runs on its OWN execution
+        # contexts (see _SecondContext) so an already-captured graph stays valid.
+        if (cfg != 1.0 or init_audio_path is not None or inpaint_range is not None
+                or init_noise_level != 1.0):
+            return self.generate_eager(
+                prompt, seconds=seconds, steps=steps, seed=seed,
+                cfg=cfg, apg=apg, negative_prompt=negative_prompt,
+                init_audio_path=init_audio_path, init_noise_level=init_noise_level,
+                inpaint_range=inpaint_range)
 
         T_lat = self.resolve_T_lat(seconds, self.decoder_name)
         if not (1 <= T_lat <= 4096):

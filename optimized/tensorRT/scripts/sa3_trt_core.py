@@ -256,7 +256,9 @@ def normalize_precision(precision):
 # "canonical" = the shipped default decoder engine. The others are downloaded from HF on demand
 # (tensorRT/<arch>/<same-*>/dec_*.trt) — the same wide-profile engines built by quantize/build_tiers.py.
 #   fp8       fp8 FFN GEMMs (near-transparent, ~1.14×) — the speed pick
-#   fp8_fast  SAME-S only: fp8 on the attention projections too (~1.22×, lossier)
+# (the SAME-S-only "fp8_fast" tier — fp8 on the attention projections too — is RETIRED. It put fp8
+#  compute on exactly the layers with the outlier activations, and measured 9.21 dB against eager
+#  fp32 where plain fp8 measures 15.78 and bf16 18.53: a 9 dB drop for ~1.07x over fp8.)
 # (int8-weight-only "w8_bf16" was retired: its DequantizeLinear constant-folds to bf16 at build, so
 #  the engine was byte-for-byte the size/speed of the bf16 baseline with slightly lossier weights —
 #  strictly dominated. For a max-fidelity decoder use --precision fp32.)
@@ -265,7 +267,7 @@ DECODER_TIER_FILENAME = {
     # rebuild: the legacy engine has a RandomNormalLike at its bottleneck, so two runs of it differ
     # by ~0.9989 and any A/B against it is floored there.
     "same-s": {"canonical": "dec_bf16_chunkable_limiter.trt",
-               "fp8": "dec_fp8.trt", "fp8_fast": "dec_fp8_fast.trt",
+               "fp8": "dec_fp8_chunkable_limiter.trt",
                "legacy": "dec_dynamic_bf16.trt"},
     # ⚠ "legacy" is the pre-chunkable engine, kept reachable so renders made before the limiter
     # landed can be reproduced exactly -- the limiter CHANGES the audio, so a same-name swap
@@ -276,7 +278,7 @@ DECODER_TIER_FILENAME = {
 }
 ENCODER_TIER_FILENAME = {
     "same-s": {"canonical": "enc_bf16_chunkable.trt",
-               "fp8": "enc_fp8.trt", "fp8_fast": "enc_fp8_fast.trt",
+               "fp8": "enc_fp8_chunkable.trt",
                "legacy": "enc_dynamic_bf16.trt"},
     # ⚠ the old same-l enc_fp8.trt was REMOVED from the model repo: its activation quantisers
     # were calibrated with p99.9-within-clip → p90-across-clips → a 1e-4 floor, putting the clip
@@ -288,7 +290,7 @@ ENCODER_TIER_FILENAME = {
                "fp8": "enc_fp8_chunkable.trt",
                "legacy": "enc_dynamic_triton_swa.trt"},
 }
-DECODER_TIERS = ("canonical", "fp8", "fp8_fast", "legacy")
+DECODER_TIERS = ("canonical", "fp8", "legacy")
 
 
 def get_decoder_tier_path(decoder_name: str, tier: str = "canonical") -> Path:
@@ -866,6 +868,11 @@ def encode_chunked(runner: TRTRunner, audio: torch.Tensor, *,
     return out[..., :T_req]                # drop the replicated latent
 
 
+# ⚠ The SHIPPED decoders BAKE this value: their IO is ('latent', 'pcm'), matching the
+# pre-limiter engines, so they are drop-in for any caller that binds two tensors. Baked and
+# runtime-input builds are BIT-EXACT given the same scales, and baked is ~4% faster (one fewer
+# scalar Mul plus constant folding). Build with --ceiling-input if you want the knob back.
+#
 # The limiter ceiling, when the decoder exposes it as a runtime input. TensorRT has NO default
 # for a graph input -- an unbound address makes enqueue fail outright ("Address is not set for
 # input tensor limiter_ceiling") -- so the default lives here and decoder_decode binds it unless

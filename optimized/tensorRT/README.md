@@ -226,10 +226,11 @@ Chunking is a **memory** mechanism, not a speed one. It wins on time only at exa
 the whole request is one window; above that, single-shot is 10–20% faster. Whole-pipeline resident
 VRAM for a six-minute render drops from ~21.5 GB to ~3.9 GB.
 
-**A limiter with a runtime ceiling.** The decoder emits already-limited PCM (5.8 ms window,
-sample-peak, ceiling 0.977 = −0.2021 dBFS) in place of the old hard clip. `--limiter-ceiling`
-changes it per call with no rebuild and no recapture; a large value bypasses it and reproduces the
-old behaviour exactly. ⚠ **This changes the audio.** To reproduce renders made before it landed,
+**A limiter.** The decoder emits already-limited PCM (5.8 ms window, sample-peak, ceiling
+0.977 = −0.2021 dBFS) in place of the old hard clip. The ceiling is **baked**, so the engines keep
+the `('latent', 'pcm')` signature of the pre-limiter builds and drop straight in — a baked engine
+is bit-exact against a runtime-input one and about 4% faster. Rebuild with `--ceiling-input` if you
+want it settable per call. ⚠ **This changes the audio.** To reproduce renders made before it landed,
 use `--dec-precision legacy`, which resolves to the previous engines — still published, nothing was
 moved.
 
@@ -293,8 +294,8 @@ variance once the graph is built).
 | `--init-noise-level` | 1.0         | σmax; 0.4–0.8 typical for variation, 1.0 = full regen                          |
 | `--inpaint-range`    | —           | `START,END` seconds; regenerate that span, keep the rest                       |
 | `--chunking`         | on          | SAME-L: windowed decode on the low profile (509 MB scratch). `--no-chunking` = single-shot on the wide profile, faster above L=256, ~5.4 GB more resident |
-| `--limiter-ceiling`  | 0.977       | Decoder's output peak ceiling, linear (0.977 = −0.2021 dBFS). Large value = bypass, reproducing the old hard clip |
-| `--dec-precision`    | canonical   | `canonical` (fp16), `fp8`, `fp8_fast` (same-s), or `legacy` (pre-limiter engines, for reproducing old renders) |
+| `--limiter-ceiling`  | baked 0.977 | Only for engines built `--ceiling-input`; the shipped ones bake it |
+| `--dec-precision`    | canonical   | `canonical` (fp16 for SAME-L, bf16 for SAME-S), `fp8`, or `legacy` (pre-limiter engines, for reproducing old renders) |
 | `--quiet`            | off         | Suppress per-stage prints + NVML probes — saves ~4 ms                          |
 | `--pinned-copy`      | on          | Pinned host buffer + non_blocking DtoH for Stage 5                             |
 | `--free-models`      | off         | Free TRT engine memory after each stage's last use                             |

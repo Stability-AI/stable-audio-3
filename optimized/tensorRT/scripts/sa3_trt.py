@@ -1098,10 +1098,12 @@ def main():
                          "is a MEMORY mechanism, not a speed one: it only wins on time at exactly "
                          "L=256, where the whole request is one window.")
     ap.add_argument("--limiter-ceiling", type=float, default=None,
-                    help="Peak ceiling the decoder's built-in limiter holds, linear (default "
-                         "0.977 = -0.2021 dBFS). Pass a large value (e.g. 1e6) to bypass it, "
-                         "which reproduces the old hard-clip behaviour exactly. Runtime input on "
-                         "the chunkable engines -- no rebuild, no recapture.")
+                    help="Peak ceiling the decoder's limiter holds, linear (0.977 = -0.2021 dBFS "
+                         "everywhere by default). ⚠ The SHIPPED engines BAKE this so their IO "
+                         "stays ('latent','pcm') and they drop in for the pre-limiter engines; "
+                         "passing this flag against them is an error. Rebuild with "
+                         "build_samel_chunkable.py --ceiling-input for a settable ceiling, or use "
+                         "--dec-precision legacy for the pre-limiter hard-clip behaviour.")
     ap.add_argument("--mega-graph", action=argparse.BooleanOptionalAction, default=True,
                     help="Capture the entire pipeline in one CUDA graph (T5+DiT+decoder+narrow+DtoH). "
                          "On by default. Falls back to eager path for cfg≠1.0, inpaint, or audio-to-audio.")

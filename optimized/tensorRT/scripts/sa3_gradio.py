@@ -343,10 +343,12 @@ def build_ui(initial_dit: str, initial_decoder: str, *,
                   default_seconds, quiet)
 
     DIT_OPTIONS = list(DEFAULT_DECODERS.keys())
-    # The DiT profile runs L=1..4096; the binding limits are the chunkable decoders'
-    # profile floor (32 latents) and that same 4096 ceiling. Clamp the slider to both so
-    # the UI cannot ask for a length the decoder will refuse.
-    MIN_SECONDS = math.ceil(canon.DECODER_MIN_L * SAMPLES_PER_LATENT / SAMPLE_RATE)   # 3 s
+    # The DiT profile runs L=1..4096 and every shipped chunkable autoencoder reports a
+    # floor of 1 latent, so 1 s is the honest slider minimum. It used to be 3 s, derived
+    # from the stale DECODER_MIN_L=32 that SA3Inference._dec_min_L() was returning because
+    # of a TypeError it swallowed; the guard reads the real per-engine floor now, so an
+    # older engine with a genuine 32 floor still gets rejected with a clear message.
+    MIN_SECONDS = 1
     MAX_SECONDS = SA3Inference.DIT_MAX_L * SAMPLES_PER_LATENT / SAMPLE_RATE // 1      # 380 s
 
     def on_dit_change(dit_name):

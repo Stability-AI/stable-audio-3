@@ -1069,8 +1069,12 @@ class SA3Inference:
         distribution and measures 0.82-0.92. So the guard has to ask the engine, not a constant.
         """
         try:
+            # ⚠ profile_bounds returns (min, max) as plain ints, not shape tuples. This read
+            # `lo[-1]`, which raises TypeError on an int, so EVERY call fell into the except
+            # and returned the stale DECODER_MIN_L=32 — rejecting every render under ~2.97 s
+            # even though the shipped chunkable engines all report a floor of 1.
             lo, _ = canon.profile_bounds(self.runners["dec"], "latent")
-            return int(lo[-1])
+            return int(lo)
         except Exception:
             return DECODER_MIN_L
 

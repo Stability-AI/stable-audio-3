@@ -54,7 +54,7 @@ lats = [canon.encode_chunked(E, torch.from_numpy(w).unsqueeze(0).cuda(),
                              warmup_passes=0, balance=True).float().cpu().numpy() for w in picked]
 E.free(); torch.cuda.empty_cache()
 from huggingface_hub import hf_hub_download
-base = hf_hub_download("stabilityai/stable-audio-3-optimized", "onnx/same-s/dec_dynamic_bf16.onnx")
+base = hf_hub_download("stabilityai/stable-audio-3-optimized", "onnx/same-s/dec_bf16.onnx")
 m = onnx.load(base, load_external_data=True); g = m.graph
 inits = {i.name for i in g.initializer}; prod = {o: n for n in g.node for o in n.output}
 targets = {}

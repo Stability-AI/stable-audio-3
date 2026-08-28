@@ -29,7 +29,7 @@ dB/cos is vs **eager** encode (the latent). dB is a heuristic — confirm near-t
 
 | file | quantized | compute | onnx | speed | dB vs bf16 (music / sfx) |
 |---|---|---|---|---|---|
-| `dec_dynamic_bf16.onnx` | — *(bf16 baseline)* | bf16 | 219 MB | 1.00× | ref (7.25 ms @1292 · 23.2 @4096) |
+| `dec_bf16.onnx` | — *(bf16 baseline)* | bf16 | 219 MB | 1.00× | ref (7.25 ms @1292 · 23.2 @4096) |
 | `dec_fp8.onnx` | fp8 weights + activations (FFN) | fp8 FFN GEMM | 58 MB | **1.14×** | 30.9 / 41.0 · near-transparent |
 | `dec_fp8_fast.onnx` | fp8 weights + activations (all linears) | fp8 all GEMMs | 58 MB | **1.22×** | 26.1 / 36.5 · lossy |
 
@@ -37,7 +37,7 @@ dB/cos is vs **eager** encode (the latent). dB is a heuristic — confirm near-t
 
 | file | quantized | compute | onnx | speed | dB vs bf16 |
 |---|---|---|---|---|---|
-| `dec_dynamic_triton_swa.onnx` | — *(bf16 baseline)* | bf16 | 1193 MB | 1.00× | ref (54.0 ms @1292 · 174.4 @4096) |
+| `dec_fp16.onnx` | — *(bf16 baseline)* | bf16 | 1193 MB | 1.00× | ref (54.0 ms @1292 · 174.4 @4096) |
 | `dec_fp8.onnx` | fp8 weights + activations (FFN) | fp8 FFN GEMM | 937 MB | **1.15×** | 43.4 · near-transparent |
 
 SAME-L has **no `_fast` tier**: its attention projections are fp32 islands (fp8 there collapses quality — see islands below).
@@ -48,7 +48,7 @@ The **encoder is cheap** (~1 ms SAME-S, ~7 ms SAME-L), so quant mostly buys **si
 
 | file | quantized | compute | onnx | speed | dB / cos vs eager |
 |---|---|---|---|---|---|
-| `enc_dynamic_bf16.onnx` | — *(bf16 baseline)* | bf16 | 216 MB | 1.00× | 36.4 / 0.997 (~1 ms) |
+| `enc_bf16.onnx` | — *(bf16 baseline)* | bf16 | 216 MB | 1.00× | 36.4 / 0.997 (~1 ms) |
 | `enc_fp8.onnx` | fp8 (FFN) | fp8 FFN GEMM | 54 MB | 1.08× | 29.9 / 0.986 · near-transparent |
 | `enc_fp8_fast.onnx` | fp8 (all linears) | fp8 all GEMMs | 54 MB | 1.14× | 22.3 / 0.924 · lossy |
 
@@ -56,7 +56,7 @@ The **encoder is cheap** (~1 ms SAME-S, ~7 ms SAME-L), so quant mostly buys **si
 
 | file | quantized | compute | onnx | speed | dB / cos vs eager |
 |---|---|---|---|---|---|
-| `enc_dynamic_triton_swa.onnx` | — *(bf16 baseline)* | bf16 | 1192 MB | 1.00× | 46.0 / 0.9997 (~7 ms) |
+| `enc_fp16.onnx` | — *(bf16 baseline)* | bf16 | 1192 MB | 1.00× | 46.0 / 0.9997 (~7 ms) |
 | `enc_fp8.onnx` | fp8 (FFN) | fp8 FFN GEMM | 895 MB | 1.03× | 30.8 / 0.989 · near-transparent |
 
 Encoder input is audio `(1,2,N)`; output latent `(1,256,N/4096)`. **Every encoder onnx carries a
@@ -155,7 +155,7 @@ those islands (int8/fp8 weights, bf16 compute — no speed or quality cost) pull
 ## Building the engines
 
 The tier **ONNX files ship on HuggingFace** (`stabilityai/stable-audio-3-optimized`, alongside the
-existing `dec_dynamic_bf16.onnx` / `enc_dynamic_*`). To build an engine with the wide profile:
+existing `dec_bf16.onnx` / `enc_dynamic_*`). To build an engine with the wide profile:
 
 ```bash
 python build_tiers.py <tier.onnx> <out.trt> --arch {same-s|same-l} --kind {enc|dec} [--fp8]

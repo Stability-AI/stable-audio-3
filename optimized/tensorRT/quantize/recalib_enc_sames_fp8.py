@@ -44,7 +44,7 @@ def main():
     if not base:
         from huggingface_hub import hf_hub_download
         base = hf_hub_download("stabilityai/stable-audio-3-optimized",
-                               "onnx/same-s/enc_dynamic_bf16.onnx")
+                               "onnx/same-s/enc_bf16.onnx")
     m = onnx.load(base, load_external_data=True); g = m.graph
     inits = {i.name: i for i in g.initializer}
     prod = {o: n for n in g.node for o in n.output}

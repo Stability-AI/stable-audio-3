@@ -294,7 +294,7 @@ TARGETS = {
     # Triton SWA plugin already runs FP32 internally, so its contract is
     # unchanged. Output engine matches PyTorch FP32 eager closely.
     "same-l-decoder-fp32": {
-        "onnx_hf":      ["same-l/dec_dynamic_triton_swa.onnx"],
+        "onnx_hf":      ["same-l/dec_fp16.onnx"],
         "trt_local":    "same-l/dec_dynamic_fp32.trt",
         "flags":        set(),
         "network":      "STRONGLY_TYPED",
@@ -307,7 +307,7 @@ TARGETS = {
     # (no FP16 ops to upcast). Just build STRONGLY_TYPED so the engine
     # honors the ONNX dtypes (FP32 instead of BF16).
     "same-s-decoder-fp32": {
-        "onnx_hf":      ["same-s/dec_dynamic_bf16.onnx"],
+        "onnx_hf":      ["same-s/dec_bf16.onnx"],
         "trt_local":    "same-s/dec_dynamic_fp32.trt",
         "flags":        set(),
         "network":      "STRONGLY_TYPED",

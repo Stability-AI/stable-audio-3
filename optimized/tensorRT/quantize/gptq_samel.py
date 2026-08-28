@@ -82,7 +82,7 @@ def gptq(Wnp, Hnp, scale_np, pd=0.05, bs=128):
     return torch.clamp(torch.round(Q), -127, 127).to(torch.int8).cpu().numpy()
 # graft onto the onnx
 from huggingface_hub import hf_hub_download
-DEC = hf_hub_download("stabilityai/stable-audio-3-optimized", "onnx/same-l/dec_dynamic_triton_swa.onnx")
+DEC = hf_hub_download("stabilityai/stable-audio-3-optimized", "onnx/same-l/dec_fp16.onnx")
 m = onnx.load(DEC, load_external_data=True); g = m.graph
 inits = {i.name: i for i in g.initializer}; prod = {o: n for n in g.node for o in n.output}
 def warr(n):

@@ -11,7 +11,7 @@ WD = "/weka2/cj/clod/sames_fp8"; E4M3 = 448.0
 SRC = os.environ.get("ENC_ONNX")
 if not SRC:
     from huggingface_hub import hf_hub_download
-    SRC = hf_hub_download("stabilityai/stable-audio-3-optimized", "onnx/same-s/enc_dynamic_bf16.onnx")
+    SRC = hf_hub_download("stabilityai/stable-audio-3-optimized", "onnx/same-s/enc_bf16.onnx")
 AUD = np.load(f"{WD}/calib_audio_sames.npz")["audio"].astype(np.float32)               # [6,2,N]
 def warr(inits, prod, n):
     w = n.input[1]

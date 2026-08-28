@@ -17,11 +17,18 @@ import argparse, shutil, sys
 from pathlib import Path
 import onnx
 
-SRC = ("/admin/home-cj/.cache/huggingface/hub/models--stabilityai--stable-audio-3-optimized/"
-       "snapshots/2204d5086475bd5b7e6e2bd720772dd8e8160513/onnx/same-s/dec_dynamic_bf16.onnx")
+def _default_src():
+    """Fetch the base decoder from the Hub rather than a pinned cache path.
+
+    This used to hardcode a snapshot hash, which pins the file to one revision and breaks
+    the moment anything in the repo changes -- as the dec_dynamic_bf16 -> dec_bf16 rename
+    just did.
+    """
+    from huggingface_hub import hf_hub_download
+    return hf_hub_download("stabilityai/stable-audio-3-optimized", "onnx/same-s/dec_bf16.onnx")
 ap = argparse.ArgumentParser()
-ap.add_argument("--src", default=SRC)
-ap.add_argument("--out", default="onnx/same-s/dec_dynamic_bf16_det.onnx")
+ap.add_argument("--src", default=None, help="base ONNX (default: fetch from the Hub)")
+ap.add_argument("--out", default="onnx/same-s/dec_bf16_det.onnx")
 a = ap.parse_args()
 out = Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)
 

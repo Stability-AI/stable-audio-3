@@ -35,7 +35,7 @@ Inputs/outputs:
 Usage:
     python build_same_s_dec_fp16.py
       [--mode {minimal,rope,full}]      # default: rope
-      [--input  /weka2/cj/clod/sa3s/stable-audio-3-optimized/onnx/same-s/dec_dynamic_bf16.onnx]
+      [--input  /weka2/cj/clod/sa3s/stable-audio-3-optimized/onnx/same-s/dec_bf16.onnx]
       [--onnx   /tmp/same_s_dec_fp16.onnx]
       [--engine .../models/sm_90/same-s/dec_dynamic_fp16.trt]
 """
@@ -608,7 +608,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input",
                     default="/weka2/cj/clod/sa3s/stable-audio-3-optimized/"
-                            "onnx/same-s/dec_dynamic_bf16.onnx",
+                            "onnx/same-s/dec_bf16.onnx",
                     help="Input FP32 ONNX (the `_bf16` suffix refers to the "
                          "eventual engine flavor; the ONNX itself is FP32)")
     ap.add_argument("--onnx",

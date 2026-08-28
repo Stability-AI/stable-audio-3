@@ -244,7 +244,7 @@ the `('latent', 'pcm')` signature of the pre-limiter builds and drop straight in
 is bit-exact against a runtime-input one and about 4% faster. Rebuild with `--ceiling-input` if you
 want it settable per call. ⚠ **This changes the audio.** To reproduce renders made before it landed,
 the pre-limiter engines are no longer reachable from the runtime — rebuild one from the pristine
-`onnx/same-*/dec_dynamic_*.onnx` if you need it.
+`onnx/same-l/dec_fp16.onnx` / `onnx/same-s/dec_bf16.onnx` if you need it.
 
 The low band's ceiling is 256 latents on both decoders and both encoders. It is a real dial:
 raising it costs scratch and cuts the window count, lowering it does the reverse. On SAME-S the

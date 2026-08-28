@@ -171,3 +171,6 @@ wandb/*
 .claude
 # LoRA-merged DiT cache (patched copies; regenerated on demand)
 optimized/tflite/models/tflite/lora_cache/
+# Rendered audio from the CLI / gradio backends. *.wav above already covers most of it,
+# but the --file-format flag also writes .flac and .mp3.
+optimized/*/output/

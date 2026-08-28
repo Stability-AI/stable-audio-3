@@ -379,3 +379,62 @@ python make_dit_fp8_smalldit.py \
 | `_arch.py` | Shared: GPU arch detection + path helpers | both |
 | `samel_loader.py` | Helper: load SAME-L from .ckpt | producer |
 | `samel_{encoder,decoder}_onnx.py` | Helper: clean ONNX rewrites of SAME-L blocks | producer |
+
+## Autoencoders: `build_autoencoders.py`
+
+The SAME-L / SAME-S encoders and decoders have their own builder, because they need two
+optimization profiles and (for decoders) a grafted limiter:
+
+```bash
+python build/build_autoencoders.py                 # all 8, auto-detect arch, verify
+python build/build_autoencoders.py --model same-l  # one model
+python build/build_autoencoders.py --list          # show the target table
+```
+
+It is pure consumer flow — download ONNX, compile, verify. **All the complexity is pre-baked into
+the published ONNX**: the decoders arrive deterministic, with the limiter already grafted and its
+ceiling already a baked constant, and the fp8 encoders arrive with `amax`-calibrated activation
+scales. Nothing here needs a checkpoint or calibration audio.
+
+Each engine carries two bands:
+
+| band | decoder | encoder | use |
+|---|---|---|---|
+| 0 | L=1..256 | L=1..256 | chunked, minimum scratch (SAME-L decoder 509 MB) |
+| 1 | L=1..4096 | L=1..4096 | single-shot (SAME-L decoder 8143 MB) |
+
+⚠ The memory saving only appears with `USER_MANAGED` contexts sized by
+`get_device_memory_size_for_profile_v2(band)`. `device_memory_size_v2` is the **max across
+profiles**, so a default context reserves the wide band and the benefit silently disappears.
+`TRTRunner(..., profile=N)` in `scripts/sa3_trt_core.py` does this correctly.
+
+Verification runs by default and checks, per engine: finite non-silent output, correct latent
+count, the two bands agreeing with each other, and — on decoders — that the baked limiter holds
+its 0.977 ceiling. It uses a synthetic harmonic signal, which is a **structural smoke test, not a
+quality measurement**; autoencoder quality has to be measured on real music.
+
+### Regenerating the build-ready ONNX (producer flow)
+
+Only needed after a model retrain or a change to the limiter. Requires the SAME-S/SAME-L
+checkpoints and the calibration audio.
+
+```
+build/limiter/limiter.onnx                exported from the torch reference (65 nodes, 9 KB)
+build/limiter/make_deterministic_sames.py removes SAME-S's RandomNormalLike bottleneck
+build/limiter/graft_limiter.py            splices the limiter in place of the decoder's clip
+build/limiter/make_ceiling_input.py       optional: promote the ceiling to a runtime input
+quantize/recalib_enc_fp8.py               SAME-L fp8 encoder, amax activation scales
+quantize/recalib_enc_sames_fp8.py         SAME-S fp8 encoder, amax activation scales
+quantize/recalib_dec_sames_margin.py      SAME-S fp8 decoder, retighten the amax margin
+```
+
+⚠ The recalibration scripts exist because both fp8 encoders shipped with activation scales derived
+from a percentile rather than `amax` — SAME-L's from p99.9 → p90-across-clips → a 1e-4 floor,
+SAME-S's from a p99.9 over a 400k random subsample. Both discarded the tail of a heavy-tailed
+distribution and cost 0.7 dB and 2.75 dB of round trip respectively. The weight scales were always
+`amax` and were never affected.
+
+⚠ fp8 output is **hypersensitive to activation-scale jitter**: two runs of the same recalibration
+differing in the 6th decimal produce engines 20 dB apart from each other, while scoring within
+0.01 dB of each other against PyTorch fp32. Never A/B two fp8 builds against each other — that
+delta is meaningless. Always measure each against fp32.

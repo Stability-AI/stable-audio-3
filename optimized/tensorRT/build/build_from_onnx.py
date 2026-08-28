@@ -39,7 +39,16 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 # diff_attn_nocast_plugin + triton_swa_v2 (for SAME-L plugin) live in ../scripts/
 sys.path.insert(0, str(SCRIPTS_DIR.parent / "scripts"))
 
-from _arch import detect_arch, arch_dir  # noqa: E402
+# ⚠ There are TWO _arch.py — this directory's (detect_arch + repo_root + arch_dir +
+# onnx_dir) and scripts/ (detect_arch only). The scripts/ insert above lands at index 0,
+# so a plain `from _arch import ...` picked the wrong one and this script died on import
+# with "cannot import name 'arch_dir'". Load it by explicit path so the order cannot
+# matter again.
+import importlib.util as _ilu  # noqa: E402
+_spec = _ilu.spec_from_file_location("_build_arch", SCRIPTS_DIR / "_arch.py")
+_build_arch = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_build_arch)
+detect_arch, arch_dir = _build_arch.detect_arch, _build_arch.arch_dir
 
 
 HF_REPO = "stabilityai/stable-audio-3-optimized"
@@ -79,46 +88,6 @@ TARGETS = {
         "workspace_gb": 8,
         "profile":      None,  # static shapes
         "plugin":       False,
-    },
-    "same-s-encoder": {
-        "onnx_hf":      ["same-s/enc_dynamic_bf16.onnx"],
-        "trt_local":    "same-s/enc_dynamic_bf16.trt",
-        "flags":        {"BF16"},
-        "network":      "EXPLICIT_BATCH",
-        "workspace_gb": 16,
-        "profile":      {"audio": [(1, 2, 32 * SAMPLES_PER_LATENT),
-                                    (1, 2, 1292 * SAMPLES_PER_LATENT),
-                                    (1, 2, 4096 * SAMPLES_PER_LATENT)]},
-        "plugin":       False,
-    },
-    "same-s-decoder": {
-        "onnx_hf":      ["same-s/dec_dynamic_bf16.onnx"],
-        "trt_local":    "same-s/dec_dynamic_bf16.trt",
-        "flags":        {"BF16"},
-        "network":      "EXPLICIT_BATCH",
-        "workspace_gb": 16,
-        "profile":      {"latent": [(1, 256, 32), (1, 256, 1292), (1, 256, 4096)]},
-        "plugin":       False,
-    },
-    "same-l-encoder": {
-        "onnx_hf":      ["same-l/enc_dynamic_triton_swa.onnx"],
-        "trt_local":    "same-l/enc_dynamic_triton_swa.trt",
-        "flags":        set(),  # STRONGLY_TYPED carries dtype hints
-        "network":      "STRONGLY_TYPED",
-        "workspace_gb": 16,
-        "profile":      {"audio": [(1, 2, 32 * SAMPLES_PER_LATENT),
-                                    (1, 2, 1292 * SAMPLES_PER_LATENT),
-                                    (1, 2, 4096 * SAMPLES_PER_LATENT)]},
-        "plugin":       True,
-    },
-    "same-l-decoder": {
-        "onnx_hf":      ["same-l/dec_dynamic_triton_swa.onnx"],
-        "trt_local":    "same-l/dec_dynamic_triton_swa.trt",
-        "flags":        set(),
-        "network":      "STRONGLY_TYPED",
-        "workspace_gb": 16,
-        "profile":      {"latent": [(1, 256, 32), (1, 256, 1292), (1, 256, 4096)]},
-        "plugin":       True,
     },
     # SA3 DiT engines: build from the pre-processed FP16-mixed ONNX hosted on
     # HF. The producer (build_dit_fp16.py) does the FP32-island surgery
@@ -571,6 +540,31 @@ def build_one(name: str) -> str:
     return str(target)
 
 
+# The autoencoders are NOT built here. build_autoencoders.py owns them: the shipping
+# engines carry two optimization profiles (a 256-latent low band for chunked decode and a
+# wide single-shot band) and, for the decoders, a baked limiter — none of which this
+# single-profile recipe table can express. Building them here produced
+# dec_dynamic_triton_swa.trt / dec_dynamic_bf16.trt and friends, retired names the runtime
+# registry never asks for, so the output was silently unusable.
+AUTOENCODER_TARGETS = {
+    "same-s-encoder": ("same-s", "enc"), "same-s-decoder": ("same-s", "dec"),
+    "same-l-encoder": ("same-l", "enc"), "same-l-decoder": ("same-l", "dec"),
+}
+
+
+def build_autoencoder(name: str) -> None:
+    """Delegate to build_autoencoders.py so there is exactly one AE build path."""
+    import subprocess
+    model, kind = AUTOENCODER_TARGETS[name]
+    script = Path(__file__).resolve().parent / "build_autoencoders.py"
+    cmd = [sys.executable, str(script), "--model", model, "--kind", kind]
+    print(f"\n━━━ {name} → build_autoencoders.py ━━━")
+    print(f"  $ {' '.join(cmd[1:])}", flush=True)
+    rc = subprocess.call(cmd)
+    if rc != 0:
+        raise SystemExit(f"build_autoencoders.py exited {rc}")
+
+
 def main():
     canonical = [k for k in TARGETS if not k.endswith("-fp32")]
     fp32      = [k for k in TARGETS if k.endswith("-fp32")]
@@ -579,6 +573,10 @@ def main():
         print(__doc__)
         print("\nCanonical (FP16-mixed) targets:")
         for k in canonical:
+            print(f"  {k}")
+        print("\nAutoencoders (delegated to build_autoencoders.py — two profiles + "
+              "baked limiter):")
+        for k in AUTOENCODER_TARGETS:
             print(f"  {k}")
         print("\nFP32 variants (~2x slower, ~2x engine size, opt-in):")
         for k in fp32:
@@ -590,20 +588,23 @@ def main():
         sys.exit(1)
 
     target = sys.argv[1]
+    def _build(name):
+        (build_autoencoder if name in AUTOENCODER_TARGETS else build_one)(name)
     if target == "all":
-        for name in canonical:
-            build_one(name)
+        for name in canonical + list(AUTOENCODER_TARGETS):
+            _build(name)
     elif target == "all-fp32":
         for name in fp32:
             build_one(name)
     elif target == "all-both":
-        for name in canonical + fp32:
-            build_one(name)
-    elif target in TARGETS:
-        build_one(target)
+        for name in canonical + list(AUTOENCODER_TARGETS) + fp32:
+            _build(name)
+    elif target in TARGETS or target in AUTOENCODER_TARGETS:
+        _build(target)
     else:
         print(f"unknown target: {target}")
-        print(f"valid: {list(TARGETS)} + 'all' / 'all-fp32' / 'all-both'")
+        print(f"valid: {list(TARGETS) + list(AUTOENCODER_TARGETS)} "
+              f"+ 'all' / 'all-fp32' / 'all-both'")
         sys.exit(1)
 
 

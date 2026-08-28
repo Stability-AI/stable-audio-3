@@ -53,22 +53,15 @@ TARGETS = [
     {"label": "t5gemma  (text encoder + tokenizer)",
      "command": _from_onnx("t5gemma"),
      "outputs": ["t5gemma/t5gemma_fp16.trt", "t5gemma/tokenizer.json"]},
-    {"label": "same-s encoder",
-     "command": _from_onnx("same-s-encoder"),
-     "outputs": ["same-s/enc_dynamic_bf16.trt"]},
-    {"label": "same-s decoder",
-     "command": _from_onnx("same-s-decoder"),
-     "outputs": ["same-s/dec_dynamic_bf16.trt"]},
-    # SAME-L uses the custom SWA plugin. Its kernel implementation is chosen at build
-    # time via SA3_SWA_PLUGIN / SA3_SWA_AOT and baked into the engine — the default (AOT
-    # block-tiled MMA) is graph-capturable and needs no Python at inference. See
-    # "Choosing the SAME-L attention kernel" in README.md before overriding.
-    {"label": "same-l encoder (SWA plugin — AOT MMA kernel, graph-capturable)",
-     "command": _from_onnx("same-l-encoder"),
-     "outputs": ["same-l/enc_dynamic_triton_swa.trt"]},
-    {"label": "same-l decoder (SWA plugin — AOT MMA kernel, graph-capturable)",
-     "command": _from_onnx("same-l-decoder"),
-     "outputs": ["same-l/dec_dynamic_triton_swa.trt"]},
+    # The autoencoders build through build_autoencoders.py: they need two optimization profiles
+    # and (decoders) a grafted limiter, which build_from_onnx.py's single-profile path cannot
+    # express. One command does all eight and verifies them.
+    {"label": "SAME-L + SAME-S autoencoders (8 engines: enc/dec x canonical/fp8)",
+     "command": [sys.executable, str(SCRIPTS_DIR / "build_autoencoders.py")],
+     "outputs": ["same-l/enc_fp16_chunkable.trt", "same-l/dec_fp16_chunkable_limiter.trt",
+                 "same-l/enc_fp8_chunkable.trt", "same-l/dec_fp8_chunkable_limiter.trt",
+                 "same-s/enc_bf16_chunkable.trt", "same-s/dec_bf16_chunkable_limiter.trt",
+                 "same-s/enc_fp8_chunkable.trt", "same-s/dec_fp8_chunkable_limiter.trt"]},
     # DiT engines now build from pre-processed FP16-mixed ONNX on HF;
     # build_from_onnx.py does the simple STRONGLY_TYPED compile.
     # Medium ships TWO engines: fp16-mixed (the DEFAULT since 2026-07 — its

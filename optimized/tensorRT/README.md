@@ -216,15 +216,27 @@ Two things changed.
 old single-profile decoder reserved **8143 MB whether it decoded five seconds or six minutes**. The
 new engines carry a low band (decoder 256 latents, encoder 64) and a wide band (4096):
 
-| | scratch | decode |
-|---|---|---|
-| `--chunking` (default), SAME-L | **509 MB** decoder, **521 MB** encoder | 256-latent windows |
-| `--chunking` (default), SAME-S | **363 MB** decoder, **365 MB** encoder | 256-latent windows |
-| `--no-chunking` | 8143 / 8330 MB (SAME-L), 5780 / 5800 (SAME-S) | one single-shot call |
+Scratch, read per profile with `get_device_memory_size_for_profile_v2()` — never
+`device_memory_size_v2`, which reports the max across profiles and so credits the low band with
+the wide band's reservation:
 
-Chunking is a **memory** mechanism, not a speed one. It wins on time only at exactly L=256, where
-the whole request is one window; above that, single-shot is 10–20% faster. Whole-pipeline resident
-VRAM for a six-minute render drops from ~21.5 GB to ~3.9 GB.
+| | decoder | encoder |
+|---|---|---|
+| SAME-L, `--chunking` (default) | **485 MB** | **496 MB** |
+| SAME-L, `--no-chunking` | 7,766 MB | 7,944 MB |
+| SAME-S bf16, `--chunking` | **346 MB** | **348 MB** |
+| SAME-S bf16, `--no-chunking` | 5,512 MB | 5,531 MB |
+| SAME-S fp8, `--chunking` | **327 MB** | **329 MB** |
+| SAME-S fp8, `--no-chunking` | 5,204 MB | 5,225 MB |
+
+These are flat in L: TensorRT sizes scratch from the profile ceiling, not from the shape you
+bind, so the wide band costs the same 7.8 GB on a 3-second clip as on a six-minute one.
+
+Chunking is a **memory** mechanism, not a speed one, and the cost is smaller than it looks in
+isolation. Decode alone at L=4096 is 250.0 ms chunked against 195.6 ms single-shot (1.28×), but
+the DiT dominates a render, so end-to-end it is **2–5%**: on medium fp16 + SAME-L a 380 s render
+is 592 ms chunked against 565 ms single-shot, and resident VRAM is 5,756 MiB against 12,832 MiB.
+Full curves in [`benchmarks/`](benchmarks/).
 
 **A limiter.** The decoder emits already-limited PCM (5.8 ms window, sample-peak, ceiling
 0.977 = −0.2021 dBFS) in place of the old hard clip. The ceiling is **baked**, so the engines keep
@@ -245,7 +257,8 @@ Also worth knowing when building your own: a profile is `(min, opt, max)`, and t
 different jobs. **`max` sets VRAM; `opt` sets which shapes get the good kernels** and costs nothing.
 The inherited default of `min(1292, ceiling)` — 1292 latents being exactly 120.0 s — costs 17–23%
 at short L on the wide band while buying nothing at long L. See
-[`build/build_samel_chunkable.py`](build/build_samel_chunkable.py) for the tuned values.
+the `bands` / `opts` columns of the `TARGETS` table in
+[`build/build_autoencoders.py`](build/build_autoencoders.py) for the tuned values.
 
 ⚠ The old `same-l/enc_fp8.trt` was **removed** from the model repo. Its activation quantisers were
 calibrated with a doubly-conservative percentile plus a `1e-4` floor, putting the clip points at
@@ -253,6 +266,63 @@ calibrated with a doubly-conservative percentile plus a `1e-4` floor, putting th
 on clean acoustic material. `enc_fp8_chunkable.trt` is the same weights recalibrated
 ([`quantize/recalib_enc_fp8.py`](quantize/recalib_enc_fp8.py)) and measures 30.9 dB of latent SNR
 where the old one measured 18.3.
+
+## Building on hardware we don't publish for
+
+Prebuilt engines exist only for the architectures we can build and verify on (currently
+`sm_90`). On anything else — `sm_120`, `sm_89`, … — the autoencoders are a ~10 minute local
+build, and the runtime asks rather than failing:
+
+```
+No prebuilt engines for sm_120 — 2 of the 4 file(s) this configuration needs are not published:
+    same-l/dec_fp16_chunkable_limiter.trt
+    same-l/enc_fp16_chunkable.trt
+
+These are autoencoders — buildable here from the published ONNX in about 10 minutes.
+Build them now for sm_120? [Y/n]
+```
+
+The whole file list is checked against the model repo *before* anything downloads, so you never
+pay 3 GB for a DiT and T5 only to discover the decoder is absent. Answering yes runs the build;
+declining, a non-tty, or an engine the AE script can't build (DiT, T5Gemma) exits with the exact
+command instead.
+
+To build ahead of time, or to rebuild after changing a profile:
+
+```bash
+python build/build_autoencoders.py                      # all eight, verified
+python build/build_autoencoders.py --model same-s --kind dec --force
+python build/build_autoencoders.py --list
+```
+
+It downloads the ONNX (the limiter is already grafted into the decoder graphs), compiles both
+profiles, and verifies by default — decoder checks are an encode→decode round trip, so a
+`--kind dec` build with no encoder present reports SKIP rather than a failure it isn't
+responsible for. Engines land in `models/<arch>/` and are picked up automatically.
+
+⚠ `build_from_onnx.py` no longer builds autoencoders itself. Its four AE targets delegate here:
+it used to emit single-profile, limiter-less engines under the retired
+`dec_dynamic_triton_swa.trt` / `dec_dynamic_bf16.trt` names, which the runtime registry can never
+request — so `all` was quietly producing unusable files.
+
+## Benchmarks
+
+[`benchmarks/`](benchmarks/) has the full sweep of all eight autoencoder configurations —
+`{SAME-S, SAME-L} × {16-bit, fp8} × {chunked, single-shot}` — across 32 latent lengths from L=1
+to L=8192, as six charts plus the raw JSON and the scripts that produce both:
+
+```bash
+python scripts/bench_autoencoders.py --out b.json --music <dir|file|npy>
+python scripts/make_ae_charts.py b.json charts.html
+```
+
+⚠ Two traps worth knowing before you measure these autoencoders yourself, both encoded in the
+script. **Accuracy has to hold content fixed** — scoring the first L latents against the original
+makes the L axis a content walk, since a longer L is a *different, longer piece of music*: at
+fixed L, moving the excerpt swings SNR 9.4–15.0 dB where the whole L axis at a fixed offset moves
+2.95 dB. And **real music only** — these are content-dependent (~16 dB on generated audio against
+~5 dB on real masters), so the accuracy pass refuses to run without `--music` and will not fall
+back to noise.
 
 ## Speed & memory
 
@@ -293,7 +363,7 @@ variance once the graph is built).
 | `--init-audio`       | —           | WAV (44.1 kHz, 16-bit PCM) for audio-to-audio / inpaint                        |
 | `--init-noise-level` | 1.0         | σmax; 0.4–0.8 typical for variation, 1.0 = full regen                          |
 | `--inpaint-range`    | —           | `START,END` seconds; regenerate that span, keep the rest                       |
-| `--chunking`         | on          | SAME-L: windowed decode on the low profile (509 MB scratch). `--no-chunking` = single-shot on the wide profile, faster above L=256, ~5.4 GB more resident |
+| `--chunking`         | on          | Windowed decode on the low profile (485 MB scratch, SAME-L). `--no-chunking` = single-shot on the wide profile: 2–5% faster end-to-end, ~7 GB more resident |
 | `--limiter-ceiling`  | baked 0.977 | Only for engines built `--ceiling-input`; the shipped ones bake it |
 | `--dec-precision`    | canonical   | `canonical` (fp16 for SAME-L, bf16 for SAME-S) or `fp8`. Both are chunkable and carry the limiter |
 | `--quiet`            | off         | Suppress per-stage prints + NVML probes — saves ~4 ms                          |
@@ -318,25 +388,34 @@ optimized/tensorRT/
 │   ├── tokenizer.json           ← bundled T5Gemma tokenizer (34 MB, arch-agnostic)
 │   ├── diff_attn_nocast_plugin.py
 │   ├── triton_swa_v2.py         ← SAME-L SWA plugin kernel
-│   └── bench_dit_profile.py     ← DiT-only timing across L values
+│   ├── sa3_gradio.py            ← web UI; gradio_ui.py is its backend-agnostic layer
+│   ├── bench_dit_profile.py     ← DiT-only timing across L values
+│   ├── bench_autoencoders.py    ← the eight AE configurations: VRAM, ms, accuracy
+│   └── make_ae_charts.py        ← that sweep → one self-contained HTML page
+├── benchmarks/                  ← the sweep: charts, raw JSON, and how to re-run it
 ├── build/
 │   ├── README.md                ← how to build for a new GPU arch
 │   ├── build.py                 ← interactive menu (default entry)
-│   ├── build_from_onnx.py       ← one target → ONNX → TRT engine
-│   └── build_dit_profile.py     ← DiT with custom (min, opt, max) profile shapes
+│   ├── build_autoencoders.py    ← the eight AE engines (2 profiles + baked limiter)
+│   ├── build_from_onnx.py       ← one target → ONNX → TRT engine (AEs delegate above)
+│   ├── build_dit_profile.py     ← DiT with custom (min, opt, max) profile shapes
+│   └── limiter/                 ← limiter.onnx + the graft used to bake it in
 └── models/                      ← .trt engines (auto-downloaded per arch; ~8 GB)
     └── sm_<cc>/                 ← arch dir matches `nvidia-smi --query-gpu=compute_cap`
         ├── t5gemma/t5gemma_fp16.trt
         ├── sa3-sm-music/dit_fp16.trt
         ├── sa3-sm-sfx/dit_fp16.trt
         ├── sa3-m/dit_fp16.trt      ← + dit_fp8.trt / dit_fp32.trt if selected
-        ├── same-s/{enc,dec}_dynamic_bf16.trt
+        ├── same-s/{enc_bf16_chunkable,dec_bf16_chunkable_limiter}.trt
         └── same-l/{enc_fp16_chunkable,dec_fp16_chunkable_limiter}.trt
-            (+ the fp8 pair, and the pre-limiter *_dynamic_triton_swa.trt as `legacy`)
+            (+ the fp8 pair for each; `--dec-precision fp8`)
 ```
 
 DiT engines support a dynamic L range of **1 → 4096** at `opt=1292`
-(~2 min, the most common output length). T5 hidden + mask + seconds_total
+(~2 min, the most common output length), and the chunkable autoencoders match it — every one
+reports a floor of 1 latent, so a 0.1 s render is legal. (Until recently it was not: the
+runtime's floor check swallowed a `TypeError` and fell back to a hardcoded 32, rejecting
+everything under ~3 s regardless of what the engine could do.) T5 hidden + mask + seconds_total
 + local_add_cond are all baked into the DiT engine, so a single TRT
 invocation per sampling step handles everything.
 

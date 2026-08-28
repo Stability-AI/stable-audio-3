@@ -282,6 +282,8 @@ class StableAudioModel:
             mask = torch.zeros((batch_size, 1, latent_sample_size), device=device)
         else:
             mask = inpaint_mask.unsqueeze(1)
+            if mask.shape[0] == 1 and batch_size > 1:
+                mask = mask.expand(batch_size, -1, -1)
         mask = mask.to(device)
 
         inpaint_input = (

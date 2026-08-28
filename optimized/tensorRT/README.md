@@ -432,6 +432,49 @@ optimized/tensorRT/
             (+ the fp8 pair for each; `--dec-precision fp8`)
 ```
 
+### The model repo
+
+Engines and the ONNX they are built from live in
+[`stabilityai/stable-audio-3-optimized`](https://huggingface.co/stabilityai/stable-audio-3-optimized):
+
+```
+tensorRT/sm_<cc>/                 ← prebuilt engines, one dir per arch
+├── t5gemma/t5gemma_fp16.trt
+├── sa3-{m,sm-music,sm-sfx}/dit_{fp16,fp8,fp32}.trt
+├── same-s/{enc_bf16_chunkable,dec_bf16_chunkable_limiter}.trt   (+ the fp8 pair)
+├── same-l/{enc_fp16_chunkable,dec_fp16_chunkable_limiter}.trt   (+ the fp8 pair)
+└── same-{s,l}/legacy/            ← superseded engines, kept but never resolved
+
+onnx/                             ← sources; build_autoencoders.py / build_from_onnx.py read these
+├── sa3-{m,sm-music,sm-sfx}/dit_{fp16,fp8}.onnx
+├── t5gemma/encoder.onnx
+├── same-l/{enc_fp16,dec_fp16,enc_fp8,dec_fp8}.onnx
+├── same-l/{dec_fp16_limiter,dec_fp8_limiter}.onnx      ← what the decoders build from
+├── same-s/{enc_bf16,dec_bf16,enc_fp8,dec_fp8}.onnx
+├── same-s/{dec_bf16_limiter,dec_fp8_limiter}.onnx      ← what the decoders build from
+└── same-{s,l}/legacy/            ← retired w8_bf16 and fp8_fast graphs
+```
+
+Three naming rules, once you know them the layout reads itself:
+
+- **`_limiter` marks the grafted decoders.** `dec_fp16_limiter.onnx` is `dec_fp16.onnx` with the
+  limiter spliced in — 99.8% the same graph, +66 `lim/` nodes replacing the old hard clip. The
+  plain ones are kept as the pristine pre-graft sources, which is what
+  [`build/limiter/graft_limiter.py`](build/limiter/graft_limiter.py) consumes if the limiter is
+  ever re-grafted.
+- **`chunkable` appears on engines, never on ONNX.** It is the two optimization profiles the TRT
+  builder adds, so `dec_fp16_limiter.onnx` → `dec_fp16_chunkable_limiter.trt`. The encoders make
+  the same point more plainly: `enc_fp16.onnx` → `enc_fp16_chunkable.trt`, identical graph, two
+  profiles instead of one.
+- **`legacy/` is never resolved by the runtime.** The registry only names the files above; nothing
+  reads `legacy/`. It exists so an older checkout or an experiment can still find what it needs.
+
+⚠ The SAME-L encoders build from an ONNX carrying a `samel::diff_attn_swa` plugin node. Whether
+that becomes a JIT or an AOT kernel is decided at *build* time — `build_autoencoders.py` always
+sets `PREFER_AOT_PYTHON_PLUGINS`, so the Triton PTX is compiled **into** the engine. A shipped
+engine therefore deserializes and runs with no plugin import at all; a JIT one would not, and
+could not go inside a CUDA graph.
+
 DiT engines support a dynamic L range of **1 → 4096** at `opt=1292`
 (~2 min, the most common output length), and the chunkable autoencoders match it — every one
 reports a floor of 1 latent, so a 0.1 s render is legal. (Until recently it was not: the

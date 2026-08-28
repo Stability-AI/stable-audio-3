@@ -4,8 +4,21 @@ Eight configurations — `{SAME-S, SAME-L} × {16-bit, fp8} × {chunked, single-
 32 latent lengths from L=1 to L=8192. 16-bit means fp16 on SAME-L and bf16 on SAME-S, the
 precision each model actually ships.
 
-Open [`same-ae-sweep.html`](same-ae-sweep.html) for the six charts (VRAM, latency, accuracy,
-for encoder and decoder). It is self-contained — no external assets — so it works offline.
+Open [`same-ae-sweep.html`](same-ae-sweep.html) for the interactive version — hover any point
+for its value. It is self-contained (no external assets), so it works offline. The same six
+charts are below.
+
+### Encoder
+
+![Encoder — VRAM scratch reserved](img/enc-vram.png)
+![Encoder — latency](img/enc-latency.png)
+![Encoder — accuracy, content held fixed](img/enc-accuracy.png)
+
+### Decoder
+
+![Decoder — VRAM scratch reserved](img/dec-vram.png)
+![Decoder — latency](img/dec-latency.png)
+![Decoder — accuracy, content held fixed](img/dec-accuracy.png)
 
 ## Reproducing
 

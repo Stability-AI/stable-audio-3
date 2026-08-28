@@ -285,7 +285,9 @@ class StableAudioModel:
             if mask.shape[0] == 1 and batch_size > 1:
                 mask = mask.expand(batch_size, -1, -1)
             elif mask.shape[0] != batch_size:
-                raise ValueError(f"inpaint_mask batch dimension ({mask.shape[0]}) must be 1 or batch_size ({batch_size}).")
+                raise ValueError(
+                    f"inpaint_mask batch dimension ({mask.shape[0]}) must be 1 or batch_size ({batch_size})."
+                )
         mask = mask.to(device)
 
         inpaint_input = (

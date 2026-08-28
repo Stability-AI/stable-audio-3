@@ -316,6 +316,27 @@ python scripts/bench_autoencoders.py --out b.json --music <dir|file|npy>
 python scripts/make_ae_charts.py b.json charts.html
 ```
 
+The decoder is the half most people are choosing between, so its three charts are below. The
+encoder's are in [`benchmarks/`](benchmarks/) along with the interactive version, where hovering
+a point gives its value.
+
+**VRAM is flat in L** — TensorRT sizes scratch from the profile ceiling, not from the shape you
+bind, so `--no-chunking` costs the full 7.8 GB on a three-second clip just as on a six-minute one.
+
+![Decoder — VRAM scratch reserved](benchmarks/img/dec-vram.png)
+
+**Latency** — chunked and single-shot are identical up to L=256, where the whole request is one
+window; the step is where windowing begins. Single-shot ends at L=4096, the wide band's ceiling.
+
+![Decoder — latency](benchmarks/img/dec-latency.png)
+
+**Accuracy is flat**, and chunked lands on single-shot to three decimals at every length. Since
+single-shot has no seams at all, that is the direct evidence the windowed overlap is exact. fp8
+costs 0.014 dB on SAME-L and 0.052 dB on SAME-S. The fall below L≈16 is real but is not a seam
+either: 0.09 s blocks encoded independently lose context at every boundary.
+
+![Decoder — accuracy, content held fixed](benchmarks/img/dec-accuracy.png)
+
 ⚠ Two traps worth knowing before you measure these autoencoders yourself, both encoded in the
 script. **Accuracy has to hold content fixed** — scoring the first L latents against the original
 makes the L axis a content walk, since a longer L is a *different, longer piece of music*: at

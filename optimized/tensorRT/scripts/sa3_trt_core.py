@@ -366,7 +366,7 @@ def get_engine_files(dit_name: str, decoder_name: str, precision: str = None,
     """Relative paths (under ARCH_DIR) needed for the chosen pipeline. Pass this
     list to _ensure_files() to auto-download anything missing from HF.
     precision=None resolves to the per-model default (fp16); dec_tier picks the
-    decoder/encoder quantization tier (canonical / fp8 / fp8_fast)."""
+    decoder/encoder quantization tier (canonical / fp8)."""
     if precision is None:
         precision = default_precision(dit_name)
     precision = normalize_precision(precision)
@@ -1727,8 +1727,8 @@ def main():
                          "'same-l' pairs with medium (1.2 GB engine). Interactive picker if omitted.")
     ap.add_argument("--dec-precision", choices=list(DECODER_TIERS), default="canonical",
                     help="Decoder/encoder quantization tier (orthogonal to --precision, the DiT): "
-                         "canonical (bf16) | fp8 (~1.14x, near-transparent) | fp8_fast (SAME-S only, "
-                         "~1.22x). Auto-downloads from HF. (For max-fidelity decode use --precision fp32.)")
+                         "canonical (bf16) | fp8 (~1.14x, near-transparent). Auto-downloads "
+                         "from HF. (For max-fidelity decode use --precision fp32.)")
     ap.add_argument("--precision", choices=list(PRECISIONS) + list(_PRECISION_ALIAS), default=None,
                     help="DiT engine precision (default 'fp16' for every model). "
                          "'fp16' = FP16 trunk + FP32 RMSNorm/RoPE islands with an FMHA-fused "

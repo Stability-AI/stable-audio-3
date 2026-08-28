@@ -68,8 +68,8 @@ $(dim "After install, run with:")
   $(cyan ./.venv/bin/python) sa3_trt.py --prompt "..." --dit sm-music --decoder same-s
 $(dim "or (with uv):")
   $(cyan uv run) sa3_trt.py --prompt "..." --dit sm-music --decoder same-s
-$(dim "Quantized decoders/encoders (auto-download from HF):") $(yellow "--dec-precision") $(magenta "fp8 | fp8_fast")
-  $(dim "fp8 ~1.14x near-transparent · fp8_fast SAME-S only ~1.22x lossier · --precision fp32 for max fidelity")
+$(dim "Quantized decoders/encoders (auto-download from HF):") $(yellow "--dec-precision") $(magenta "fp8")
+  $(dim "fp8 ~1.14x near-transparent · --precision fp32 for max fidelity")
   $(dim "build tier engines locally with quantize/build_tiers.py; tier ONNX + sm_90/sm_120 engines live on HF")
 USAGE
             exit 0;;

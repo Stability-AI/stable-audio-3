@@ -1482,8 +1482,7 @@ def main():
     ap.add_argument("--decoder", choices=list(DECODER_PATHS.keys()), default=None)
     ap.add_argument("--dec-precision", choices=list(canon.DECODER_TIERS), default="canonical",
                     help="Decoder/encoder quantization tier (orthogonal to --precision, which is the "
-                         "DiT). 'canonical' (bf16, default); 'fp8' (~1.14x, near-transparent); "
-                         "'fp8_fast' (SAME-S only; fp8 attention projections too, ~1.22x, lossier). "
+                         "DiT). 'canonical' (bf16, default); 'fp8' (~1.14x, near-transparent). "
                          "Engine auto-downloads from HF. (For max-fidelity decode use --precision fp32.)")
     ap.add_argument("--precision", choices=list(canon.PRECISIONS) + list(canon._PRECISION_ALIAS), default=None,
                     help="DiT engine precision. Default is 'fp16' for every model: "

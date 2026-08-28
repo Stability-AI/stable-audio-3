@@ -7,7 +7,9 @@ preserved by GPTQ weight-error compensation and per-op precision placement (deta
 Two tiers, both derived from the published bf16 export:
 
 - **`fp8`** — fp8 **compute** on the FFN GEMMs (fp8 tensor cores) → real speedup **and** a smaller engine, near-transparent.
-- **`fp8_fast`** — fp8 pushed into the attention projections too (SAME-S only) — faster still, lower quality.
+- **`fp8_fast`** — fp8 pushed into the attention projections too (SAME-S only) — faster still,
+  lower quality. **Retired**: `--dec-precision` no longer accepts it and the ONNX moved to
+  `onnx/same-s/legacy/`. The measurements below are kept as the record of why.
 
 For max fidelity, use the bf16 baseline (or `--precision fp32`).
 

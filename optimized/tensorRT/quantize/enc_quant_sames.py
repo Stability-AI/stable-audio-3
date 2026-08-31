@@ -7,7 +7,7 @@ import numpy as np, onnx, torch
 from onnx import TensorProto, helper, numpy_helper
 import onnxruntime as ort
 torch.set_grad_enabled(False)
-WD = "/weka2/cj/clod/sames_fp8"; E4M3 = 448.0
+WD = "/path/to/sames_fp8"; E4M3 = 448.0
 SRC = os.environ.get("ENC_ONNX")
 if not SRC:
     from huggingface_hub import hf_hub_download

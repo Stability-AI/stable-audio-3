@@ -22,7 +22,7 @@ import argparse, os
 import numpy as np, onnx, onnxruntime as ort
 from onnx import TensorProto, helper, numpy_helper as nh
 E4M3 = 448.0
-WD = "/weka2/cj/clod/sames_fp8"
+WD = "/path/to/sames_fp8"
 
 def warr(inits, prod, n):
     w = n.input[1]
@@ -38,7 +38,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--base", default="", help="base ONNX to capture on (default: HF bf16 encoder)")
     ap.add_argument("--calib", default=f"{WD}/calib_audio_sames.npz")
-    ap.add_argument("--work", default="/weka2/cj/tmp/_enc_amax.onnx")
+    ap.add_argument("--work", default="/tmp/_enc_amax.onnx")
     a = ap.parse_args()
     base = a.base
     if not base:

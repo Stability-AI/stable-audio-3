@@ -17,7 +17,7 @@ import argparse, shutil, sys
 from pathlib import Path
 import onnx
 
-SRC = ("/admin/home-cj/.cache/huggingface/hub/models--stabilityai--stable-audio-3-optimized/"
+SRC = ("~/.cache/huggingface/hub/models--stabilityai--stable-audio-3-optimized/"
        "snapshots/2204d5086475bd5b7e6e2bd720772dd8e8160513/onnx/same-s/dec_dynamic_bf16.onnx")
 ap = argparse.ArgumentParser()
 ap.add_argument("--src", default=SRC)

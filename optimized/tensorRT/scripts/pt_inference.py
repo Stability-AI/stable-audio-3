@@ -21,23 +21,23 @@ import numpy as np
 import torch
 
 
-TRT_REPO = Path("/weka2/cj/clod/sa3s/stable-audio-3/optimized/tensorRT")
+TRT_REPO = Path("/path/to/sa3s/stable-audio-3/optimized/tensorRT")
 SCRIPTS_DIR = TRT_REPO / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 # stable_audio_tools is expected to be importable (the venv this gradio runs in
-# must include it). The producer venv at /admin/home-cj/sa/venvs/sa3_torch29
+# must include it). The producer venv at /path/to/venvs/sa3_torch29
 # has both gradio + tensorrt + stable_audio_tools.
-SAT_PATH = "/admin/home-cj/sa/stable-audio-tools-dev-latest"
+SAT_PATH = "/path/to/stable-audio-tools-dev-latest"
 if SAT_PATH not in sys.path:
     sys.path.insert(0, SAT_PATH)
 
 
 # Defaults — matches the user's "medium / SAME-L / fp32" scope.
-PT_MODEL_DIR = Path("/weka2/cj/clod/sa3s/models/SA3-M-hf")
+PT_MODEL_DIR = Path("/path/to/sa3s/models/SA3-M-hf")
 T5_TRT_PATH = TRT_REPO / "models" / "sm_90" / "t5gemma" / "t5gemma_fp16.trt"
-SAMEL_CKPT_DIR = Path("/weka2/cj/clod/sa3s/models/SAME-L")  # local SAME-L = TRT decoder's weight source
-SAMES_CKPT_DIR = Path("/weka2/cj/clod/sa3s/models/SAME-S")  # local SAME-S = TRT SAME-S decoder's weight source
+SAMEL_CKPT_DIR = Path("/path/to/sa3s/models/SAME-L")  # local SAME-L = TRT decoder's weight source
+SAMES_CKPT_DIR = Path("/path/to/sa3s/models/SAME-S")  # local SAME-S = TRT SAME-S decoder's weight source
 
 SAMPLE_RATE = 44100
 SAMPLES_PER_LATENT = 4096
@@ -60,12 +60,12 @@ def _resolve_pt_model_dir() -> Path:
     return the first match.
     """
     for name in ("SA3-M-hf", "SA3-M", "SA3-medium-ARC", "SA3-medium"):
-        d = Path("/weka2/cj/clod/sa3s/models") / name
+        d = Path("/path/to/sa3s/models") / name
         if (d / "model.safetensors").exists() and (d / "model_config.json").exists():
             return d
     raise FileNotFoundError(
         f"Couldn't locate the medium DiT PyTorch checkpoint under "
-        f"/weka2/cj/clod/sa3s/models/. Looked for SA3-M-hf / SA3-M / SA3-medium-ARC / SA3-medium."
+        f"/path/to/sa3s/models/. Looked for SA3-M-hf / SA3-M / SA3-medium-ARC / SA3-medium."
     )
 
 

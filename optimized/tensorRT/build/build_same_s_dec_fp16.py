@@ -35,7 +35,7 @@ Inputs/outputs:
 Usage:
     python build_same_s_dec_fp16.py
       [--mode {minimal,rope,full}]      # default: rope
-      [--input  /weka2/cj/clod/sa3s/stable-audio-3-optimized/onnx/same-s/dec_dynamic_bf16.onnx]
+      [--input  /path/to/sa3s/stable-audio-3-optimized/onnx/same-s/dec_dynamic_bf16.onnx]
       [--onnx   /tmp/same_s_dec_fp16.onnx]
       [--engine .../models/sm_90/same-s/dec_dynamic_fp16.trt]
 """
@@ -607,7 +607,7 @@ def build_trt_engine(onnx_path, engine_path, workspace_gb=16):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input",
-                    default="/weka2/cj/clod/sa3s/stable-audio-3-optimized/"
+                    default="/path/to/sa3s/stable-audio-3-optimized/"
                             "onnx/same-s/dec_dynamic_bf16.onnx",
                     help="Input FP32 ONNX (the `_bf16` suffix refers to the "
                          "eventual engine flavor; the ONNX itself is FP32)")
@@ -615,7 +615,7 @@ def main():
                     default="/tmp/same_s_dec_fp16.onnx",
                     help="Output FP16-mixed ONNX (intermediate)")
     ap.add_argument("--engine",
-                    default="/weka2/cj/clod/sa3s/stable-audio-3/optimized/"
+                    default="/path/to/sa3s/stable-audio-3/optimized/"
                             "tensorRT/models/sm_90/same-s/"
                             "dec_dynamic_fp16.trt",
                     help="Output TRT engine path")

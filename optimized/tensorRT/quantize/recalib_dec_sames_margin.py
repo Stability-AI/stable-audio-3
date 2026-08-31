@@ -8,7 +8,7 @@ range, so this recalibrates from a WIDER real-music set with a smaller margin.
 audio would report an overfit number.
 """
 import argparse, json, os, random, sys
-sys.path.append("/weka2/cj/clod/sa3s/stable-audio-3/optimized/tensorRT/scripts")
+sys.path.append("/path/to/sa3s/stable-audio-3/optimized/tensorRT/scripts")
 sys.path.insert(0, "gradio"); sys.path.insert(0, "lora")
 os.environ.setdefault("SA3_SWA_PLUGIN", "aot")
 import numpy as np, onnx, onnxruntime as ort, torch, soundfile as sf
@@ -39,7 +39,7 @@ def load_excerpt(path, start_s=35.0):
     if not np.isfinite(w).all() or np.abs(w).max() < 1e-3: return None
     return np.ascontiguousarray(w.T)
 from concurrent.futures import ThreadPoolExecutor
-cat = json.load(open("/weka2/cj/knn/promptlists/asx_comma_audio.json"))
+cat = json.load(open("/path/to/promptlists/asx_comma_audio.json"))
 mus = [e for e in cat if "tracktype: sfx" not in e.get("p", "").lower()]
 random.Random(a.seed).shuffle(mus)
 picked = []
@@ -67,7 +67,7 @@ have = {o.name for o in g.output}
 for t in set(targets.values()):
     if t not in have:
         g.output.append(onnx.helper.make_tensor_value_info(t, onnx.TensorProto.FLOAT, None))
-WK = "/weka2/cj/tmp/_dec_recal.onnx"
+WK = "/tmp/_dec_recal.onnx"
 onnx.save(m, WK, save_as_external_data=True, all_tensors_to_one_file=True,
           location=os.path.basename(WK)+".data", size_threshold=1024)
 so = ort.SessionOptions(); so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL

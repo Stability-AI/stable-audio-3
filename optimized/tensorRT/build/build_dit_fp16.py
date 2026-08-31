@@ -1144,7 +1144,7 @@ def main():
                     help="Input FP32 ONNX")
     ap.add_argument("--onnx",   default="/tmp/dit_sm-music_fp16.onnx",
                     help="Output FP16-mixed ONNX (intermediate)")
-    ap.add_argument("--engine", default="/weka2/cj/clod/sa3s/stable-audio-3/"
+    ap.add_argument("--engine", default="/path/to/sa3s/stable-audio-3/"
                                        "optimized/tensorRT/models/sm_90/"
                                        "sa3-sm-music/dit_fp16.trt",
                     help="Output TRT engine path")

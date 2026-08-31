@@ -9,7 +9,7 @@ import numpy as np, onnx, torch
 from onnx import TensorProto, helper, numpy_helper
 import onnxruntime as ort
 torch.set_grad_enabled(False)
-DEC, OUT = sys.argv[1], sys.argv[2]; WD = "/weka2/cj/clod/sames_fp8"
+DEC, OUT = sys.argv[1], sys.argv[2]; WD = "/path/to/sames_fp8"
 AS = json.load(open(f"{WD}/dec_fp8_act_scales_real.json")); nsc = AS["node_scale"]; gs = AS["global_scale"]
 LATS = np.load(f"{WD}/calib_latents.npz")["latents"]
 NOACT = re.compile(os.environ.get("NOACT_RE", r"to_qkv|to_out"))   # weight-only fp8 (bf16); set "$^" for all-linears fp8

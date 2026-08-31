@@ -59,58 +59,51 @@ prompt ─▶ T5Gemma encoder ─▶ DiT pingpong sampler ─▶ SAME-S/L decode
                   optional: encoder + init audio (audio-to-audio / inpaint)
 ```
 
-## Precision variants (`--precision`)
+## Precision variants
 
-Same flag as the TensorRT CLI's `--precision`; the values use the wXaY naming
-(weights/activations bit-widths). One flag switches the DiT, the codec decoder,
-and (for audio-to-audio / inpainting) the encoder together; T5Gemma stays
-single-precision. All
-variants keep the full feature set: variable length (any `--seconds`, odd or even
-latent counts) and variable batch (batched or sequential CFG). Missing files
-lazy-download from HuggingFace on first use.
+Precision is split between the **DiT** and the **SAME codec** — they react to quantization oppositely:
 
-| `--precision` | legacy name | size (sm DiT / medium DiT / codecs) | quality | CPU speed |
-|---------------|-------------|-------------------------------------|---------|-----------|
-| `fp32` (default) | — | 1.8 GB / 5.8 GB / 0.2–1.8 GB | reference | 1× — on CPU this is *also* the fast choice |
-| `w16a32` | fp16 | 0.9 / 2.9 / 0.1–0.9 GB | ≈lossless (fp16 weights, fp32 activations; 62–75 dB per-forward) | 1.5–3× slower, model-dependent (XNNPACK dequantizes per-matmul) |
-| `w8a32` | woint8 | 0.45 / 1.5 / 0.05–0.5 GB | GPTQ int8 weights — codecs transparent (40–46 dB); DiT gives a *different but plausible* sample | ≈fp32 |
-| `w8a8-dyn` | dynint8 | 0.45 / 1.5 / 0.05–0.5 GB | lowest (int8 weights + activations, per-invoke dynamic scales) | fastest (~1.2–1.3×) |
+- **DiT** (`--dit-precision`, or the global `--precision`): `fp32` (default) · `w16a32` · `w8a32` · `w8a8-dyn`
+  (wXaY = weight/activation bits; "16" = fp16). int8 *fails* on the DiT — its 8-step sampler is chaotically
+  sensitive, so per-step error becomes a *different* (still plausible) sample, not a noisier fp32. Judge by ear;
+  **fp32 is the pick**, and on CPU it's also the fast one.
+- **Codec** (`--decoder-precision` / `--encoder-precision`): `fp32` · **`w8a8` (default)**. The SAME enc/dec ship as
+  static **rung** models — see [docs/RUNGS.md](docs/RUNGS.md). They run once on a fixed latent, so int8 is
+  quality-free: a real-music round-trip is identical to fp32. `w8a8` is ~3× faster and ~half the RAM on an
+  int8-capable CPU; `fp32` is bit-exact and the pick for CPUs *without* int8 acceleration. (The old `w16a32`/`w8a32`
+  codec variants added no audible quality and are retired to `tflite/same-*/legacy/`.)
 
-*(Names follow the wXaY convention — weight/activation bit-widths, as in LLM releases:
-quantization here touches the FULLY_CONNECTED weights; activations stay fp32 except
-`w8a8-dyn`, whose int8×int8 matmuls are what make it the only faster-than-fp32 variant.
-All bit-widths are per-channel weight grids; "16" is fp16 — there is no int16 variant.
-Speed factors measured on an Apple M4 Pro MacBook Pro, XNNPACK, 8 threads.)*
+`--precision` is a global default that sets the DiT directly and maps to the codec (`fp32`→`fp32`, any int8→`w8a8`).
+When omitted, the defaults are **DiT fp32, codec w8a8**. All variants keep the full feature set (any `--seconds`,
+odd/even L, batched/sequential CFG) and lazy-download from HuggingFace on first use.
 
-Two things worth knowing, both counter-intuitive:
+| component | precisions | size | notes |
+|---|---|---|---|
+| **DiT** | `fp32` / `w16a32` / `w8a32` / `w8a8-dyn` | sm 1.8 / 0.9 / 0.45 / 0.45 GB · medium 5.8 / 2.9 / 1.5 / 1.5 GB | int8 → a *different* sample; fp32 is the pick |
+| **codec** (rung) | `fp32` / `w8a8` | SAME-S enc/dec 0.22 / 0.25 → w8a8 0.06 / 0.09 GB · SAME-L 1.7 / 1.8 → w8a8 0.47 / 0.52 GB | w8a8 quality-free, ~3× faster + half RAM; needs litert ≥ 2.2.0 |
+| T5Gemma | fp16 | 0.6 GB | single-precision |
 
-- **Quantization buys *size*, not speed, on CPU.** Weight-only int8 dequantizes
-  to fp32 before each matmul, so they run at fp32 speed; fp16 is *slower* than fp32.
-  Only `dynint8` (quantized activations → true int8 matmuls) is faster.
-- **DiT quantization error compounds.** The 8-step sampler is chaotically sensitive:
-  per-step weight error turns into a *different* (still plausible) sample rather than
-  a noisy version of the fp32 one. Judge DiT precisions by ear; decoder precisions
-  by PSNR (they run once on a fixed latent).
+*(int8 weights are per-channel; `w8a8-dyn` also quantizes activations, its int8×int8 matmuls being what make it
+faster-than-fp32 on the DiT. Codec rungs use dynamic int8 too, but there the extra activation-quant error is far
+below the AE's own loss. DiT speed factors measured on an Apple M4 Pro, XNNPACK, 8 threads.)*
 
-One CFG note: batched and sequential CFG are bit-identical for `fp32`/`w8a32` and
-inaudibly different (~80 dB) for `w16a32`, but under `w8a8-dyn` the batch=2
-invoke shares activation-quantization scales across the cond/uncond rows, so batched
-CFG yields a *different plausible sample* than sequential. Pass `--no-cfg-batched`
-with `w8a8-dyn` when you need run-to-run reproducibility against sequential baselines.
+One CFG note (DiT-only): batched vs sequential CFG is bit-identical at `fp32`/`w8a32`, ~80 dB apart at `w16a32`, but
+under `w8a8-dyn` the batch=2 invoke shares activation scales across the cond/uncond rows → a *different plausible
+sample*. Pass `--no-cfg-batched` with `w8a8-dyn` when you need run-to-run reproducibility.
 
 ```bash
-# quarter-size models, same speed and near-identical quality on the decoder side
-./sa3 --prompt "lofi house loop" --dit sm-music --decoder same-s --precision w8a32
+# default: fp32 DiT + w8a8 codec (fastest codec, quality-free)
+./sa3 --prompt "lofi house loop" --dit sm-music --decoder same-s
 
-# fastest CPU inference (quality tradeoff)
-./sa3 --prompt "lofi house loop" --dit sm-music --decoder same-s --precision w8a8-dyn
+# bit-exact codec (e.g. a CPU without int8 acceleration)
+./sa3 --prompt "lofi house loop" --dit sm-music --decoder same-s --decoder-precision fp32
+
+# cap codec RAM on a tiny-memory device (slower)
+./sa3 --prompt "lofi house loop" --dit medium --max-rung 64
 ```
 
-**Encoder variants** (used by audio-to-audio / inpainting) exist at the same
-precisions; int8 weights are GPTQ-calibrated on real audio, like the DiT and codec
-(measured latent PSNR vs fp32, same-s / same-l): `w16a32` 66 / 71 dB (≈lossless),
-`w8a32` 36 / 46 dB, `w8a8-dyn` 24 / 30 dB. For the most quality-sensitive
-inpainting you can still pin `--encoder-precision fp32`.
+`--dit-precision` / `--decoder-precision` / `--encoder-precision` override the global flag per component
+(the DiT changes *which* sample you get; the codec's precision is quality-free on the round-trip):
 
 `--dit-precision` / `--decoder-precision` / `--encoder-precision` override the shared
 flag per component — useful because they react to quantization very differently (the
@@ -189,7 +182,7 @@ sa3.bat --prompt "lofi house loop" --dit sm-music --decoder same-s
 # Sound effects
 ./sa3 --prompt "footsteps on gravel" --dit sm-sfx --decoder same-s --out steps.wav
 
-# Higher-quality music (medium DiT, chunked SAME-L decode)
+# Higher-quality music (medium DiT + SAME-L codec)
 ./sa3 --prompt "A beautiful piano arpeggio grows into a cinematic climax" \
       --dit medium --decoder same-l --seconds 30 --out piano.wav
 
@@ -237,7 +230,8 @@ first run it offers to install the UI-only extras (`gradio`, `pillow`,
 `soundfile`) into `.venv`. In the browser:
 
 - **Precision** dropdown next to the model picker — `fp32` (default) / `w16a32`
-  / `w8a32` / `w8a8-dyn`, applied to the DiT + codec.
+  / `w8a32` / `w8a8-dyn`, applied to the DiT; the codec maps it to its rung tier
+  (`fp32` → fp32, any int8 → w8a8).
 - **LoRA** panel — upload a `.safetensors` adapter or pick one from
   `loras/<model>/` (e.g. `loras/sa3-medium/`), set its strength, stack several;
   settings are remembered per model. The panel is disabled under a quantized
@@ -260,7 +254,7 @@ python scripts/sa3_tflite.py --prompt "..." --dit medium --decoder same-l
 
 This is a **CPU** path — it trades the GPU releases' speed for portability. The
 small models comfortably beat realtime on a modern laptop CPU; `medium` is slower
-(its DiT is ~5.8 GB fp32 and it chunk-decodes SAME-L). Use ≥ ~20 s clips: very
+(its DiT is ~5.8 GB fp32). Use ≥ ~20 s clips: very
 short clips have too few latent tokens for the sampler to settle into a coherent
 loop. Throughput scales with `--threads` up to your physical core count (4–8 is
 the usual sweet spot; more threads on a short model adds overhead).
@@ -305,7 +299,7 @@ same adapters and semantics as the MLX backend's `--lora`:
 ```bash
 # one adapter
 ./sa3 --dit medium --decoder same-l --prompt "progressive metal" \
-      --lora plini-sa3-380.safetensors
+      --lora myband.safetensors
 
 # per-adapter strength; stack several
 ./sa3 --dit medium --decoder same-l --prompt "..." \
@@ -356,8 +350,8 @@ sa3_tflite/
         ├── sa3-sm-music/dit_fp32.tflite       1.8 GB   small music DiT (conditioner baked in)
         ├── sa3-sm-sfx/dit_fp32.tflite         1.8 GB   small sfx DiT (conditioner baked in)
         ├── sa3-m/dit_fp32.tflite              5.8 GB   medium DiT (conditioner baked in)
-        ├── same-s/{enc,dec}_fp32.tflite       ~220 MB each   shared sm-* codec
-        └── same-l/{enc,dec}_fp32.tflite       ~1.8 GB each   medium codec
+        ├── same-s/{enc,dec}_{fp32,w8a8}.tflite   rung codec (fp32 ~0.22 GB · w8a8 ~0.07 GB); legacy/ = pre-rung
+        └── same-l/{enc,dec}_{fp32,w8a8}.tflite   rung codec (fp32 ~1.75 GB · w8a8 ~0.5 GB);  legacy/ = pre-rung
 ```
 
 The DiT graphs are **baked-I/O**: the conditioner (prompt-padding + seconds
@@ -393,10 +387,12 @@ is the one weight that IS committed, since the `.tflite` T5Gemma is encoder-only
   shift to the normalized `[1→0]` grid, then scales by σmax, so audio-to-audio
   (σmax < 1) stays monotonically decreasing while keeping all N distilled steps.
   σmax = 1.0 (text-to-audio) is bit-identical to the classic schedule.
-- **SAME-L chunked decode.** The SAME-L decoder's dense sliding-window-attention
-  mask is O(T²), so long clips are decoded in overlap-8 windows of 64 latent
-  tokens (the throughput optimum) and stitched. SAME-S has a narrow receptive
-  field and decodes whole.
+- **SAME codec = static rung models.** Both SAME encoders and decoders are static
+  **rung** `.tflite` (a ladder of fixed-size subgraphs sharing one copy of the weights,
+  litert ≥ 2.2.0 `CompiledModel` + weight cache). `RungEncoder`/`RungDecoder`
+  auto-dispatch the optimal rung per length and tile bit-exactly — no chunk-size knob,
+  RAM flat. This replaced the dynamic-varlen graphs whose RAM blew up (SAME-L O(S²) →
+  16 GB@256; SAME-S → ~50 GB@8192). See [docs/RUNGS.md](docs/RUNGS.md).
 - **CFG (`--cfg ≠ 1`)** combines a cond and an uncond velocity in denoised space
   (optional APG). The canonical DiT is **variable-batch**, so by default cond+uncond
   run as **one batch=2 invoke per step** (`--cfg-batched`) — ~7–29% faster on

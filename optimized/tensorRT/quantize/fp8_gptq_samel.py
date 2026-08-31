@@ -6,12 +6,12 @@ import sys, os, re, json
 from pathlib import Path
 import numpy as np, torch, onnx
 from onnx import TensorProto, helper, numpy_helper
-sys.path.insert(0, "/weka2/cj/clod/sa3s/stable-audio-3/optimized/tensorRT/scripts")
-sys.path.insert(0, "/weka2/cj/clod/fp8_calib/build")
+sys.path.insert(0, "/path/to/sa3s/stable-audio-3/optimized/tensorRT/scripts")
+sys.path.insert(0, "/path/to/fp8_calib/build")
 from stable_audio_3.factory import create_autoencoder_from_config
 from stable_audio_3.loading_utils import copy_state_dict
 torch.set_grad_enabled(False)
-ML = "/weka2/cj/clod/sa3s/models/SAME-L"; AB = "/weka2/cj/clod/sames_fp8/decoder_ab"; E4M3 = 448.0
+ML = "/path/to/sa3s/models/SAME-L"; AB = "/path/to/sames_fp8/decoder_ab"; E4M3 = 448.0
 cfg = json.load(open(f"{ML}/SAME-L.json"))
 ae = create_autoencoder_from_config(cfg["model"], cfg["sample_rate"])
 ck = torch.load(f"{ML}/SAME-L.ckpt", map_location="cpu", weights_only=False)
@@ -41,7 +41,7 @@ def mk_hook(k):
         H[k] = h if H[k] is None else H[k] + h; AMAX[k] = max(AMAX[k], float(inp[0].abs().max()))
     return hook
 handles = [m.register_forward_pre_hook(mk_hook(k)) for k, m in mods.items()]
-lats = [np.load("/weka2/cj/clod/fp8_listening/latents_2min.npz")["bf16"]]
+lats = [np.load("/path/to/fp8_listening/latents_2min.npz")["bf16"]]
 lats += [np.load(f) for f in sorted(Path(AB).glob("samel_lat_*.npy"))]
 for i, L in enumerate(lats):
     ae.decode(torch.tensor(L, device="cuda", dtype=torch.float32)); print(f"  captured {i} ({L.shape[-1]})", flush=True)
@@ -112,7 +112,7 @@ while rem:
     rem = nx
     if not prog: raise RuntimeError("topo stuck")
 del g.node[:]; g.node.extend(order)
-OUT = "/weka2/cj/clod/sames_fp8/samel_fp8_gptq.onnx"
+OUT = "/path/to/sames_fp8/samel_fp8_gptq.onnx"
 for f in (OUT, OUT + ".data"):
     if os.path.exists(f): os.remove(f)
 onnx.save(m, OUT, save_as_external_data=True, all_tensors_to_one_file=True, location=os.path.basename(OUT) + ".data", size_threshold=1024)

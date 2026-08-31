@@ -177,7 +177,7 @@ def parse_args():
                     help="Comma-separated; default = underfit's dashboard exclude list")
     ap.add_argument("--no-conditioner-lora", action="store_true",
                     help="Skip the seconds-conditioner adapter (underfit adapts it "
-                         "by default — e.g. the plini checkpoint carries its delta)")
+                         "by default — e.g. the myband checkpoint carries its delta)")
     ap.add_argument("--bora-mode", default="speed", choices=["speed", "memory"],
                     help="bora/bora-xs forward: 'speed' (default) caches W0² per "
                          "adapted layer (+1 weight copy) for the reformulated "

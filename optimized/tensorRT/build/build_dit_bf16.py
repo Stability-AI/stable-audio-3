@@ -122,7 +122,7 @@ def attr(node, name):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default="/weka2/cj/clod/sa3s/stable-audio-3-optimized/"
+    ap.add_argument("--input", default="/path/to/sa3s/stable-audio-3-optimized/"
                                       "onnx/sa3-m/dit.onnx")
     ap.add_argument("--output", required=True)
     ap.add_argument("--max-t", type=int, default=4160,

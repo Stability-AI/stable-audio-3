@@ -9,7 +9,7 @@ from onnx import TensorProto, helper, numpy_helper
 import onnxruntime as ort
 DEC, OUT = sys.argv[1], sys.argv[2]
 LSL = int(sys.argv[3]) if len(sys.argv) > 3 else 768
-LATS = np.load("/weka2/cj/clod/sames_fp8/calib_latents.npz")["latents"]
+LATS = np.load("/path/to/sames_fp8/calib_latents.npz")["latents"]
 m = onnx.load(DEC, load_external_data=True); g = m.graph
 inits = {i.name: i for i in g.initializer}; prod = {o: n for n in g.node for o in n.output}
 def warr(n):
@@ -30,10 +30,10 @@ n0 = len(g.output)
 existing = {o.name for o in g.output}
 for t in in_names:
     if t not in existing: g.output.append(helper.make_tensor_value_info(t, TensorProto.FLOAT, None))
-onnx.save(m, "/weka2/cj/clod/sames_fp8/_gptq_cap.onnx", save_as_external_data=True, all_tensors_to_one_file=True, location="_gptq_cap.onnx.data", size_threshold=1024)
+onnx.save(m, "/path/to/sames_fp8/_gptq_cap.onnx", save_as_external_data=True, all_tensors_to_one_file=True, location="_gptq_cap.onnx.data", size_threshold=1024)
 del g.output[n0:]
 so = ort.SessionOptions(); so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-sess = ort.InferenceSession("/weka2/cj/clod/sames_fp8/_gptq_cap.onnx", so, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+sess = ort.InferenceSession("/path/to/sames_fp8/_gptq_cap.onnx", so, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
 iname = sess.get_inputs()[0].name
 Hs = {n.name: None for n, *_ in linears}
 for li in range(LATS.shape[0]):

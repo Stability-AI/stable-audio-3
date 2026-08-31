@@ -103,7 +103,7 @@ Apple Silicon only (MLX is Metal-backed). Python 3.10+. `./install.sh
 # Step-gated adapters are re-merged in place at the few step boundaries
 # (~80 ms each on medium) — no extra memory, every step runs at full speed.
 ./sa3 --prompt "progressive metal instrumental" --dit medium --decoder same-l \
-      --lora plini.safetensors strength=0.8 steps=2- \
+      --lora myband.safetensors strength=0.8 steps=2- \
       --lora rain_texture.safetensors steps=-4 --out prog.wav
 
 # Generate + play immediately (afplay; Ctrl-C stops both)

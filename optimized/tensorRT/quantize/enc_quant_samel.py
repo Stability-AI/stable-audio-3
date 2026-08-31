@@ -6,14 +6,14 @@ proj stay fp32 islands. Self-contained."""
 import sys, os, re, json, glob
 import numpy as np, torch, onnx
 from onnx import TensorProto, helper, numpy_helper
-sys.path.insert(0, "/weka2/cj/clod/sa3s/stable-audio-3/optimized/tensorRT/scripts"); sys.path.insert(0, "/weka2/cj/clod/fp8_calib/build")
+sys.path.insert(0, "/path/to/sa3s/stable-audio-3/optimized/tensorRT/scripts"); sys.path.insert(0, "/path/to/fp8_calib/build")
 from stable_audio_3.factory import create_autoencoder_from_config
 from stable_audio_3.loading_utils import copy_state_dict
 torch.set_grad_enabled(False)
-WD = "/weka2/cj/clod/sames_fp8"; E4M3 = 448.0
-cfg = json.load(open("/weka2/cj/clod/sa3s/models/SAME-L/SAME-L.json"))
+WD = "/path/to/sames_fp8"; E4M3 = 448.0
+cfg = json.load(open("/path/to/sa3s/models/SAME-L/SAME-L.json"))
 ae = create_autoencoder_from_config(cfg["model"], cfg["sample_rate"])
-ck = torch.load("/weka2/cj/clod/sa3s/models/SAME-L/SAME-L.ckpt", map_location="cpu", weights_only=False)
+ck = torch.load("/path/to/sa3s/models/SAME-L/SAME-L.ckpt", map_location="cpu", weights_only=False)
 copy_state_dict(ae, ck.get("state_dict", ck) if isinstance(ck, dict) else ck); ae = ae.cuda().eval()
 # eager encoder FFN linears, in module order
 eproj = [m for nm, m in ae.named_modules() if re.search(r"encoder\..*\.ff\.ff\.0\.proj$", nm)]

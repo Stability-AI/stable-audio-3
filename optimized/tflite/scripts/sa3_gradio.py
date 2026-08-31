@@ -51,10 +51,10 @@ sys.path.insert(0, str(REPO))          # so `from models.defs.* import` resolves
 sys.path.insert(0, str(SCRIPTS_DIR))   # so `from weights / lora_* / spec import` resolves
 
 from sa3_tflite import (  # noqa: E402
-    BakedDiT, BakedEncoder, BakedDecoder, read_wav,
+    BakedDiT, RungEncoder, RungDecoder, read_wav,
     valid_T_lat, DEFAULT_DECODER, DIT_REL, DEC_REL, T5_REL,
     COND_TOKENS, COND_DIM, SAMPLE_RATE, SAMPLES_PER_LATENT,
-    SAMEL_CHUNK, SAMEL_OVERLAP, MIN_SIGMA,
+    RUNG_TRIM, MIN_SIGMA,
 )
 from models.defs import tflite_pipeline as P   # noqa: E402
 from lora_core import parse_lora_spec, LoraError  # noqa: E402
@@ -175,9 +175,9 @@ _tok = None
 _dit_cache: dict[str, BakedDiT] = {}
 _dit_lru: list[str] = []
 _DIT_CACHE_MAX = 1          # one big DiT resident at a time (medium fp32 = 5.8 GB)
-_dec_cache: dict[tuple, BakedDecoder] = {}
+_dec_cache: dict[tuple, RungDecoder] = {}
 _dec_lru: list[tuple] = []
-_enc_cache: dict[tuple, BakedEncoder] = {}
+_enc_cache: dict[tuple, RungEncoder] = {}
 _enc_lru: list[tuple] = []
 _CODEC_CACHE_MAX = 2
 # Encoded-latent cache: rerunning a2a/inpainting with the same input audio skips
@@ -224,8 +224,14 @@ def get_dit(dit_path, T_lat, t5_hidden, t5_mask, seconds, cfg, apg,
     return model, load_ms
 
 
-def get_decoder(name: str, precision: str) -> BakedDecoder:
-    key = (name, precision)
+def _codec_prec(precision: str) -> str:
+    """Map the (DiT-style) precision from the UI to the codec's 2 rung tiers: fp32 -> fp32, any int8 -> w8a8."""
+    return "fp32" if precision == "fp32" else "w8a8"
+
+
+def get_decoder(name: str, precision: str) -> RungDecoder:
+    cprec = _codec_prec(precision)
+    key = (name, cprec)
     if key in _dec_cache:
         _dec_lru.remove(key)
         _dec_lru.append(key)
@@ -234,15 +240,15 @@ def get_decoder(name: str, precision: str) -> BakedDecoder:
         old = _dec_lru.pop(0)
         _dec_cache.pop(old, None)
         gc.collect()
-    dec = BakedDecoder(ensure_local(dec_rel(name, precision)), _THREADS,
-                       needs_even=(name == "same-s"))
+    dec = RungDecoder(ensure_local(dec_rel(name, cprec)), threads=_THREADS, trim=RUNG_TRIM[name])
     _dec_cache[key] = dec
     _dec_lru.append(key)
     return dec
 
 
-def get_encoder(name: str, precision: str) -> BakedEncoder:
-    key = (name, precision)
+def get_encoder(name: str, precision: str) -> RungEncoder:
+    cprec = _codec_prec(precision)
+    key = (name, cprec)
     if key in _enc_cache:
         _enc_lru.remove(key)
         _enc_lru.append(key)
@@ -251,8 +257,7 @@ def get_encoder(name: str, precision: str) -> BakedEncoder:
         old = _enc_lru.pop(0)
         _enc_cache.pop(old, None)
         gc.collect()
-    enc = BakedEncoder(ensure_local(enc_rel(name, precision)), _THREADS,
-                       needs_even=(name == "same-s"))
+    enc = RungEncoder(ensure_local(enc_rel(name, cprec)), threads=_THREADS, trim=RUNG_TRIM[name])
     _enc_cache[key] = enc
     _enc_lru.append(key)
     return enc
@@ -316,7 +321,7 @@ def run_generation(dit_name: str, decoder_name: str, precision: str, prompt: str
             audio_np = audio_np[:, :target]
         else:
             audio_np = np.pad(audio_np, ((0, 0), (0, target - audio_np.shape[-1])))
-        lat = enc.encode(audio_np[None], T_lat)   # (1,256,T_lat)
+        lat = enc.encode(audio_np[None])[:, :, :T_lat]   # (1,256,T_lat); RungEncoder auto-dispatches rungs
         while len(_latent_cache) >= _LATENT_CACHE_MAX:
             _latent_cache.pop(next(iter(_latent_cache)))
         _latent_cache[ck] = lat
@@ -367,13 +372,13 @@ def run_generation(dit_name: str, decoder_name: str, precision: str, prompt: str
     t["sample_ms"] = (time.time() - t0) * 1000
     t["n_fwd"] = backend.n_fwd
 
-    # 6. Decode (whole for SAME-S; chunked for SAME-L past the window)
+    # 6. Decode — RungDecoder auto-dispatches the optimal rung per length (no chunk knob)
     decoder = get_decoder(dec, precision)
     t0 = time.time()
-    if dec == "same-l" and T_lat > SAMEL_CHUNK:
-        audio = decoder.decode_chunked(latents, SAMEL_CHUNK, SAMEL_OVERLAP)
-    else:
-        audio = decoder.decode_whole(latents)
+    dec_lat = latents
+    if needs_even and T_lat % 2:                  # SAME-S needs even L: pad one latent, trim the audio
+        dec_lat = np.concatenate([latents, latents[:, :, -1:]], axis=2)
+    audio = decoder.decode(dec_lat)[:, :, :T_lat * SAMPLES_PER_LATENT]
     t["decode_ms"] = (time.time() - t0) * 1000
 
     audio_np = audio[0]                               # (2, L*4096)

@@ -9,6 +9,13 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+# The SAME codec build scripts live at optimized/tflite/build/ — a real source
+# tree (checkpoints -> .tflite), not a Python build artifact. Re-include it (the
+# generic build/ above would otherwise swallow it); keep its caches/work dirs out.
+!optimized/tflite/build/
+!optimized/tflite/build/**
+optimized/tflite/build/**/__pycache__/
+optimized/tflite/build/**/_work/
 develop-eggs/
 dist/
 downloads/

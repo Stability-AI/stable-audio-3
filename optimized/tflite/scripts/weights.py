@@ -26,23 +26,25 @@ SCRIPT_DIR = Path(__file__).resolve().parent.parent
 # Bundles the install script offers to the user. Each maps to a list of
 # model files (local relative path on the left, HF repo path on the right).
 # T5Gemma is in SHARED because every bundle needs it. The two small DiTs
-# share the SAME-S codec; medium uses the SAME-L codec.
+# share the SAME-S codec; medium uses the SAME-L codec. Each ships at its
+# runtime default precision — DiT fp32, SAME codec w8a8 (quality-free and
+# ~5x smaller); either's other tier lazy-downloads on demand.
 
 DIT_BUNDLES: dict[str, list[tuple[str, str]]] = {
     "sm-music": [
         ("models/tflite/sa3-sm-music/dit_fp32.tflite", "tflite/sa3-sm-music/dit_fp32.tflite"),
-        ("models/tflite/same-s/enc_fp32.tflite",       "tflite/same-s/enc_fp32.tflite"),
-        ("models/tflite/same-s/dec_fp32.tflite",       "tflite/same-s/dec_fp32.tflite"),
+        ("models/tflite/same-s/enc_w8a8.tflite",       "tflite/same-s/enc_w8a8.tflite"),
+        ("models/tflite/same-s/dec_w8a8.tflite",       "tflite/same-s/dec_w8a8.tflite"),
     ],
     "sm-sfx": [
         ("models/tflite/sa3-sm-sfx/dit_fp32.tflite",   "tflite/sa3-sm-sfx/dit_fp32.tflite"),
-        ("models/tflite/same-s/enc_fp32.tflite",       "tflite/same-s/enc_fp32.tflite"),
-        ("models/tflite/same-s/dec_fp32.tflite",       "tflite/same-s/dec_fp32.tflite"),
+        ("models/tflite/same-s/enc_w8a8.tflite",       "tflite/same-s/enc_w8a8.tflite"),
+        ("models/tflite/same-s/dec_w8a8.tflite",       "tflite/same-s/dec_w8a8.tflite"),
     ],
     "medium": [
         ("models/tflite/sa3-m/dit_fp32.tflite",        "tflite/sa3-m/dit_fp32.tflite"),
-        ("models/tflite/same-l/enc_fp32.tflite",       "tflite/same-l/enc_fp32.tflite"),
-        ("models/tflite/same-l/dec_fp32.tflite",       "tflite/same-l/dec_fp32.tflite"),
+        ("models/tflite/same-l/enc_w8a8.tflite",       "tflite/same-l/enc_w8a8.tflite"),
+        ("models/tflite/same-l/dec_w8a8.tflite",       "tflite/same-l/dec_w8a8.tflite"),
     ],
 }
 
@@ -52,9 +54,9 @@ SHARED: list[tuple[str, str]] = [
 
 # Human-friendly bundle sizes (for the install prompt). Exact, from HF metadata.
 BUNDLE_SIZES = {
-    "sm-music": "2.3 GB  (small music DiT + SAME-S codec, all fp32)",
-    "sm-sfx":   "2.3 GB  (small sfx DiT + SAME-S codec, all fp32)",
-    "medium":   "9.5 GB  (medium DiT + SAME-L codec, all fp32)",
+    "sm-music": "2.0 GB  (small music DiT fp32 + SAME-S codec w8a8)",
+    "sm-sfx":   "2.0 GB  (small sfx DiT fp32 + SAME-S codec w8a8)",
+    "medium":   "6.8 GB  (medium DiT fp32 + SAME-L codec w8a8)",
 }
 # T5Gemma (shared, fp16) adds ~0.6 GB the first time any bundle is fetched.
 

@@ -10,12 +10,17 @@
 # Checkpoints (public on HF; standalone AE repos also work — see stable_audio_3.model_configs):
 #   sa3-medium ARC.safetensors  → SAME-L enc+dec        sa3-sm-music ckpt → SAME-S enc+dec
 #
-# ⚠ PREREQ before this runs clean from a fresh checkout: the export/quant/merge scripts currently
-#   hardcode a scratch dir (SC=...). Parameterize them to read $WORK (output dir) — tracked cleanup.
+# Prereqs (set via the environment — build_paths.py reads them; no paths are baked in):
+#   $SA3_CKPT_MEDIUM   sa3-medium checkpoint (.safetensors)   -> SAME-L enc+dec
+#   $SA3_CKPT_SMMUSIC  sa3-sm-music checkpoint                -> SAME-S enc+dec
+#   $SA3_BUILD_WORK    output/scratch dir (optional; default build/_work)
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-WORK="${WORK:-$HERE/_work}"; mkdir -p "$WORK"
+# The Python scripts resolve their I/O dir from $SA3_BUILD_WORK (via build_paths.py);
+# keep the shell WORK in lock-step so export/quant/merge never disagree on the dir.
+export SA3_BUILD_WORK="${SA3_BUILD_WORK:-$HERE/_work}"
+WORK="$SA3_BUILD_WORK"; mkdir -p "$WORK"
 PY_EXPORT="${PY_EXPORT:-python}"
 PY_RUNTIME="${PY_RUNTIME:-python}"
 LADDER_L="1 2 4 8 12 16 32 64 128 256"

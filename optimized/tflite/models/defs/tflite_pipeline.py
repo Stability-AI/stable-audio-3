@@ -8,8 +8,8 @@ The baked-I/O DiT bakes the conditioner (seconds embedder + prompt padding) and
 patch/unpatch into the graph, so this module only needs: the tokenizer, the T5Gemma
 front-end, the pingpong schedule, the noise maker, the host-side sampler, and a WAV
 writer. The research-only backends (MLX DiT A/B, per-precision model dicts, the numpy
-Conditioner / unpatch, encode_prompt / decode_with helpers) live in the speed-metal
-repo's tflite_pipeline.py and are intentionally dropped here.
+Conditioner / unpatch, encode_prompt / decode_with helpers) live in the full
+research pipeline and are intentionally dropped here.
 """
 from __future__ import annotations
 import wave

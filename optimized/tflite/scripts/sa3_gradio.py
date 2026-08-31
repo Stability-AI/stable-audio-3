@@ -531,7 +531,7 @@ def _lora_specs_from_ui(vals, notes):
 
 
 def _lora_disp(specs) -> str:
-    """Short human tag per adapter: 'plini×0.8, rain'."""
+    """Short human tag per adapter: 'myband×0.8, rain'."""
     tags = []
     for s in specs or []:
         name = Path(s["path"]).stem

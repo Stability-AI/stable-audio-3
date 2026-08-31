@@ -299,7 +299,7 @@ same adapters and semantics as the MLX backend's `--lora`:
 ```bash
 # one adapter
 ./sa3 --dit medium --decoder same-l --prompt "progressive metal" \
-      --lora plini-sa3-380.safetensors
+      --lora myband.safetensors
 
 # per-adapter strength; stack several
 ./sa3 --dit medium --decoder same-l --prompt "..." \

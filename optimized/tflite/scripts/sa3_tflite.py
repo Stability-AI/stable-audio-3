@@ -474,7 +474,7 @@ def main():
                     help="A LoRA adapter to merge into the DiT — repeat the flag to stack "
                          "several. Each --lora takes the adapter path followed by an optional "
                          "strength=S (default --lora-strength). Example: "
-                         "--lora plini.safetensors strength=0.8 . The adapter is a .safetensors "
+                         "--lora myband.safetensors strength=0.8 . The adapter is a .safetensors "
                          "file (SA3-native train_lora.py / underfit output) or a PEFT adapter "
                          "directory; ONLY .safetensors is accepted. The merged weights are "
                          "written into a cached copy of the DiT (models/tflite/lora_cache/) and "

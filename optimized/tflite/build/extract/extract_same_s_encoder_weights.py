@@ -1,4 +1,4 @@
-"""Extract SAME-S ENCODER weights from the sa3-sm-music checkpoint (torch pickle) -> flat .npz.
+"""Extract SAME-S ENCODER weights from the sa3-sm-music checkpoint (.safetensors) -> flat .npz.
 Same structure as SAME-L encoder but dim=768, 6 blocks, FF inner 2304, mapping k=1.
 Output keys match torch_defs/same_s_encoder_torch.SAMESEncoder.
 """
@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
-import torch
+from safetensors import safe_open
 from build_paths import WORK, ckpt
 
 CKPT = ckpt("sm-music")
@@ -17,12 +17,8 @@ B = "pretransform.model.bottleneck"
 
 
 def main():
-    sd = torch.load(CKPT, map_location="cpu", weights_only=False)
-    if isinstance(sd, dict):
-        for key in ("state_dict", "model", "module"):
-            if key in sd and isinstance(sd[key], dict):
-                sd = sd[key]; break
-    g = lambda k: sd[k].float().numpy()
+    f = safe_open(CKPT, "pt")
+    g = lambda k: f.get_tensor(k).float().numpy()
     out = {}
     wv = g(f"{E}.layers.0.mapping.weight_v")          # (768,512,1)
     wg = g(f"{E}.layers.0.mapping.weight_g")

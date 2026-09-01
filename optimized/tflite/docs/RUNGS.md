@@ -54,6 +54,16 @@ sensitive and int8 becomes a different sample.)
 The one hardware knob: cap the largest rung used (e.g. `--max-rung 64`) to roughly halve peak codec RAM on a
 tiny-memory device, at some speed cost. Default is auto (uncapped = fastest); no realistic target needs it.
 
+## Output limiter (baked into the decoder graph)
+The decoder's raw output is not bounded to ±1.0 (62% of renders exceed 0 dBFS), so the **output limiter is
+baked into every decoder rung** — the tflite decoders emit already-limited float audio (sample peak ≤ ceiling
+**0.977** / −0.2021 dBFS), matching the shipped TensorRT graft. It's `dsp.limit_ship` (sample-peak, 5.8 ms
+window) as a torch module (`build/torch_defs/limiter.py`), so ai_edge_torch converts it in-graph; verified
+bit-exact vs `dsp.limit_ship` (max|Δ|=1.8e-7). Per-rung baking is bit-identical to whole-signal limiting
+because the tiling overlap (TRIM ≥ 12 latents ≫ the limiter's 512-sample radius) is block-aligned. Fixed-rung
+graphs give the upsample a **static** output size → XNNPACK-delegated (fast), unlike the retired dynamic-graph
+limiter. Encoders are not limited (they don't emit audio). Build with `SA3_BAKE_LIMITER=0` for a raw decoder.
+
 ## CPU support
 `w8a8` runs (correctly) everywhere and is *faster* than fp32 wherever the CPU has an int8 dot/matrix instruction:
 x86 AVX-512-VNNI / AVX-VNNI / AMX-INT8; ARM NEON-dotprod (v8.2+) / i8mm (v8.6+) / SVE2 / SME. That includes the

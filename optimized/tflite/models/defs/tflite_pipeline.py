@@ -32,7 +32,7 @@ COND_TOKENS = 256                  # T5Gemma seq len
 # ───────────────────────── WAV ─────────────────────────
 def save_wav(path, audio):  # audio: (2, T) float32 in [-1,1]
     audio = np.clip(np.asarray(audio, np.float32), -1, 1)
-    pcm = (audio * 32767.0).astype(np.int16).T  # (T, 2) interleaved
+    pcm = np.rint(audio * 32767.0).astype(np.int16).T  # (T, 2) interleaved; round-to-nearest (matches TRT; truncation is a biased quantiser)
     with wave.open(str(path), "wb") as w:
         w.setnchannels(audio.shape[0]); w.setsampwidth(2); w.setframerate(SAMPLE_RATE)
         w.writeframes(pcm.tobytes())

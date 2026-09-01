@@ -16,7 +16,9 @@ if which == "enc":
     path = str(WORK / f"same-s_enc_fixed_{S}.tflite")
 else:
     import same_s_decoder_torch as M
+    from limiter import maybe_wrap
     model = M.load_model(weights_path=str(WORK / "same_s_decoder_f32.npz"), output_audio=True).eval()
+    model = maybe_wrap(model).eval()   # bake the output limiter into the graph (SA3_BAKE_LIMITER=0 to skip)
     sample = torch.randn(1, 256, S) * 1.0
     path = str(WORK / f"same-s_dec_fixed_{S}.tflite")
 with torch.no_grad():

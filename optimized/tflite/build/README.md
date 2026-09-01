@@ -44,7 +44,8 @@ files) → **verify** (structural: ladders + dispatch + shapes). Outputs land in
 build_paths.py     resolves $SA3_BUILD_WORK + checkpoints; makes torch_defs importable
 extract/           4 weight extractors (ckpt -> npz)
 torch_defs/        checkpoint-faithful torch model defs + windowed_decoder (O(S) attention patch)
-export/            torch -> fixed-size tflite rung
+                   + limiter.py (output limiter baked into the decoder graph; SA3_BAKE_LIMITER=0 to skip)
+export/            torch -> fixed-size tflite rung (decoders get the limiter baked in)
 quant_merge/       quant_one (fp32->w8a8) + merge_rungs_generic (fixed rungs -> one weight-shared file)
 tfl_surgery.py     flatbuffer helper used by the merge
 verify_final.py    structural check of the 8 built files (runtime env)

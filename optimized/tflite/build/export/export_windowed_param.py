@@ -12,6 +12,8 @@ import windowed_decoder as W
 T_LAT = int(sys.argv[1])
 W.patch()                                         # O(S) windowed attention (== dense band mask)
 model = M.load_model(weights_path=str(WORK / "same_l_decoder_f32.npz"), T_lat=None, output_audio=True).eval()
+from limiter import maybe_wrap
+model = maybe_wrap(model).eval()      # bake the output limiter into the graph (SA3_BAKE_LIMITER=0 to skip)
 sample = torch.randn(1, 256, T_LAT)
 with torch.no_grad():
     y_torch = model(sample).numpy()

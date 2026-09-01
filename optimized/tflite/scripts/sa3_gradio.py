@@ -829,7 +829,7 @@ def build_ui(initial_dit: str, initial_decoder: str, initial_precision: str, *,
         if not np.isfinite(audio_np).all():
             return None, "error: model produced non-finite audio (try a higher σmax or different seed)"
 
-        pcm = (np.clip(audio_np, -1, 1) * 32767.0).astype(np.int16).T   # (T, 2)
+        pcm = np.rint(np.clip(audio_np, -1, 1) * 32767.0).astype(np.int16).T   # (T, 2); round-to-nearest (matches TRT)
         basename = verbose_basename(prompt, negative_prompt, cfg, sigma_max, seed, precision)
         out_path = OUTPUT_DIR / f"{basename}.wav"
         _save_wav(pcm, out_path)

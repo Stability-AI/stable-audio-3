@@ -1365,13 +1365,17 @@ class DiTRunner:
 
 # ─── Pingpong sampler ────────────────────────────────────────────────────
 def build_pingpong_schedule(steps, sigma_max=1.0, dist_shift=None, latent_len=None):
-    """Match SAT build_schedule for RF/RF-denoiser: linspace(sigma_max, 0, steps+1),
-    optionally dist-shifted, with t[0] forced back to sigma_max so the schedule's
-    starting point aligns with the init-mix's t."""
-    t = torch.linspace(sigma_max, 0.0, steps + 1, device="cuda")
+    """LogSNR schedule of (steps+1) points from sigma_max down to zero.
+
+    Warp the normalized grid before scaling it to sigma_max so audio-to-audio
+    schedules remain monotonic and agree with the init-latent mix.
+    """
+    t = torch.linspace(1.0, 0.0, steps + 1, device="cuda")
     if dist_shift is not None and latent_len is not None:
-        t = dist_shift.shift(t, latent_len)
+        t = dist_shift.shift(t, latent_len) * sigma_max
         t[0] = sigma_max
+    else:
+        t = t * sigma_max
     return t
 
 

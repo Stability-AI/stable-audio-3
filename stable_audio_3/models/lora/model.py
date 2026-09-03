@@ -197,9 +197,47 @@ class LoRAParametrization(nn.Module):
         if s == 1.0:
             return mag
         return base_norm + s * (mag - base_norm)
+    def _delta_dropout(self):
+        """_delta() with training-time dropout applied — used by the forwards."""
+        return torch.matmul(*self.swap((self.lora_B, self.dropout_fn(self.lora_A))))
+
+    def _delta(self):
+        """The unscaled low-rank update, as 2-D (fan_out, prod(rest)).
+
+        Factored out of the forward paths so the norm it feeds can be computed
+        at save time, outside any forward pass. Deliberately skips dropout: a
+        baked norm must be deterministic, not a sample from the training-time
+        dropout distribution.
+        """
+        if self.adapter_type.endswith("-xs"):
+            return self.U @ self.M_xs.to(self.U.dtype) @ self.V.T
+        return torch.matmul(*self.swap((self.lora_B, self.lora_A)))
+
+    def baked_vnorm_row(self, layer):
+        """Row norms of the adapted direction at unit strength: ||W0 + s.d||_row.
+
+        This is the denominator every DoRA forward divides by, and the only part
+        that needs the base weights. Baking it into the checkpoint lets a loader
+        reconstruct the adapted weight without loading a multi-GB base model
+        first.
+
+        Uses self.scaling alone, with strength forced to 1: the runtime
+        convention is vn = ||W0 + (alpha/rank).delta||_row at unit strength, so
+        folding in lora_strength would bake in whatever the slider happened to
+        be set to. Flattens to 2-D first so Conv1d/Conv2d behave, for the same
+        reason the forward paths work in 2-D.
+
+        `layer` is passed in rather than read from self: a parametrization keeps
+        no back-reference to the module it is registered on, and adding one just
+        to bake a norm would create a reference cycle for every adapter.
+        """
+        W0 = self._get_original_weight(layer).detach()
+        W0_2d = W0.reshape(W0.shape[0], -1).to(torch.float32)
+        delta = self._delta().detach().to(torch.float32)
+        return torch.linalg.norm(W0_2d + self.scaling * delta, dim=1)
 
     def lora_forward(self, W):
-        delta = torch.matmul(*self.swap((self.lora_B, self.dropout_fn(self.lora_A)))).view(W.shape)
+        delta = self._delta_dropout().view(W.shape)
         delta = self.scaling * self.lora_strength * delta
         return (W + delta.to(W.dtype))
     
@@ -211,7 +249,7 @@ class LoRAParametrization(nn.Module):
         orig_shape = W.shape
         W_2d = W.view(W.shape[0], -1).to(self.lora_A.dtype)
         # low-rank update on the *direction*
-        delta = torch.matmul(*self.swap((self.lora_B, self.dropout_fn(self.lora_A))))
+        delta = self._delta_dropout()
         V = W_2d + self.scaling * self.lora_strength * delta
         # normalize along _norm_dim, then scale by per-element magnitude
         V_hat = V / (V.norm(dim=self._norm_dim, keepdim=True) + 1e-12)
@@ -226,7 +264,7 @@ class LoRAParametrization(nn.Module):
             return W
         orig_shape = W.shape
         W_2d = W.view(W.shape[0], -1).to(self.lora_A.dtype)
-        delta = torch.matmul(*self.swap((self.lora_B, self.dropout_fn(self.lora_A))))
+        delta = self._delta_dropout()
         V = W_2d + self.scaling * self.lora_strength * delta
         # Row-normalize, then scale by row magnitudes. Both magnitudes
         # interpolate toward the base weight's own norms so strength -> 0
@@ -243,8 +281,7 @@ class LoRAParametrization(nn.Module):
         return (H_c * mag_c).view(orig_shape).to(W.dtype)
 
     def lora_xs_forward(self, W):
-        delta = self.U @ self.M_xs.to(self.U.dtype) @ self.V.T
-        delta = delta.view(W.shape)
+        delta = self._delta().view(W.shape)
         return (W + (self.scaling * self.lora_strength * delta).to(W.dtype))
 
     def dora_xs_forward(self, W):
@@ -252,7 +289,7 @@ class LoRAParametrization(nn.Module):
             return W
         orig_shape = W.shape
         W_2d = W.view(W.shape[0], -1).to(self.U.dtype)
-        delta = self.U @ self.M_xs.to(self.U.dtype) @ self.V.T
+        delta = self._delta()
         V = W_2d + self.scaling * self.lora_strength * delta
         V_hat = V / (V.norm(dim=self._norm_dim, keepdim=True) + 1e-12)
         mag = self._blend_magnitude(
@@ -266,7 +303,7 @@ class LoRAParametrization(nn.Module):
             return W
         orig_shape = W.shape
         W_2d = W.view(W.shape[0], -1).to(self.U.dtype)
-        delta = self.U @ self.M_xs.to(self.U.dtype) @ self.V.T
+        delta = self._delta()
         V = W_2d + self.scaling * self.lora_strength * delta
         V_r = V / (V.norm(dim=1, keepdim=True) + 1e-12)
         intermediate = self._blend_magnitude(

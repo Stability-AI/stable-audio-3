@@ -14,6 +14,7 @@ from .utils import (
     load_lora_checkpoint,
     load_multiple_lora,
     name_is_lora,
+    get_dora_norm_state_dict,
     remap_lora_state_dict,
     save_lora_safetensors,
     select_lora,
@@ -23,6 +24,9 @@ from .utils import (
     cast_base_to_precision,
     detect_dora_variant,
     prepare_dora_state_dict,
-    resolve_adapter_type
+    resolve_adapter_type,
+    # The suffix identifying a baked DoRA row norm. Exported so consumers can
+    # recognise those keys without hardcoding the string.
+    BAKED_VNORM_KEY,
 )
 from .loader import load_and_apply_loras

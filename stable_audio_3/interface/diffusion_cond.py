@@ -104,7 +104,7 @@ def generate_cond(
         preview_every = None
 
     # Parse per-LoRA controls from trailing args
-    # Each LoRA has 5 controls: strength, interval_min, interval_max, layer_filter
+    # Each LoRA has 4 controls: strength, interval_min, interval_max, layer_filter
     lora_configs = None
     if n_loras > 0 and len(lora_args) >= n_loras * 4:
         lora_configs = []

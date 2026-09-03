@@ -179,6 +179,25 @@ class LoRAParametrization(nn.Module):
             self._adapter_forward_fn = self.forward_fn
 
 
+    def _blend_magnitude(self, mag, base_norm):
+        """Interpolate a learned magnitude back toward the base weight's norm.
+
+        lora_strength scales the *direction* update, but a magnitude vector
+        replaces the base norm outright. So as strength -> 0 the direction
+        converges to W0/||W0|| while the magnitude stays fully learned, leaving
+        (mag/||W0||)*W0 rather than W0 — while strength == 0 short-circuits to
+        exactly W0. That discontinuity is why strength=1e-5 is not close to "no
+        LoRA". Interpolating the magnitude too makes strength continuous at 0.
+
+        Returns the learned magnitude unchanged at strength 1, so trained
+        behaviour is untouched and the extra base-norm reduction is skipped on
+        the common path.
+        """
+        s = self.lora_strength
+        if s == 1.0:
+            return mag
+        return base_norm + s * (mag - base_norm)
+
     def lora_forward(self, W):
         delta = torch.matmul(*self.swap((self.lora_B, self.dropout_fn(self.lora_A)))).view(W.shape)
         delta = self.scaling * self.lora_strength * delta
@@ -196,7 +215,11 @@ class LoRAParametrization(nn.Module):
         V = W_2d + self.scaling * self.lora_strength * delta
         # normalize along _norm_dim, then scale by per-element magnitude
         V_hat = V / (V.norm(dim=self._norm_dim, keepdim=True) + 1e-12)
-        return (V_hat * self.magnitude.unsqueeze(self._norm_dim)).view(orig_shape).to(W.dtype)
+        mag = self._blend_magnitude(
+            self.magnitude.unsqueeze(self._norm_dim),
+            W_2d.norm(dim=self._norm_dim, keepdim=True),
+        )
+        return (V_hat * mag).view(orig_shape).to(W.dtype)
 
     def bora_forward(self, W):
         if self.lora_strength == 0:
@@ -205,12 +228,19 @@ class LoRAParametrization(nn.Module):
         W_2d = W.view(W.shape[0], -1).to(self.lora_A.dtype)
         delta = torch.matmul(*self.swap((self.lora_B, self.dropout_fn(self.lora_A))))
         V = W_2d + self.scaling * self.lora_strength * delta
-        # Row-normalize, then scale by row magnitudes
+        # Row-normalize, then scale by row magnitudes. Both magnitudes
+        # interpolate toward the base weight's own norms so strength -> 0
+        # reconstructs W0 rather than a rescaled W0.
         V_r = V / (V.norm(dim=1, keepdim=True) + 1e-12)
-        intermediate = self.magnitude_r.unsqueeze(1) * V_r
+        intermediate = self._blend_magnitude(
+            self.magnitude_r.unsqueeze(1), W_2d.norm(dim=1, keepdim=True)
+        ) * V_r
         # Column-normalize, then scale by column magnitudes
         H_c = intermediate / (intermediate.norm(dim=0, keepdim=True) + 1e-12)
-        return (H_c * self.magnitude_c.unsqueeze(0)).view(orig_shape).to(W.dtype)
+        mag_c = self._blend_magnitude(
+            self.magnitude_c.unsqueeze(0), W_2d.norm(dim=0, keepdim=True)
+        )
+        return (H_c * mag_c).view(orig_shape).to(W.dtype)
 
     def lora_xs_forward(self, W):
         delta = self.U @ self.M_xs.to(self.U.dtype) @ self.V.T
@@ -225,7 +255,11 @@ class LoRAParametrization(nn.Module):
         delta = self.U @ self.M_xs.to(self.U.dtype) @ self.V.T
         V = W_2d + self.scaling * self.lora_strength * delta
         V_hat = V / (V.norm(dim=self._norm_dim, keepdim=True) + 1e-12)
-        return (V_hat * self.magnitude.unsqueeze(self._norm_dim)).view(orig_shape).to(W.dtype)
+        mag = self._blend_magnitude(
+            self.magnitude.unsqueeze(self._norm_dim),
+            W_2d.norm(dim=self._norm_dim, keepdim=True),
+        )
+        return (V_hat * mag).view(orig_shape).to(W.dtype)
 
     def bora_xs_forward(self, W):
         if self.lora_strength == 0:
@@ -235,9 +269,14 @@ class LoRAParametrization(nn.Module):
         delta = self.U @ self.M_xs.to(self.U.dtype) @ self.V.T
         V = W_2d + self.scaling * self.lora_strength * delta
         V_r = V / (V.norm(dim=1, keepdim=True) + 1e-12)
-        intermediate = self.magnitude_r.unsqueeze(1) * V_r
+        intermediate = self._blend_magnitude(
+            self.magnitude_r.unsqueeze(1), W_2d.norm(dim=1, keepdim=True)
+        ) * V_r
         H_c = intermediate / (intermediate.norm(dim=0, keepdim=True) + 1e-12)
-        return (H_c * self.magnitude_c.unsqueeze(0)).view(orig_shape).to(W.dtype)
+        mag_c = self._blend_magnitude(
+            self.magnitude_c.unsqueeze(0), W_2d.norm(dim=0, keepdim=True)
+        )
+        return (H_c * mag_c).view(orig_shape).to(W.dtype)
 
     def forward(self, X):
         return self.forward_fn(X)

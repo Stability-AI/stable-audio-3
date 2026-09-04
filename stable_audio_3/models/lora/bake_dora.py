@@ -15,7 +15,11 @@ SVD IS NEVER COMPUTED. ``-xs`` bases are sliced from the frozen ``svd_bases.pt``
 adapter was trained against; recomputing them per layer is minutes of work and numerically
 unstable on the DiT's larger matrices.
 
-Runs as a module (it imports from its own package):
+Runs as a module (it imports from its own package), or through the bake_dora.sh
+wrapper next to this file, which does that for you from any working directory:
+
+    ./stable_audio_3/models/lora/bake_dora.sh <adapter.safetensors> \
+        --base-weights /path/to/model.safetensors [--out PATH] [--force]
 
     python -m stable_audio_3.models.lora.bake_dora <adapter.safetensors> \
         --base-weights /path/to/model.safetensors [--out PATH] [--force]

@@ -19,7 +19,8 @@ Risk 2). It is NOT on the fused (oneDNN) runtime path, so for AVX2 we compile it
 import os, sys, re, glob, json, shutil, time, subprocess
 os.environ.setdefault("TRITON_CPU_BACKEND", "1")
 import numpy as np, torch
-sys.path.insert(0, "/weka2/cj/clod/tritoncpu_sa3/dit_triton")
+sys.path.insert(0, os.environ.get("SA3_TRITON_CPU",
+                os.path.join(os.environ.get("SA3_CPUAMX_HOME", "engines"), "dit_triton")))
 import kernels as K, kernels_fused as KF
 from model_p3 import DiTTritonP3
 from gen_reference import read_subset, CKPT
@@ -110,7 +111,9 @@ def mnem(sopath):
 
 
 if __name__ == "__main__":
-    ref = np.load(f"/weka2/cj/clod/tritoncpu_sa3/dit_triton/ref/ref_L{L}.npz")
+    ref = np.load(os.path.join(os.environ.get("SA3_TRITON_CPU",
+              os.path.join(os.environ.get("SA3_CPUAMX_HOME", "engines"), "dit_triton")),
+              "ref", f"ref_L{L}.npz"))
     inp = [torch.from_numpy(ref[k]) for k in ("x", "t", "cross", "gcond")]
     sd = read_subset(CKPT)
     m = DiTTritonP3(sd, T_lat=L, prec="int8", backend="tri")

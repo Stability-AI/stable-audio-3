@@ -74,7 +74,14 @@ static inline int8_t q127(float v){ v=std::rintf(v); return (int8_t)(v>127.0f?12
 struct Ten{void* p; std::string dt; long n; std::vector<long> shp;};
 static std::map<std::string,Ten> TEN;
 static char* BASE=nullptr;
-static std::string WBASE="/weka2/cj/clod/same_s_int8fused_cpu_amx/weights";
+
+// Engine paths resolve from $SA3_CPUAMX_HOME (same base the Python side uses), so nothing
+// absolute is baked into the binary. Falls back to the current directory.
+static const char* sa3_home() {
+    const char* v = getenv("SA3_CPUAMX_HOME");
+    return (v && *v) ? v : ".";
+}
+static std::string WBASE = std::string(sa3_home()) + "/same_s_int8fused_cpu_amx/weights";
 static void load_weights(){
     std::string bin=WBASE+".bin";
     int fd=open(bin.c_str(),O_RDONLY); struct stat st; fstat(fd,&st);

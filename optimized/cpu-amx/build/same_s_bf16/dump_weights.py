@@ -13,13 +13,21 @@ Layout choices (match model_bf16.py SHIP config exactly):
 bf16 conversion uses torch's round-to-nearest-even (build-time tool; the *runtime* is
 torch-free). Manifest line:  name dtype byte_offset nelem d0 d1 ...
 """
+
+import os
+
+# Paths come from the environment so nothing local is baked in.
+#   SA3_CPUAMX_HOME  where the engine dirs live (default ./engines)
+#   SA3_REPO         checkout providing the reference weights to dump
+HOME = os.environ.get("SA3_CPUAMX_HOME", os.path.abspath("engines"))
+REPO = os.environ.get("SA3_REPO", os.path.abspath("."))
 import os, sys
 import numpy as np
 import torch
 
-SA3 = "/weka2/cj/clod/q4/sa3-w4-cluster"
+SA3 = REPO
 WEIGHTS = os.path.join(SA3, "models", "mlx", "same_s_decoder_f32.npz")
-OUT = "/weka2/cj/clod/same_s_cpu_amx"
+OUT = os.path.join(HOME, "same_s_cpu_amx")
 NB = 6
 
 raw = dict(np.load(WEIGHTS))

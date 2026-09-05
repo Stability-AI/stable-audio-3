@@ -4,8 +4,8 @@ The `cpu-amx` runtime loads six torch-free C++/AMX engines as `.so`s via ctypes.
 how to (re)build each `.so` and dump its weight blob. The runtime itself (CLI/gradio) needs only the
 built `.so`s + weight blobs; you only need this if you're rebuilding from source.
 
-All sources live under `build/`. Prebuilt `.so`s + weight blobs currently live in the per-engine dirs
-under `/weka2/cj/clod/` (see "Where the runtime looks" below) — `backends.py` points there.
+All sources live under `build/`. Prebuilt `.so`s + weight blobs live in per-engine directories under
+`$SA3_CPUAMX_HOME` (see "Where the runtime looks" below) — `backends.py` resolves that same variable.
 
 ## Components
 
@@ -22,11 +22,11 @@ under `/weka2/cj/clod/` (see "Where the runtime looks" below) — `backends.py` 
 
 1. **CPU with AMX** (Sapphire Rapids / Emerald Rapids Xeon; reports `cpu_isa_avx10_1_512_amx`).
    The engines fall back to VNNI/AVX2 but the headline speed needs AMX (see `LESSONS.md`).
-2. **Static oneDNN with the OpenMP runtime** at `/weka2/cj/tmp/onednn-omp` (`include/`, `lib/libdnnl.a`).
+2. **Static oneDNN with the OpenMP runtime**, path in `$ONEDNN_HOME` (`include/`, `lib/libdnnl.a`).
    Rebuild from oneDNN source with `-DDNNL_CPU_RUNTIME=OMP -DDNNL_LIBRARY_TYPE=STATIC` if it's missing.
 3. **g++** with C++17 + `-march=native` (must resolve AMX intrinsics).
-4. **triton-cpu fork** at `/weka2/cj/clod/tritoncpu_sa3/` — ONLY for rebuilding the DiT's AOT kernels.
-5. Python venv `/weka/cj/venvs/sad310/bin/python3` (numpy; for weight dumping).
+4. **triton-cpu fork**, path in `$SA3_TRITON_CPU` — ONLY for rebuilding the DiT's AOT kernels.
+5. A Python environment with numpy (for weight dumping).
 
 ## Weight sourcing
 
@@ -45,7 +45,7 @@ All five are a single `g++` + static-oneDNN link. The pattern (see each dir's `b
 comment at the top of the `.cpp`):
 
 ```bash
-ONE=/weka2/cj/tmp/onednn-omp
+ONE="$ONEDNN_HOME"
 g++ -O3 -march=native -std=c++17 -fopenmp -shared -fPIC -I"$ONE/include" \
     <engine>.cpp -o <engine>.so "$ONE/lib/libdnnl.a" -ldl -lpthread -lm
 ```
@@ -66,7 +66,7 @@ python build/same_l_int8/dump_weights_int8.py <same_l_decoder_f32.npz>
 The dumpers write `weights.bin` (bf16 or per-out-channel int8) + `weights_manifest.txt` (the mmap layout
 the C++ loader reads). Linear weights are pre-transposed to `(in,out)` so the row-major oneDNN matmul
 consumes them directly. **The int8 "improved" (SQ+GPTQ) blobs that actually ship** are produced by the
-separate calibration tooling in `/weka2/cj/clod/gptqsq_test/` (SmoothQuant α0.9 → GPTQ → re-quant); they
+separate calibration tooling (SmoothQuant α0.9 → GPTQ → re-quant), not included here; they
 are byte-compatible drop-ins for the int8 `.so` and are what the shipped `weights.bin` symlinks point to.
 
 ### medium DiT (int8) — the AOT-Triton path
@@ -110,13 +110,13 @@ golden shape).
 
 ## Where the runtime looks
 
-`scripts/backends.py` loads each engine's `.so` + weight blob from an engine dir under `/weka2/cj/clod/`
-(`t5gemma_cpu_amx/`, `same_{s,l}_cpu_amx/`, `same_{s,l}_int8fused_cpu_amx/`, `same_{s,l}_encoder_cpu_amx/`,
-`tritoncpu_sa3/aot_speedprove/`). **These binaries are NOT in git — `scripts/weights.py` `ensure()`
+`scripts/backends.py` loads each engine's `.so` + weight blob from an engine dir under
+`$SA3_CPUAMX_HOME` (`t5gemma_cpu_amx/`, `dit_medium_cpu_amx/`, `same_{s,l}_cpu_amx/`,
+`same_{s,l}_int8fused_cpu_amx/`, `same_{s,l}_encoder_cpu_amx/`). **These binaries are NOT in git — `scripts/weights.py` `ensure()`
 downloads them from HF** (`stabilityai/stable-audio-3-optimized/cpu-amx/`, flat) into those dirs on first
 use; a local build (this BUILD.md) satisfies them too and skips the download. Override the base dir with
 `SA3_CPUAMX_HOME`, or `SA3_CPUAMX_NO_HF=1` to force local-only. The DiT `.so` bakes in absolute kernel/core
-paths (`tritoncpu_sa3/aot_stage2`, `aot_speedprove`), so those are fixed for now — making the DiT `.so`
+paths are read from `$SA3_CPUAMX_HOME` at load time, so a rebuilt `.so` is relocatable; binaries published before that change still carry the old absolute prefix.
 env-configurable (like the other seven engines, which load relative to their dir) is the remaining
 portability follow-up.
 

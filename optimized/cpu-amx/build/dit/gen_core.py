@@ -6,8 +6,9 @@ aot_stage2/dump_bin.py; cpp_kernels.txt/so/ are L-independent and reused from ao
 import os, sys
 import numpy as np
 
-SRC = "/weka2/cj/clod/tritoncpu_sa3/aot_stage2"          # read-only npz source
-DST = "/weka2/cj/clod/tritoncpu_sa3/aot_speedprove"
+SRC = os.path.join(os.environ.get("SA3_CPUAMX_HOME", "engines"),
+                   "dit_medium_cpu_amx", "aot_stage2")   # read-only npz source
+DST = os.path.join(os.environ.get("SA3_CPUAMX_HOME", "engines"), "dit_medium_cpu_amx")
 L = int(sys.argv[1]) if len(sys.argv) > 1 else 1292
 DT = {np.dtype("float32"): "f32", np.dtype("int8"): "i8", np.dtype("int32"): "i32"}
 

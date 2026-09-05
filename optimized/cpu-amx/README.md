@@ -165,16 +165,24 @@ cpu-amx/
     └── test_all_configs.py   ← full-stack self-test (assets + every CLI mode)
 ```
 
-The heavy weights are **not** in this directory — the C++ engines mmap them from
-their build directories, imported by `sys.path` (see `scripts/backends.py`):
+The heavy weights are **not** in this directory. Each engine lives in its own directory under
+the *engine home*, and `scripts/weights.py` downloads the published binaries into it on first
+use (from `stabilityai/stable-audio-3-optimized/cpu-amx/`):
 
-| component | engine `.so` + weights |
-|-----------|------------------------|
-| T5Gemma | `/weka2/cj/clod/t5gemma_cpu_amx/` |
-| DiT (medium int8) | `/weka2/cj/clod/tritoncpu_sa3/aot_speedprove/` + `.../aot_stage2/` |
-| SAME-S / SAME-L (bf16) | `/weka2/cj/clod/same_{s,l}_cpu_amx/` |
-| SAME-S / SAME-L (int8) | `/weka2/cj/clod/same_{s,l}_int8fused_cpu_amx/` |
-| fp32 AE encoder (a2a/inpaint) | `/weka2/cj/clod/sa3s/fast_load/` (torch) |
+```bash
+export SA3_CPUAMX_HOME=~/.cache/stable-audio-3/cpu-amx   # the default
+```
+
+| component | engine directory (under `$SA3_CPUAMX_HOME`) |
+|-----------|---------------------------------------------|
+| T5Gemma | `t5gemma_cpu_amx/` |
+| DiT (medium, int8 / bf16) | `dit_medium_cpu_amx/` |
+| SAME-S / SAME-L decoder (bf16) | `same_{s,l}_cpu_amx/` |
+| SAME-S / SAME-L decoder (int8) | `same_{s,l}_int8fused_cpu_amx/` |
+| SAME-S / SAME-L encoder (a2a/inpaint) | `same_{s,l}_encoder_cpu_amx/` |
+
+Both the Python loader and the C++ engines read `$SA3_CPUAMX_HOME`, so the tree is
+relocatable — nothing absolute is compiled in.
 
 ## Notes on the design
 

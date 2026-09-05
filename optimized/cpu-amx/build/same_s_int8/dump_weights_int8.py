@@ -19,12 +19,20 @@ NEVER smoothed (214x outliers -> backfires, per smoothquant_test/SMOOTHQUANT_W8A
 
 Manifest line:  name dtype byte_offset nelem d0 d1 ...    (dtype in {i8,f32})
 """
+
+import os
+
+# Paths come from the environment so nothing local is baked in.
+#   SA3_CPUAMX_HOME  where the engine dirs live (default ./engines)
+#   SA3_REPO         checkout providing the reference weights to dump
+HOME = os.environ.get("SA3_CPUAMX_HOME", os.path.abspath("engines"))
+REPO = os.environ.get("SA3_REPO", os.path.abspath("."))
 import os
 import numpy as np
 
-SA3 = "/weka2/cj/clod/q4/sa3-w4-cluster"
+SA3 = REPO
 WEIGHTS = os.path.join(SA3, "models", "mlx", "same_s_decoder_f32.npz")
-OUT = "/weka2/cj/clod/same_s_int8_cpu_amx"
+OUT = os.path.join(HOME, "same_s_int8_cpu_amx")
 NB = 6
 USE_SQ = os.environ.get("SQ", "0") == "1"
 SQ_NPZ = os.path.join(OUT, "sq_scales.npz")

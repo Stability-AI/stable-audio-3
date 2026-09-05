@@ -4,8 +4,7 @@ Every heavy component is a torch-free C++ AMX engine, loaded by inserting its
 source directory on sys.path and importing the ctypes shim (the .so + weights
 live in those directories; we do not copy them). The a2a/inpaint init-encoder is
 now ALSO a torch-free C++ AMX engine (SAME-S / SAME-L, matched to the decoder),
-so the whole release is C++/numpy — no torch anywhere. (The legacy fp32 torch AE
-remains as load_ae_encoder_torch() for reference/fallback only.)
+so the whole release is C++/numpy — no torch anywhere.
 
 Components
     T5Gemma    : t5gemma_cpu_amx.so  (bf16 AMX)          -> [1,256,768]
@@ -26,18 +25,27 @@ import sys
 
 import numpy as np
 
-# ── C++ backend source directories (import .so via sys.path; do not copy) ────
-DIR_T5 = "/weka2/cj/clod/t5gemma_cpu_amx"
-DIR_DIT = "/weka2/cj/clod/q4/sa3-w4-cluster"          # cpu_amx_backend.py (DiTCppAmx)
-DIR_SAMES = "/weka2/cj/clod/same_s_cpu_amx"
-DIR_SAMEL = "/weka2/cj/clod/same_l_cpu_amx"
-DIR_SAMES_INT8 = "/weka2/cj/clod/same_s_int8fused_cpu_amx"
-DIR_SAMEL_INT8 = "/weka2/cj/clod/same_l_int8fused_cpu_amx"
-DIR_SAMES_ENC = "/weka2/cj/clod/same_s_encoder_cpu_amx"   # C++ AMX SAME-S encoder (bf16)
-DIR_SAMEL_ENC = "/weka2/cj/clod/same_l_encoder_cpu_amx"   # C++ AMX SAME-L encoder (bf16)
-DIR_SAMES_ENC_INT8 = "/weka2/cj/clod/same_s_encoder_int8fused_cpu_amx"   # C++ AMX SAME-S encoder (int8)
-DIR_SAMEL_ENC_INT8 = "/weka2/cj/clod/same_l_encoder_int8fused_cpu_amx"   # C++ AMX SAME-L encoder (int8)
-DIR_AE = "/weka2/cj/clod/sa3s/fast_load"              # samel_loader.load_model (torch AE, fallback only)
+# ── C++ backend engine directories ───────────────────────────────────────────────────────
+# All resolved from ONE base so this file and weights.py (which downloads into it) can never
+# disagree. Override with SA3_CPUAMX_HOME; see weights.py for the DiT .so path caveat.
+try:
+    from weights import HOME as _HOME
+except ImportError:                                  # standalone import of this module
+    _HOME = os.environ.get("SA3_CPUAMX_HOME",
+                           os.path.expanduser("~/.cache/stable-audio-3/cpu-amx"))
+
+_D = lambda name: os.path.join(_HOME, name)
+
+DIR_T5             = _D("t5gemma_cpu_amx")
+DIR_DIT            = _D("dit_medium_cpu_amx")             # cpu_amx_backend.py (DiTCppAmx)
+DIR_SAMES          = _D("same_s_cpu_amx")
+DIR_SAMEL          = _D("same_l_cpu_amx")
+DIR_SAMES_INT8     = _D("same_s_int8fused_cpu_amx")
+DIR_SAMEL_INT8     = _D("same_l_int8fused_cpu_amx")
+DIR_SAMES_ENC      = _D("same_s_encoder_cpu_amx")         # C++ AMX SAME-S encoder (bf16)
+DIR_SAMEL_ENC      = _D("same_l_encoder_cpu_amx")         # C++ AMX SAME-L encoder (bf16)
+DIR_SAMES_ENC_INT8 = _D("same_s_encoder_int8fused_cpu_amx")   # SAME-S encoder (int8)
+DIR_SAMEL_ENC_INT8 = _D("same_l_encoder_int8fused_cpu_amx")   # SAME-L encoder (int8)
 
 DIT_THREADS = 1   # verified-stable; the .so heap-races at higher thread counts
 
@@ -201,46 +209,8 @@ def _pick_free_gpu() -> str | None:
         return None
 
 
-class AEEncoder:
-    """fp32 SAME-L autoencoder ENCODER for a2a / inpaint. Torch — imported lazily.
+# NOTE: a legacy torch fp32 SAME-L encoder (AEEncoder / load_ae_encoder_torch) lived here.
+# Nothing called it — a2a/inpaint use the C++ AMX encoders via load_encoder() — and it
+# pulled in torch + stable_audio_tools + an unpublished loader, against this release being
+# torch-free. Removed.
 
-    encode(audio (2,N) fp32, T_lat) -> latent (1,256,T_lat) fp32.
-    The AE downsamples 4096 audio samples per latent token, so the audio is
-    trimmed/zero-padded to exactly T_lat*4096 samples before encoding."""
-
-    def __init__(self, device: str | None = None):
-        gpu = _pick_free_gpu()
-        if device is None and gpu is not None:
-            os.environ["CUDA_VISIBLE_DEVICES"] = gpu   # must precede torch import
-        _add_path(DIR_AE)
-        import torch
-        from samel_loader import load_model
-        import stable_audio_tools.models.autoencoders as ae
-        self.torch = torch
-        dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.device = dev
-        model = load_model(dev)
-        # inference-clean bottleneck: no stochastic noise regularisation / masking
-        model.bottleneck.noise_regularize = False
-        for m in model.modules():
-            if isinstance(m, ae.TransformerResamplingBlock):
-                m.mask_noise = 0.0
-        self.model = model.eval()
-
-    def encode(self, audio: np.ndarray, T_lat: int) -> np.ndarray:
-        torch = self.torch
-        target = T_lat * SAMPLES_PER_LATENT
-        a = np.ascontiguousarray(audio, np.float32)
-        if a.shape[-1] >= target:
-            a = a[:, :target]
-        else:
-            a = np.pad(a, ((0, 0), (0, target - a.shape[-1])))
-        with torch.no_grad():
-            x = torch.from_numpy(a[None]).to(self.device)                 # (1,2,N)
-            lat = self.model.encode(x)                                    # (1,256,T_lat)
-        return np.ascontiguousarray(lat.float().cpu().numpy(), np.float32)
-
-
-def load_ae_encoder_torch(device: str | None = None) -> AEEncoder:
-    """Legacy fp32 torch AE encoder (fallback/reference; the release uses load_encoder)."""
-    return AEEncoder(device)

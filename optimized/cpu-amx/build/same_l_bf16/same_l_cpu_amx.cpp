@@ -89,7 +89,14 @@ static inline int cdiv(int a,int b){return (a+b-1)/b;}
 struct Ten{void* p; std::string dt; long n; std::vector<long> shp;};
 static std::map<std::string,Ten> TEN;
 static char* BASE=nullptr;
-static std::string WBASE="/weka2/cj/clod/same_l_cpu_amx/weights";
+
+// Engine paths resolve from $SA3_CPUAMX_HOME (same base the Python side uses), so nothing
+// absolute is baked into the binary. Falls back to the current directory.
+static const char* sa3_home() {
+    const char* v = getenv("SA3_CPUAMX_HOME");
+    return (v && *v) ? v : ".";
+}
+static std::string WBASE = std::string(sa3_home()) + "/same_l_cpu_amx/weights";
 static void load_weights(){
     std::string bin=WBASE+".bin";
     int fd=open(bin.c_str(),O_RDONLY); struct stat st; fstat(fd,&st);

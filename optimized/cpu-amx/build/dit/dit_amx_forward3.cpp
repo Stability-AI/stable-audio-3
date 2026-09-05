@@ -32,15 +32,24 @@ static const int E=1536, H=24, D=64, RD=32, MEM=64, CROSS=257, DEPTH=24;
 static const int FF=6144;                       // FFN inner
 static const float NORM_EPS=1e-5f, QK_EPS=1e-6f;
 static const float SCALE=0.125f;                // D**-0.5 = 64**-0.5
-static const char* AOT="/weka2/cj/clod/tritoncpu_sa3/aot_stage2";        // so/ + cpp_kernels.txt (L-independent)
-static std::string COREBASE="/weka2/cj/clod/tritoncpu_sa3/aot_speedprove/core_L128";  // .bin + _manifest.txt
+
+// Engine paths resolve from $SA3_CPUAMX_HOME (same base the Python side uses), so nothing
+// absolute is baked into the binary. Falls back to the current directory.
+static const char* sa3_home() {
+    const char* v = getenv("SA3_CPUAMX_HOME");
+    return (v && *v) ? v : ".";
+}
+static std::string AOT_S = std::string(sa3_home()) + "/dit_medium_cpu_amx/aot_stage2";
+static const char* AOT = AOT_S.c_str();        // so/ + cpp_kernels.txt (L-independent)
+static std::string COREBASE = std::string(sa3_home()) + "/dit_medium_cpu_amx/core_L128";  // .bin + _manifest.txt
 
 static bool USE_ONEDNN=true;                     // int8 linear GEMM backend
 static void* FLASH_OVERRIDE=nullptr;             // optional alternate flash kernel .so entry
 static int   FLASH_BM=128;                       // flash query-block size (BM); constexpr in the .so.
 // BM only tiles the (independent) query rows -> bit-exact vs BM=32, but 4x fewer per-tile kernel
 // invocations, cutting the per-launch AMX-config/dispatch overhead. bm{64,128}.so live in so_flash/.
-static const char* FLASH_SO_DIR="/weka2/cj/clod/tritoncpu_sa3/aot_speedprove/so_flash";
+static std::string FLASH_SO_DIR_S = std::string(sa3_home()) + "/dit_medium_cpu_amx/so_flash";
+static const char* FLASH_SO_DIR = FLASH_SO_DIR_S.c_str();
 
 static inline int cdiv(int a,int b){return (a+b-1)/b;}
 static int npow2(int n){int p=1;while(p<n)p<<=1;return p;}
@@ -399,7 +408,7 @@ int main(int argc,char**argv){
         else if(nv("--flashbm")) FLASH_BM=atoi(argv[++i]);
     }
     if(threads<=0){const char* e=getenv("OMP_NUM_THREADS"); threads=e?atoi(e):16;}
-    if(L>0) COREBASE="/weka2/cj/clod/tritoncpu_sa3/aot_speedprove/core_L"+std::to_string(L);
+    if(L>0) COREBASE = std::string(sa3_home()) + "/dit_medium_cpu_amx/core_L" + std::to_string(L);
 
     if(syscall(SYS_arch_prctl,0x1023,18)!=0){fprintf(stderr,"arch_prctl AMX FAILED\n");return 1;}
     omp_set_dynamic(0); omp_set_num_threads(threads);

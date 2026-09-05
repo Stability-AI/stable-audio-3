@@ -1,10 +1,12 @@
-# Big engine binaries live on HF (stabilityai/stable-audio-3-optimized/cpu-amx);
-# weights.py pulls them at runtime. Never commit them here.
-*.so
-*.bin
-weights_manifest.txt
-weights_f32_manifest.txt
-hf/
+output/
+.venv/
+
+# The repo-root .gitignore has a blanket `build/` rule for generated output. Ours holds the
+# ENGINE SOURCES (C++ + weight dumpers), so re-include them explicitly...
+!build/
+!build/**
+
+# ...but never track bytecode. These rules come AFTER the re-include so they still win.
 __pycache__/
+**/__pycache__/
 *.pyc
-*.wav

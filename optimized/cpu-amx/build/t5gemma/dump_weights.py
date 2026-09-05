@@ -15,11 +15,20 @@ C++ runtime f2b() (r = x + 0x7fff + ((x>>16)&1); bf16 = r>>16). No torch needed.
 
 Manifest line:  name dtype byte_offset nelem d0 d1 ...
 """
+
+import os
+
+# Paths come from the environment so nothing local is baked in.
+#   SA3_CPUAMX_HOME  where the engine dirs live (default ./engines)
+#   SA3_REPO         checkout providing the reference weights to dump
+HOME = os.environ.get("SA3_CPUAMX_HOME", os.path.abspath("engines"))
+REPO = os.environ.get("SA3_REPO", os.path.abspath("."))
 import os
 import numpy as np
 
-NPZ = "/weka2/cj/clod/t5gemma_cpu_amx/hf/MLX/t5gemma_f16.npz"
-OUT = "/weka2/cj/clod/t5gemma_cpu_amx"
+NPZ = os.environ.get("SA3_T5GEMMA_NPZ",
+                     os.path.join(HOME, "t5gemma_cpu_amx", "t5gemma_f16.npz"))
+OUT = os.path.join(HOME, "t5gemma_cpu_amx")
 NB = 12
 
 

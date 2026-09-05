@@ -4,16 +4,26 @@ The big binaries live on HF at stabilityai/stable-audio-3-optimized/cpu-amx/ (fl
 `ensure(group)` downloads an engine's files and places them where its ctypes shim expects them, so
 `backends.py` can load unchanged. Idempotent: skips files already present with the right size.
 
-Portability note: the DiT `.so` has baked-in absolute paths (`/weka2/cj/clod/tritoncpu_sa3/...`), so its
-files are placed there; the other seven engines load relative to their own dir. Making everything
-relocatable is a follow-up (rebuild the DiT `.so` with env-configurable kernel/core paths).
+Engine home
+-----------
+Everything is placed under ``$SA3_CPUAMX_HOME`` (default ``~/.cache/stable-audio-3/cpu-amx``),
+one directory per engine. ``backends.py`` resolves the same base, so the two never disagree.
+
+Portability caveat
+------------------
+All engines resolve their kernel/weight paths from ``$SA3_CPUAMX_HOME`` at load time (the C++
+reads the same variable), so the tree is relocatable. NOTE: binaries published before this
+change have the old absolute prefix baked in — rebuild from ``build/`` to get a portable one.
 """
 from __future__ import annotations
 import os, shutil, tarfile
 
 HF_REPO = "stabilityai/stable-audio-3-optimized"
 HF_DIR  = "cpu-amx"
-_C = os.environ.get("SA3_CPUAMX_HOME", "/weka2/cj/clod")   # base the shims + DiT .so expect
+# Single source of truth for where engines live; backends.py imports this.
+HOME = os.environ.get("SA3_CPUAMX_HOME",
+                      os.path.expanduser("~/.cache/stable-audio-3/cpu-amx"))
+_C = HOME
 
 # HF flat filename  ->  local destination the loader reads
 FILES = {
@@ -46,18 +56,18 @@ FILES = {
  "same_l_encoder_int8.so":                   f"{_C}/same_l_encoder_int8fused_cpu_amx/same_l_encoder_int8fused_cpu_amx.so",
  "same_l_encoder_int8_weights.bin":          f"{_C}/same_l_encoder_int8fused_cpu_amx/weights.bin",
  "same_l_encoder_int8_weights_manifest.txt": f"{_C}/same_l_encoder_int8fused_cpu_amx/weights_manifest.txt",
- "dit_medium_int8.so":                       f"{_C}/tritoncpu_sa3/aot_speedprove/dit_cpu_amx.so",
- "dit_medium_int8_core.bin":                 f"{_C}/tritoncpu_sa3/aot_speedprove/core_L320.bin",
- "dit_medium_int8_core_manifest.txt":        f"{_C}/tritoncpu_sa3/aot_speedprove/core_L320_manifest.txt",
- "dit_medium_bf16.so":                       f"{_C}/tritoncpu_sa3/aot_bf16/dit_cpu_amx_bf16.so",
- "dit_medium_bf16_core.bin":                 f"{_C}/tritoncpu_sa3/aot_bf16/core_bf16.bin",
- "dit_medium_bf16_core_manifest.txt":        f"{_C}/tritoncpu_sa3/aot_bf16/core_bf16_manifest.txt",
- "dit_medium_bf16_pin_fp32.npz":             f"{_C}/tritoncpu_sa3/aot_bf16/pin_fp32.npz",
- "dit_medium_bf16_flash.so":                 f"{_C}/tritoncpu_sa3/aot_bf16/_flash_diff_bf16_bm128.so",
+ "dit_medium_int8.so":                       f"{_C}/dit_medium_cpu_amx/dit_cpu_amx.so",
+ "dit_medium_int8_core.bin":                 f"{_C}/dit_medium_cpu_amx/core_L320.bin",
+ "dit_medium_int8_core_manifest.txt":        f"{_C}/dit_medium_cpu_amx/core_L320_manifest.txt",
+ "dit_medium_bf16.so":                       f"{_C}/dit_medium_cpu_amx/dit_cpu_amx_bf16.so",
+ "dit_medium_bf16_core.bin":                 f"{_C}/dit_medium_cpu_amx/core_bf16.bin",
+ "dit_medium_bf16_core_manifest.txt":        f"{_C}/dit_medium_cpu_amx/core_bf16_manifest.txt",
+ "dit_medium_bf16_pin_fp32.npz":             f"{_C}/dit_medium_cpu_amx/pin_fp32.npz",
+ "dit_medium_bf16_flash.so":                 f"{_C}/dit_medium_cpu_amx/so_flash/_flash_diff_bf16_bm128.so",
 }
 # dit_medium_kernels.tar.gz is extracted (not a single dst); handled specially.
 _DIT_KERNELS_HF = "dit_medium_int8_kernels.tar.gz"
-_DIT_KERNELS_SENTINEL = f"{_C}/tritoncpu_sa3/aot_stage2/cpp_kernels.txt"
+_DIT_KERNELS_SENTINEL = f"{_C}/dit_medium_cpu_amx/aot_stage2/cpp_kernels.txt"
 
 GROUPS = {
  "t5gemma": ["t5gemma_bf16.so", "t5gemma_bf16_weights.bin", "t5gemma_bf16_weights_manifest.txt"],
@@ -98,7 +108,7 @@ def ensure(group: str):
                 continue
             tarpath = _fetch(hf)
             with tarfile.open(tarpath, "r:gz") as t:
-                t.extractall(f"{_C}/tritoncpu_sa3")        # recreates aot_stage2/so, cpp_kernels.txt, aot_speedprove/so_flash
+                t.extractall(f"{_C}/dit_medium_cpu_amx")   # recreates aot_stage2/{so,cpp_kernels.txt} + so_flash
             continue
         dst = FILES[hf]
         if os.path.exists(dst):

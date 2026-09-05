@@ -10,6 +10,7 @@ output WAV on: correct duration (±0.1s), finite samples, and not-silent
 from __future__ import annotations
 
 import subprocess
+import os
 import sys
 import tempfile
 import time
@@ -17,6 +18,9 @@ import wave
 from pathlib import Path
 
 import numpy as np
+
+_HOME = os.environ.get("SA3_CPUAMX_HOME",
+                       os.path.expanduser("~/.cache/stable-audio-3/cpu-amx"))
 
 SCRIPTS = Path(__file__).resolve().parent
 ROOT = SCRIPTS.parent
@@ -32,14 +36,14 @@ EXPECTED_ASSETS = [
     ROOT / "assets" / "cond_medium.npz",     # conditioner weights
 ]
 EXPECTED_SO = [
-    "/weka2/cj/clod/t5gemma_cpu_amx/t5gemma_cpu_amx.so",
-    "/weka2/cj/clod/tritoncpu_sa3/aot_speedprove/dit_cpu_amx.so",
-    "/weka2/cj/clod/same_s_cpu_amx/same_s_cpu_amx.so",
-    "/weka2/cj/clod/same_l_cpu_amx/same_l_cpu_amx.so",
-    "/weka2/cj/clod/same_s_int8fused_cpu_amx/same_s_int8fused_cpu_amx.so",
-    "/weka2/cj/clod/same_l_int8fused_cpu_amx/same_l_int8fused_cpu_amx.so",
-    "/weka2/cj/clod/same_s_encoder_cpu_amx/same_s_encoder_cpu_amx.so",   # a2a/inpaint init-encode
-    "/weka2/cj/clod/same_l_encoder_cpu_amx/same_l_encoder_cpu_amx.so",
+    os.path.join(_HOME, "t5gemma_cpu_amx", "t5gemma_cpu_amx.so"),
+    os.path.join(_HOME, "dit_medium_cpu_amx", "dit_cpu_amx.so"),
+    os.path.join(_HOME, "same_s_cpu_amx", "same_s_cpu_amx.so"),
+    os.path.join(_HOME, "same_l_cpu_amx", "same_l_cpu_amx.so"),
+    os.path.join(_HOME, "same_s_int8fused_cpu_amx", "same_s_int8fused_cpu_amx.so"),
+    os.path.join(_HOME, "same_l_int8fused_cpu_amx", "same_l_int8fused_cpu_amx.so"),
+    os.path.join(_HOME, "same_s_encoder_cpu_amx", "same_s_encoder_cpu_amx.so"),   # a2a/inpaint init-encode
+    os.path.join(_HOME, "same_l_encoder_cpu_amx", "same_l_encoder_cpu_amx.so"),
 ]
 
 

@@ -52,23 +52,16 @@ def _from_onnx(name):
 TARGETS = [
     {"label": "t5gemma  (text encoder + tokenizer)",
      "command": _from_onnx("t5gemma"),
-     "outputs": ["t5gemma/t5gemma_fp16mixed.trt", "t5gemma/tokenizer.json"]},
-    {"label": "same-s encoder",
-     "command": _from_onnx("same-s-encoder"),
-     "outputs": ["same-s/enc_dynamic_bf16.trt"]},
-    {"label": "same-s decoder",
-     "command": _from_onnx("same-s-decoder"),
-     "outputs": ["same-s/dec_dynamic_bf16.trt"]},
-    # SAME-L uses the custom SWA plugin. Its kernel implementation is chosen at build
-    # time via SA3_SWA_PLUGIN / SA3_SWA_AOT and baked into the engine — the default (AOT
-    # block-tiled MMA) is graph-capturable and needs no Python at inference. See
-    # "Choosing the SAME-L attention kernel" in README.md before overriding.
-    {"label": "same-l encoder (SWA plugin — AOT MMA kernel, graph-capturable)",
-     "command": _from_onnx("same-l-encoder"),
-     "outputs": ["same-l/enc_dynamic_triton_swa.trt"]},
-    {"label": "same-l decoder (SWA plugin — AOT MMA kernel, graph-capturable)",
-     "command": _from_onnx("same-l-decoder"),
-     "outputs": ["same-l/dec_dynamic_triton_swa.trt"]},
+     "outputs": ["t5gemma/t5gemma_fp16.trt", "t5gemma/tokenizer.json"]},
+    # The autoencoders build through build_autoencoders.py: they need two optimization profiles
+    # and (decoders) a grafted limiter, which build_from_onnx.py's single-profile path cannot
+    # express. One command does all eight and verifies them.
+    {"label": "SAME-L + SAME-S autoencoders (8 engines: enc/dec x canonical/fp8)",
+     "command": [sys.executable, str(SCRIPTS_DIR / "build_autoencoders.py")],
+     "outputs": ["same-l/enc_fp16_chunkable.trt", "same-l/dec_fp16_chunkable_limiter.trt",
+                 "same-l/enc_fp8_chunkable.trt", "same-l/dec_fp8_chunkable_limiter.trt",
+                 "same-s/enc_bf16_chunkable.trt", "same-s/dec_bf16_chunkable_limiter.trt",
+                 "same-s/enc_fp8_chunkable.trt", "same-s/dec_fp8_chunkable_limiter.trt"]},
     # DiT engines now build from pre-processed FP16-mixed ONNX on HF;
     # build_from_onnx.py does the simple STRONGLY_TYPED compile.
     # Medium ships TWO engines: fp16-mixed (the DEFAULT since 2026-07 — its
@@ -84,19 +77,19 @@ TARGETS = [
     # spacing is 32 rad — more than a full 2*pi rotation).
     {"label": "DiT medium  (SA3-M, FP16-mixed — medium DEFAULT, attention-fused)",
      "command": _from_onnx("sa3-m"),
-     "outputs": ["sa3-m/dit_fp16mixed.trt"]},
+     "outputs": ["sa3-m/dit_fp16.trt"]},
     {"label": "DiT medium  (SA3-M, bf16 — selectable; drifts at long sequence)",
      "command": _from_onnx("sa3-m-bf16"),
      "outputs": ["sa3-m/dit_bf16.trt"]},
-    {"label": "DiT medium  (SA3-M, fp8 — selectable; MAX-SPEED clean tier, ~1.3x over fp16mixed)",
+    {"label": "DiT medium  (SA3-M, fp8 — selectable; MAX-SPEED clean tier, ~1.3x over fp16)",
      "command": _from_onnx("sa3-m-fp8"),
      "outputs": ["sa3-m/dit_fp8.trt"]},
     {"label": "DiT sm-music (FP16-mixed)",
      "command": _from_onnx("sa3-sm-music"),
-     "outputs": ["sa3-sm-music/dit_fp16mixed.trt"]},
+     "outputs": ["sa3-sm-music/dit_fp16.trt"]},
     {"label": "DiT sm-sfx (FP16-mixed)",
      "command": _from_onnx("sa3-sm-sfx"),
-     "outputs": ["sa3-sm-sfx/dit_fp16mixed.trt"]},
+     "outputs": ["sa3-sm-sfx/dit_fp16.trt"]},
     # FP32 variants — opt-in. ~2× engine size, ~2× slower, but bit-equivalent
     # to PyTorch eager. Useful for precision-debug or reference comparisons.
     {"label": "[opt-in] same-l decoder FP32",

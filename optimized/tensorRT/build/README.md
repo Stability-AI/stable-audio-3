@@ -13,18 +13,18 @@ Run the build on the target GPU; TensorRT bakes the arch into the engine, so the
 ```
                               consumer flow                producer flow
                               ─────────────                ─────────────
-HuggingFace                    onnx/<engine>/  ←─────── publish (incl. dit_fp16mixed.onnx)
+HuggingFace                    onnx/<engine>/  ←─────── publish (incl. dit_fp16.onnx)
    tensorRT/<arch>/   ←─── compile + commit              source ckpts
                               │                              │
                               ↓                              ↓
                          build.py                      build_*.py
                          build_from_onnx.py            (build_t5gemma.py,
                             (just compile,              build_dit.py,
-                             STRONGLY_TYPED;            build_dit_fp16mixed.py,
+                             STRONGLY_TYPED;            build_dit_fp16.py,
                              no graphsurgeon)            build_same_*.py)
 ```
 
-The SA3 DiT ships both an FP32 canonical `dit.onnx` (regenerable from PyTorch source) and a pre-processed `dit_fp16mixed.onnx` (canonical + FP32 islands around RMSNorm and RoPE *generation*, FP16 attention core, rest converted to FP16). Consumers use the pre-processed one; producers refresh both when the model retrains.
+The SA3 DiT ships both an FP32 canonical `dit.onnx` (regenerable from PyTorch source) and a pre-processed `dit_fp16.onnx` (canonical + FP32 islands around RMSNorm and RoPE *generation*, FP16 attention core, rest converted to FP16). Consumers use the pre-processed one; producers refresh both when the model retrains.
 
 ## Consumer flow (default)
 
@@ -46,7 +46,7 @@ python build.py                   # interactive menu
   Output dir: models/sm_100/
 
   [1] ✓  t5gemma  (text encoder + tokenizer)
-        ✓  t5gemma/t5gemma_fp16mixed.trt  538.1 MB
+        ✓  t5gemma/t5gemma_fp16.trt  538.1 MB
         ✓  t5gemma/tokenizer.json     32.8 MB
   [2] ✗  same-s encoder
         ✗  same-s/enc_dynamic_bf16.trt  (missing)
@@ -223,17 +223,17 @@ python build_dit.py sa3-sm-sfx
 python build_dit.py sa3-m
 ```
 
-After the DiT ONNXes are exported, run the FP16-mixed precision-island surgery on each one (see `build_dit_fp16mixed.py`):
+After the DiT ONNXes are exported, run the FP16-mixed precision-island surgery on each one (see `build_dit_fp16.py`):
 
 ```bash
-python build_dit_fp16mixed.py \
+python build_dit_fp16.py \
     --input  <HF_REPO>/onnx/sa3-sm-music/dit.onnx \
-    --onnx   <HF_REPO>/onnx/sa3-sm-music/dit_fp16mixed.onnx \
-    --engine ../models/<arch>/sa3-sm-music/dit_fp16mixed.trt
+    --onnx   <HF_REPO>/onnx/sa3-sm-music/dit_fp16.onnx \
+    --engine ../models/<arch>/sa3-sm-music/dit_fp16.trt
 # repeat for sa3-sm-sfx and sa3-m
 ```
 
-This wraps every RMSNorm chain, attention `Softmax`, and the RoPE region in `Cast(FP32) → op → Cast(FP16)` islands, converts the rest of the weights to FP16, then **bounds the RoPE island before QK^T** (`bound_attention_core()`) so the attention core — QK^T → Softmax → P·V — runs FP16, and finally compiles a `STRONGLY_TYPED` TRT engine. It writes BOTH the modified `dit_fp16mixed.onnx` (~half the size of the original) AND the TRT engine. Publishing the modified ONNX is what lets consumers compile their own engines with plain `build_from_onnx.py` (no `onnx-graphsurgeon` dependency on the consumer side).
+This wraps every RMSNorm chain, attention `Softmax`, and the RoPE region in `Cast(FP32) → op → Cast(FP16)` islands, converts the rest of the weights to FP16, then **bounds the RoPE island before QK^T** (`bound_attention_core()`) so the attention core — QK^T → Softmax → P·V — runs FP16, and finally compiles a `STRONGLY_TYPED` TRT engine. It writes BOTH the modified `dit_fp16.onnx` (~half the size of the original) AND the TRT engine. Publishing the modified ONNX is what lets consumers compile their own engines with plain `build_from_onnx.py` (no `onnx-graphsurgeon` dependency on the consumer side).
 
 The attention-core step is not cosmetic. Without it the RoPE island emits q/k in FP32 and nothing casts them back, so the whole O(L²) core stays FP32 and TRT's FMHA fuser cannot fire: **0 fused MHA nodes and 4.3× slower at L=4096** on the medium DiT, for no accuracy gain (teacher-forced velocity cos vs the FP32 engine is 1.0000 with the step, 0.9998 without). PyTorch does the same thing the step does — `apply_rotary_pos_emb` ends with `t.to(out_dtype)` and attention is then a fused `scaled_dot_product_attention` over FP16 inputs — and TRT's FMHA kernels accumulate softmax in FP32 internally anyway. `--no-bound-attn` skips it, only useful for reproducing the pre-2026-07 engines.
 
@@ -253,12 +253,13 @@ git push
 
 ## Medium `fp8` — the max-speed RoPE-baked engine, calibrated
 
-On top of the `fp16mixed` default and the selectable `bf16`, the medium DiT ships an **`fp8`**
+On top of the `fp16` default (the medium-only `bf16` tier was retired — its uniform-bf16
+build survives only internally as the fp8 RoPE-baker), the medium DiT ships an **`fp8`**
 engine (`dit_fp8.trt`, `--precision fp8`): fp8 E4M3 on the 176 linear GEMMs + 96 bf16 fused
-FMHA + the **same baked fp32 RoPE constant table** as bf16. Measured on H200 it is ~1.3×
-faster than `fp16mixed` at every length (1.40× / 1.32× / 1.34× @L129/1292/4092, also ahead of
-bf16) and clean at long sequence (latent std 0.86, 0.000% clip at 6-min), so it stays clean
-exactly where bf16 clips.
+FMHA + the **same baked fp32 RoPE constant table**. Measured on H200 it is ~1.3×
+faster than `fp16` at every length (1.40× / 1.32× / 1.34× @L129/1292/4092) and clean at
+long sequence (latent std 0.86, 0.000% clip at 6-min), so it stays clean exactly where the
+old bf16 tier clipped.
 
 The fp8 scales are **calibrated on real conditioning** (updated 2026-07-31). The scale VALUES —
 per-tensor activation amax + per-channel weight scales — come from @ryanontheinside's fp8 work
@@ -267,8 +268,8 @@ and grafted onto this baked / bf16-fused structure by `transplant_scales.py`. Ca
 **speed-free** (31.2 vs the earlier uncalibrated 30.8 ms/fwd, inside run noise) and lifts
 worst-case per-step fidelity — worst-step velocity-cos vs fp32 on adversarial seeds goes
 **0.52/0.57/0.64 → 0.92/0.94/0.92**, with sampling steps 1–7 tracking the fully-calibrated #47
-reference within ~0.001. It is still a **speed tier over the `fp16mixed` default, not a fidelity
-upgrade over it** (single-step velocity cos ~0.92–0.94 < fp16mixed's ~1.0; the 8-step render
+reference within ~0.001. It is still a **speed tier over the `fp16` default, not a fidelity
+upgrade over it** (single-step velocity cos ~0.92–0.94 < fp16's ~1.0; the 8-step render
 stays coherent), but it no longer collapses at the highest-noise first step the way the
 uncalibrated engine did. See the runtime README's precision section for positioning.
 
@@ -329,21 +330,21 @@ merged here). Everyday consumers never recalibrate — they pull the published c
 `sm-music` and `sm-sfx` also ship a selectable **`fp8`** engine (`--precision fp8`), but it is
 **not** the medium's baked-RoPE recipe — those DiTs use standard (non-differential) attention and
 never had the bf16 long-angle RoPE problem, so there is nothing to bake. Their fp8 is a straight
-**graft of fp8 E4M3 Q/DQ onto the linear GEMMs of the known-good `dit_fp16mixed.onnx`** — attention
-stays fp16-fused and the fp32 RMSNorm/RoPE islands are left exactly as the fp16mixed producer made
+**graft of fp8 E4M3 Q/DQ onto the linear GEMMs of the known-good `dit_fp16.onnx`** — attention
+stays fp16-fused and the fp32 RMSNorm/RoPE islands are left exactly as the fp16 producer made
 them. Built `STRONGLY_TYPED` (`build_from_onnx.py sa3-sm-music-fp8` / `sa3-sm-sfx-fp8`); the QDQ
-carry the precision. Identity: 186 fp8 GEMMs + fp16 fused attention + the fp16mixed fp32 islands.
+carry the precision. Identity: 186 fp8 GEMMs + fp16 fused attention + the fp16 fp32 islands.
 
 Positioning is honest: this is a **clean weight-halving tier** (engine 479 vs 936 MB, velocity-cos
-~0.99 vs eager, clip% at or below fp16mixed), only **marginally faster** (~1.10–1.17×) — a small
+~0.99 vs eager, clip% at or below fp16), only **marginally faster** (~1.10–1.17×) — a small
 DiT's ~5 ms forward at batch 1 is overhead-bound, so fp8's GEMM-math savings barely show. Default
-stays `fp16mixed`; fp8 is for when the smaller engine / weight footprint helps. Not seed-reproducible
-vs fp16mixed.
+stays `fp16`; fp8 is for when the smaller engine / weight footprint helps. Not seed-reproducible
+vs fp16.
 
 > ⚠ Do **not** produce these with `build_dit_fp8.py` (#47's ModelOpt path): on the small graphs its
 > island-flatten + reapply does not restore the fp32 islands correctly and the engine collapses to
 > velocity-cos ~0.69 with clipping (the GEMMs are fine — it's the islands). Grafting onto the
-> fp16mixed ONNX keeps the islands correct by construction.
+> fp16 ONNX keeps the islands correct by construction.
 
 **Producer (refresh the ONNX).** `make_dit_fp8_smalldit.py` calibrates per-linear activation scales
 from the eager model (own-domain few-shot prompts + one full render) and grafts the fp8 Q/DQ. Two
@@ -353,7 +354,7 @@ fp16) and floored at 1e-4 (fp16 underflows tiny scales to 0, which TRT rejects):
 ```bash
 python make_dit_fp8_smalldit.py \
     --model-config <ckpt>/model_config.json --checkpoint <ckpt>/model.safetensors \
-    --fp16mixed-onnx onnx/sa3-sm-music/dit_fp16mixed.onnx \
+    --fp16-onnx onnx/sa3-sm-music/dit_fp16.onnx \
     --domain Music --out onnx/sa3-sm-music/dit_fp8.onnx      # --domain SFX for sm-sfx
 ```
 
@@ -362,9 +363,9 @@ python make_dit_fp8_smalldit.py \
 | File | Role | Flow |
 |---|---|---|
 | `build.py` | Interactive menu (default entry point) | consumer |
-| `build_from_onnx.py` | One target → download ONNX from HF + compile to TRT. **For the SA3 DiTs, pulls `dit_fp16mixed.onnx` (the pre-processed island-wrapped graph)** so the consumer just needs to invoke `STRONGLY_TYPED` compilation — no `onnx-graphsurgeon` required | consumer |
+| `build_from_onnx.py` | One target → download ONNX from HF + compile to TRT. **For the SA3 DiTs, pulls `dit_fp16.onnx` (the pre-processed island-wrapped graph)** so the consumer just needs to invoke `STRONGLY_TYPED` compilation — no `onnx-graphsurgeon` required | consumer |
 | `build_dit_profile.py` | Build a DiT with custom `(min, opt, max)` profile shapes (experimental — short-form / fixed-shape variants). Operates on either ONNX flavor. | consumer |
-| `build_dit_fp16mixed.py` | **Producer-side** ONNX surgery: takes the canonical FP32 `dit.onnx`, finds RMSNorm chains + attention `Softmax` + RoPE region, wraps each in `Cast(FP32) ↔ Cast(FP16)` islands, converts non-island weights to FP16, then bounds the RoPE island before QK^T (`bound_attention_core()`, `--no-bound-attn` to skip) so the attention core runs FP16 and TRT's FMHA fuser fires — 96/96 attentions on the medium DiT, 4.3× at L=4096. Writes both the modified `dit_fp16mixed.onnx` AND the TRT engine, which **must** be `STRONGLY_TYPED` (weakly-typed + `BuilderFlag.FP16` re-casts the FP32 islands and silently degrades to naive FP16). Only re-run when the model retrains or the island recipe changes. Requires `onnx` + `onnx-graphsurgeon`. | producer |
+| `build_dit_fp16.py` | **Producer-side** ONNX surgery: takes the canonical FP32 `dit.onnx`, finds RMSNorm chains + attention `Softmax` + RoPE region, wraps each in `Cast(FP32) ↔ Cast(FP16)` islands, converts non-island weights to FP16, then bounds the RoPE island before QK^T (`bound_attention_core()`, `--no-bound-attn` to skip) so the attention core runs FP16 and TRT's FMHA fuser fires — 96/96 attentions on the medium DiT, 4.3× at L=4096. Writes both the modified `dit_fp16.onnx` AND the TRT engine, which **must** be `STRONGLY_TYPED` (weakly-typed + `BuilderFlag.FP16` re-casts the FP32 islands and silently degrades to naive FP16). Only re-run when the model retrains or the island recipe changes. Requires `onnx` + `onnx-graphsurgeon`. | producer |
 | `build_dit_bf16.py` | **Producer-side** shared RoPE-baker for the medium `bf16` AND `fp8` engines: precomputes RoPE's cos/sin in fp64 on the host, freezes them as fp32 constant tables (`--max-t`), rewires the 96 trig sites and lets DCE delete the runtime angle chain — so the trunk runs bf16/fp8 without the long-angle drift. Weights are never loaded (keeps the input's `.data` sidecar). Handles both external `inv_freq` (fp32 `dit.onnx`) and inline (fp8-linear ONNX). Consumer compile: `build_from_onnx.py sa3-m-bf16` / `sa3-m-fp8`. Requires `onnx`. | producer |
 | `make_calib.py` | **Producer-side** FP8 calibration capture: drives the model's own pingpong `generate()` and records the six DiT engine inputs at every sampling step into a `.npz` (real-conditioning, deployment-matched prompts). Feeds `build_dit_fp8.py` (#47). Only re-run for a from-scratch recalibration on a model retrain. Calibration tooling by @ryanontheinside (#47). Requires `torch` + `stable_audio_3`. | producer |
 | `transplant_scales.py` | **Producer-side** fp8 scale transplant: grafts #47's calibrated activation + per-channel weight scales onto the RoPE-baked bakedmin ONNX (matches Linears by weight-initializer name, swaps only the scale VALUES; weights untouched). This is what makes the shipped `dit_fp8.onnx` calibrated while keeping bakedmin's bf16 fused-MHA speed. Scale values / calibration by @ryanontheinside (#47). Requires `onnx`. | producer |
@@ -374,7 +375,66 @@ python make_dit_fp8_smalldit.py \
 | `build_same_s_encoder.py` | Trace + export SAME-S encoder ONNX + build TRT | producer |
 | `build_same_l_decoder.py` | Trace + export SAME-L decoder ONNX (Triton SWA) + build TRT | producer |
 | `build_same_l_encoder.py` | Trace + export SAME-L encoder ONNX (Triton SWA) + build TRT | producer |
-| `build_dit.py <NAME>` | Trace + export DiT FP32 ONNX (cond baked in) + build TRT BF16 engine (legacy; the BF16 output isn't suitable for inference — chain it with `build_dit_fp16mixed.py` afterwards) | producer |
+| `build_dit.py <NAME>` | Trace + export DiT FP32 ONNX (cond baked in) + build TRT BF16 engine (legacy; the BF16 output isn't suitable for inference — chain it with `build_dit_fp16.py` afterwards) | producer |
 | `_arch.py` | Shared: GPU arch detection + path helpers | both |
 | `samel_loader.py` | Helper: load SAME-L from .ckpt | producer |
 | `samel_{encoder,decoder}_onnx.py` | Helper: clean ONNX rewrites of SAME-L blocks | producer |
+
+## Autoencoders: `build_autoencoders.py`
+
+The SAME-L / SAME-S encoders and decoders have their own builder, because they need two
+optimization profiles and (for decoders) a grafted limiter:
+
+```bash
+python build/build_autoencoders.py                 # all 8, auto-detect arch, verify
+python build/build_autoencoders.py --model same-l  # one model
+python build/build_autoencoders.py --list          # show the target table
+```
+
+It is pure consumer flow — download ONNX, compile, verify. **All the complexity is pre-baked into
+the published ONNX**: the decoders arrive deterministic, with the limiter already grafted and its
+ceiling already a baked constant, and the fp8 encoders arrive with `amax`-calibrated activation
+scales. Nothing here needs a checkpoint or calibration audio.
+
+Each engine carries two bands:
+
+| band | decoder | encoder | use |
+|---|---|---|---|
+| 0 | L=1..256 | L=1..256 | chunked, minimum scratch (SAME-L decoder 509 MB) |
+| 1 | L=1..4096 | L=1..4096 | single-shot (SAME-L decoder 8143 MB) |
+
+⚠ The memory saving only appears with `USER_MANAGED` contexts sized by
+`get_device_memory_size_for_profile_v2(band)`. `device_memory_size_v2` is the **max across
+profiles**, so a default context reserves the wide band and the benefit silently disappears.
+`TRTRunner(..., profile=N)` in `scripts/sa3_trt_core.py` does this correctly.
+
+Verification runs by default and checks, per engine: finite non-silent output, correct latent
+count, the two bands agreeing with each other, and — on decoders — that the baked limiter holds
+its 0.977 ceiling. It uses a synthetic harmonic signal, which is a **structural smoke test, not a
+quality measurement**; autoencoder quality has to be measured on real music.
+
+### Regenerating the build-ready ONNX (producer flow)
+
+Only needed after a model retrain or a change to the limiter. Requires the SAME-S/SAME-L
+checkpoints and the calibration audio.
+
+```
+build/limiter/limiter.onnx                exported from the torch reference (65 nodes, 9 KB)
+build/limiter/make_deterministic_sames.py removes SAME-S's RandomNormalLike bottleneck
+build/limiter/graft_limiter.py            splices the limiter in place of the decoder's clip
+build/limiter/make_ceiling_input.py       optional: promote the ceiling to a runtime input
+quantize/recalib_enc_fp8.py               SAME-L fp8 encoder, amax activation scales
+quantize/recalib_enc_sames_fp8.py         SAME-S fp8 encoder, amax activation scales
+quantize/recalib_dec_sames_margin.py      SAME-S fp8 decoder, retighten the amax margin
+```
+
+⚠ The recalibration scripts exist because both fp8 encoders shipped with activation scales derived
+from a percentile rather than `amax` — SAME-L's from p99.9 → p90-across-clips → a 1e-4 floor,
+SAME-S's from a p99.9 over a 400k random subsample. Both discarded the tail of a heavy-tailed
+distribution and cost 0.7 dB and 2.75 dB of round trip respectively. The weight scales were always
+`amax` and were never affected.
+
+⚠ fp8 output is **hypersensitive to activation-scale jitter**: two runs of the same recalibration
+differing in the 6th decimal produce engines 20 dB apart from each other, while scoring within
+0.01 dB of each other against PyTorch fp32. Never A/B two fp8 builds against each other — that
+delta is meaningless. Always measure each against fp32.

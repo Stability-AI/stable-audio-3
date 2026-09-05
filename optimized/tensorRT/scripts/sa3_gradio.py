@@ -22,9 +22,9 @@ import argparse
 import base64
 import math
 import sys
+import html as html_lib
+import subprocess
 import time
-import uuid
-import wave
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -38,6 +38,13 @@ from spec import render_spectrogram_png  # noqa: E402
 OUTPUT_DIR = SCRIPTS_DIR.parent / "output" / "gradio"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 KEEP_RECENT_N = 20
+
+from gradio_ui import (  # backend-agnostic UI layer, forked from optimized/mlx
+    # The other _JS_* constants (promote / pause-others / scroll / playhead) are wired
+    # inside render_player and render_history themselves, so they stay private to that
+    # module; only the two this file attaches to its own events are imported.
+    _JS_FIX_SLIDERS, _save_wav, render_history, render_player, render_queue_status, verbose_basename,
+)
 
 MODELS_ROOT = SCRIPTS_DIR.parent / "models" / canon.ARCH
 
@@ -59,7 +66,7 @@ def discover_variants(dit_name: str) -> list[tuple[str, Path]]:
     """Return [(label, path)] of available DiT engine files for this model.
 
     Scans models/<arch>/<dit_subdir>/dit_*.trt. The canonical engine
-    (dit_fp16mixed.trt) is always first if present; other variants follow
+    (dit_fp16.trt) is always first if present; other variants follow
     alphabetically. For the medium DiT also appends a pseudo-variant
     "pytorch fp32 (GT)" that dispatches to the PyTorch-eager backend.
     """
@@ -69,15 +76,15 @@ def discover_variants(dit_name: str) -> list[tuple[str, Path]]:
     d = MODELS_ROOT / subdir
     if not d.exists():
         return []
-    files = sorted(d.glob("dit_*.trt"))
-    canonical_name = "dit_fp16mixed.trt"
+    files = [f for f in sorted(d.glob("dit_*.trt")) if f.name not in RETIRED_DITS]
+    canonical_name = "dit_fp16.trt"
     canonical = [f for f in files if f.name == canonical_name]
     others = [f for f in files if f.name != canonical_name]
     out = []
     for f in canonical + others:
         label = f.name[len("dit_"):-len(".trt")] if f.name.startswith("dit_") and f.name.endswith(".trt") else f.name
         if f.name == canonical_name:
-            label = "fp16mixed (canonical)"
+            label = "fp16 (canonical)"
         elif "buggy" in f.name:
             label = label + " ← old, broken"
         out.append((label, f))
@@ -87,35 +94,47 @@ def discover_variants(dit_name: str) -> list[tuple[str, Path]]:
     return out
 
 
-def discover_decoder_variants(decoder_name: str) -> list[tuple[str, Path]]:
-    """Return [(label, path)] of available decoder engine files. Scans
-    models/<arch>/<same-s|same-l>/dec_*.trt.
+# Pre-chunkable engines. Removed from the model repo's download path and hidden from the picker.
+RETIRED_DECODERS = {"dec_dynamic_bf16.trt", "dec_dynamic_triton_swa.trt", "dec_dynamic_fp32.trt",
+                    "dec_fp8.trt", "dec_fp8_fast.trt", "dec_dynamic_fp16mixed.trt"}
+# Experimental DiT engines that are not part of the shipped set. "fp16mixed" is the retired name
+# for plain fp16 -- every tier is mixed-precision, so the qualifier only ever meant "old".
+RETIRED_DITS = {"dit_fp16mixed.trt", "dit_fp16_bands4096_32768.trt", "dit_fp16_maxL32768.trt"}
 
-    Canonical (what's referenced by DECODER_PATHS) is always first if present.
-    Naming convention: dec_dynamic_<precision_marker>.trt (e.g.
-    dec_dynamic_bf16.trt, dec_dynamic_fp32.trt, dec_dynamic_triton_swa.trt).
+
+def _precision_of(filename: str) -> str:
+    """Pull the precision token out of an engine filename: dec_fp16_chunkable_limiter -> fp16."""
+    for tok in ("fp32", "fp16", "bf16", "fp8"):
+        if f"_{tok}" in filename:
+            return tok
+    return ""
+
+
+def discover_decoder_variants(decoder_name: str) -> list[tuple[str, Path]]:
+    """Return [(label, path)] of decoder quantization tiers for this decoder —
+    canonical first. Uses the known tier set (canonical / fp8; see quantize/README.md); engines
+    auto-download from HF on selection if missing. Any extra local dec_*.trt not in the known set
+    are appended, so a self-built variant shows up — except the RETIRED pre-chunkable engines,
+    which are filtered out. A leftover copy of one of those in models/ would otherwise appear in
+    the picker and silently serve pre-limiter audio with a 5.7-8.1 GB scratch reservation.
     """
-    d = MODELS_ROOT / decoder_name
-    if not d.exists():
-        return []
-    files = sorted(d.glob("dec_*.trt"))
-    canonical = canon.DECODER_PATHS.get(decoder_name)
-    canonical_name = canonical.name if canonical else ""
-    canonicals = [f for f in files if f.name == canonical_name]
-    others = [f for f in files if f.name != canonical_name]
-    out = []
-    for f in canonicals + others:
-        # Strip 'dec_dynamic_' prefix and '.trt' suffix for the label.
-        stem = f.name
-        if stem.startswith("dec_dynamic_"):
-            label = stem[len("dec_dynamic_"):-len(".trt")]
-        elif stem.startswith("dec_"):
-            label = stem[len("dec_"):-len(".trt")]
-        else:
-            label = stem
-        if f.name == canonical_name:
-            label = f"{label} (canonical)"
-        out.append((label, f))
+    out, known = [], set(RETIRED_DECODERS)
+    for tier, fname in canon.DECODER_TIER_FILENAME.get(decoder_name, {}).items():
+        # Name the tier by the precision it actually is -- SAME-L canonical is fp16, SAME-S is
+        # bf16 -- rather than rendering "canonical (canonical)".
+        prec = _precision_of(fname)
+        label = f"{prec} (canonical)" if tier == "canonical" else (prec or tier)
+        out.append((label, canon.ARCH_DIR / decoder_name / fname))
+        known.add(fname)
+    d = canon.ARCH_DIR / decoder_name
+    if d.exists():
+        for f in sorted(d.glob("dec_*.trt")):
+            if f.name in known:
+                continue
+            stem = f.name
+            label = (stem[len("dec_dynamic_"):-len(".trt")] if stem.startswith("dec_dynamic_")
+                     else stem[len("dec_"):-len(".trt")])
+            out.append((label, f))
     return out
 
 
@@ -128,58 +147,129 @@ def _prune_old_outputs():
             pass
 
 
-def _save_wav(pcm, out_path):
-    with wave.open(str(out_path), "wb") as w:
-        w.setnchannels(2)
-        w.setsampwidth(2)
-        w.setframerate(SAMPLE_RATE)
-        w.writeframes(pcm.tobytes())
-
-
 # ── SA3Inference cache (model+variant → instance) ──────────────────────────
 # Each cached entry holds 5-15 GB of VRAM (engines + persistent graph buffers).
 # H100 80GB fits ~5 sm-music or ~3 medium combos before OOM. We LRU-evict to
 # stay under that limit. Switching back to an evicted variant re-loads (~5-7s).
-_inference_cache: dict[tuple[str, str, str, str], SA3Inference] = {}
+_inference_cache: dict[tuple[str, str, str, str, bool], SA3Inference] = {}
 _inference_lru: list[tuple[str, str, str, str]] = []  # MRU at end
 _INFERENCE_CACHE_MAX = 2
 
 
+def _mb(b):
+    return f"{b / 2**20:,.0f} MB" if b else "—"
+
+
+def render_debug(inf, t_fused, t_stage):
+    """Per-stage ms + VRAM, and what the fused mega-graph costs by comparison.
+
+    ⚠ The stage split is measured on the UNFUSED path, because a captured CUDA graph
+    cannot be instrumented from inside: torch rejects Event.record() during capture, and
+    even cudaEventRecordWithFlags(..., cudaEventRecordExternal) is accepted only to fail
+    at capture_end(). Adding timers would mean splitting the mega-graph into per-stage
+    graphs, which would change the very thing being measured. So debug mode times the
+    same engines run stage-by-stage and reports the fused total beside it — the gap
+    between the two IS the fusion win.
+
+    VRAM is split the same way it is actually paid: engine weights and scratch are
+    resident for the whole process, while `transient` is what a stage allocates on top.
+    """
+    fp = inf.engine_footprint()
+    sv = t_stage.get("stage_vram", {})
+    rows = [("encoder", t_stage.get("encode_ms", 0.0), sv.get("encode"), fp.get("enc")),
+            ("T5Gemma", t_stage.get("t5_ms", 0.0),     sv.get("t5"),     fp.get("t5")),
+            (f"DiT x{t_stage.get('steps', 0)}",
+             t_stage.get("sampling_ms", 0.0), sv.get("dit"), fp.get("dit")),
+            ("decoder", t_stage.get("decode_ms", 0.0), sv.get("decode"), fp.get("dec"))]
+    th = ("padding:3px 10px 3px 0; text-align:right; font-weight:600; "
+          "border-bottom:1px solid rgba(127,127,127,0.3)")
+    td = "padding:2px 10px 2px 0; text-align:right; font-variant-numeric:tabular-nums"
+    out = ['<div style="font-size:0.82em; margin-top:6px">',
+           '<table style="border-collapse:collapse">',
+           f'<tr><th style="{th}; text-align:left">stage</th><th style="{th}">ms</th>'
+           f'<th style="{th}">transient</th><th style="{th}">weights</th>'
+           f'<th style="{th}">scratch</th></tr>']
+    for name, ms, tv, f in rows:
+        if f is None and not ms:
+            continue                              # encoder absent unless a2a/inpaint ran
+        sc = _mb(f["scratch"]) + (" (shared)" if f and f["shared"] else "") if f else "—"
+        out.append(f'<tr><td style="{td}; text-align:left">{html_lib.escape(name)}</td>'
+                   f'<td style="{td}">{ms:,.1f}</td><td style="{td}">{_mb(tv)}</td>'
+                   f'<td style="{td}">{_mb(f["weights"]) if f else "—"}</td>'
+                   f'<td style="{td}">{sc}</td></tr>')
+    # Whatever the four stages do not account for: schedule build, noise, the int16 cast
+    # and the GPU->CPU copy. Shown rather than hidden, so the column sums to the total.
+    unfused = t_stage.get("inference_ms", 0.0)
+    other = unfused - sum(r[1] for r in rows)
+    if other > 0.5:
+        out.append(f'<tr><td style="{td}; text-align:left; opacity:0.7">other '
+                   f'<span style="opacity:0.7">(schedule, noise, int16 cast, GPU→CPU)</span>'
+                   f'</td><td style="{td}; opacity:0.7">{other:,.1f}</td>'
+                   f'<td style="{td}">—</td><td style="{td}">—</td>'
+                   f'<td style="{td}">—</td></tr>')
+    out.append("</table>")
+    shared = fp.get("_shared_scratch", 0)
+    note = []
+    if t_fused.get("eager"):
+        note.append("this render used the eager path (CFG / audio-to-audio / inpaint), "
+                    "so the breakdown IS the render — no second pass was run")
+    else:
+        fused = t_fused.get("inference_ms", 0.0)
+        gain = f"{unfused / fused:.2f}x faster" if fused > 0 else ""
+        note.append(f"unfused {unfused:,.1f} ms &nbsp;·&nbsp; "
+                    f"<b>fused mega-graph {fused:,.1f} ms</b> ({gain})")
+    note.append(f"shared scratch {_mb(shared)} — one buffer for every engine above, so the "
+                f"scratch column does not sum")
+    note.append("a captured graph allocates nothing at replay, so the mega-graph's peak "
+                "VRAM equals its resident footprint")
+    out += [f'<div style="color:#888; margin-top:4px">{n}</div>' for n in note]
+    out.append("</div>")
+    return "".join(out)
+
+
 def _evict_inference(key):
-    """Free the engines + caches held by a cached SA3Inference before dropping it."""
+    """Free the engines + caches held by a cached SA3Inference before dropping it.
+
+    The teardown ORDER is load-bearing and lives in SA3Inference.close(): captured CUDA
+    graphs and the eager contexts must go before the runners whose contexts and shared
+    scratch they point into. This used to free the runners first and clear the graphs
+    after, which poisoned the CUDA context — the next render in a *different* instance
+    died with `an illegal memory access was encountered`, so switching models past the
+    cache limit bricked the server until restart.
+    """
     inf = _inference_cache.pop(key, None)
     if inf is None:
         return
-    # Free TRT engines (each runner has a .free() that releases the device buffer).
-    for name, runner in list(inf.runners.items()):
-        try:
-            runner.free()
-        except Exception:
-            pass
-    # Drop cached graphs (their persistent buffers will be freed when GC'd).
-    inf._graphs.clear()
-    inf._graph_lru.clear()
+    try:
+        inf.close()
+    except Exception as e:
+        print(f"    (eviction cleanup raised {type(e).__name__}: {e})")
     del inf
     import gc
     gc.collect()
-    try:
-        canon.torch.cuda.empty_cache()
-        canon.torch.cuda.synchronize()
-    except Exception:
-        pass
+
+
+# Set once from --chunking in main(). A module-level default keeps it out of every call site
+# and out of the UI, which is right: it is a deployment choice (memory vs speed), not a per-render
+# one -- switching it means selecting a different optimization profile, so the engines reload.
+_CHUNKING = True
 
 
 def get_inference(dit: str, decoder: str, dit_variant_path: str,
                    dec_variant_path: str,
                    default_T_lat: int, default_steps: int,
-                   default_seconds: float, quiet: bool) -> SA3Inference:
+                   default_seconds: float, quiet: bool,
+                   chunking: bool | None = None) -> SA3Inference:
     """Return a warm SA3Inference, building (and caching) if not yet loaded.
 
     The cache key is (dit, decoder, dit_variant_path, dec_variant_path) so
     swapping either the DiT *or* the decoder variant triggers a fresh load.
     LRU eviction caps the cache at _INFERENCE_CACHE_MAX entries.
     """
-    key = (dit, decoder, dit_variant_path, dec_variant_path)
+    chunking = _CHUNKING if chunking is None else chunking
+    # chunking is part of the key: it selects the profile, so the two modes are different
+    # contexts with different scratch and cannot share a cached SA3Inference.
+    key = (dit, decoder, dit_variant_path, dec_variant_path, chunking)
     if key in _inference_cache:
         if key in _inference_lru:
             _inference_lru.remove(key)
@@ -196,10 +286,19 @@ def get_inference(dit: str, decoder: str, dit_variant_path: str,
     # Override the canonical engine path lookups before constructing.
     canon.DIT_CHOICES[dit]["engine"] = Path(dit_variant_path)
     canon.DECODER_PATHS[decoder] = Path(dec_variant_path)
+    dec_tier = canon.decoder_tier_from_filename(decoder, Path(dec_variant_path).name)
     print(f"\n  → loading SA3Inference({dit!r}, {decoder!r}, "
           f"dit={Path(dit_variant_path).name}, "
-          f"dec={Path(dec_variant_path).name})")
+          f"dec={Path(dec_variant_path).name}, tier={dec_tier})")
     inf = SA3Inference(dit, decoder,
+                        dec_precision=dec_tier,
+                        chunking=chunking,
+                        # pass the picked files explicitly -- mutating canon.DIT_CHOICES /
+                        # DECODER_PATHS above does not reach the resolver, so the dropdowns
+                        # were silently ignored for the DiT.
+                        dit_engine=(None if str(dit_variant_path).startswith("<")
+                                    else dit_variant_path),
+                        dec_engine=dec_variant_path,
                         default_T_lat=default_T_lat,
                         default_steps=default_steps,
                         default_seconds=default_seconds,
@@ -210,12 +309,27 @@ def get_inference(dit: str, decoder: str, dit_variant_path: str,
 
 
 # ── Gradio UI ──────────────────────────────────────────────────────────────
+_css = ("#sa3-promote{display:none !important}"
+            "#sa3-out{gap:4px !important}"
+            "#sa3-out .html-container{padding:0 !important; margin:0 !important}"
+            # the queued chip is clickable once a take is ready — say so on hover/focus
+            ".sa3-queued{transition:background 0.12s, color 0.12s}"
+            ".sa3-queued:hover,.sa3-queued:focus{background:rgba(127,127,127,0.22) !important;"
+            "color:#bbb !important; outline:none}")
+
+
 def build_ui(initial_dit: str, initial_decoder: str, *,
              share: bool, quiet: bool,
              default_T_lat: int, default_steps: int, default_seconds: float):
+    """Same UI as the MLX gradio -- history, a pre-rendered next take, radio mode, the rich
+    player -- over the TensorRT backend, plus the controls only TRT has (engine variant per
+    model, decoder quantisation tier, chunked vs single-shot).
+
+    No LoRA panel: the TRT engines carry no LoRA branches, so there is nothing to hot-swap
+    without first building refit-capable or branch-capable engines.
+    """
     import gradio as gr
 
-    # Pre-warm the initial bundle so the first user click is fast.
     initial_variants = discover_variants(initial_dit)
     if not initial_variants:
         raise RuntimeError(f"no DiT engines found for {initial_dit} under {MODELS_ROOT}")
@@ -224,214 +338,338 @@ def build_ui(initial_dit: str, initial_decoder: str, *,
     if not initial_dec_variants:
         raise RuntimeError(f"no decoder engines found for {initial_decoder} under {MODELS_ROOT}")
     initial_dec_variant_path = str(initial_dec_variants[0][1])
-    get_inference(initial_dit, initial_decoder,
-                   initial_variant_path, initial_dec_variant_path,
-                   default_T_lat, default_steps, default_seconds, quiet)
+    get_inference(initial_dit, initial_decoder, initial_variant_path,
+                  initial_dec_variant_path, default_T_lat, default_steps,
+                  default_seconds, quiet)
 
     DIT_OPTIONS = list(DEFAULT_DECODERS.keys())
+    # The DiT profile runs L=1..4096 and every shipped chunkable autoencoder reports a
+    # floor of 1 latent, so 1 s is the honest slider minimum. It used to be 3 s, derived
+    # from the stale DECODER_MIN_L=32 that SA3Inference._dec_min_L() was returning because
+    # of a TypeError it swallowed; the guard reads the real per-engine floor now, so an
+    # older engine with a genuine 32 floor still gets rejected with a clear message.
+    MIN_SECONDS = 1
+    MAX_SECONDS = SA3Inference.DIT_MAX_L * SAMPLES_PER_LATENT / SAMPLE_RATE // 1      # 380 s
 
     def on_dit_change(dit_name):
-        """When user picks a new DiT, refresh the DiT-variant dropdown + suggest decoder."""
         variants = discover_variants(dit_name)
-        suggested_decoder = DEFAULT_DECODERS.get(dit_name, "same-s")
-        dec_variants = discover_decoder_variants(suggested_decoder)
-        var_update = (gr.update(choices=[(lbl, str(p)) for lbl, p in variants],
-                                 value=str(variants[0][1]))
-                       if variants else gr.update(choices=[], value=None))
-        dec_var_update = (gr.update(choices=[(lbl, str(p)) for lbl, p in dec_variants],
-                                     value=str(dec_variants[0][1]))
-                          if dec_variants else gr.update(choices=[], value=None))
-        return var_update, gr.update(value=suggested_decoder), dec_var_update
+        suggested = DEFAULT_DECODERS.get(dit_name, "same-s")
+        dec_variants = discover_decoder_variants(suggested)
+        var_u = (gr.update(choices=[(l, str(p)) for l, p in variants], value=str(variants[0][1]))
+                 if variants else gr.update(choices=[], value=None))
+        dec_u = (gr.update(choices=[(l, str(p)) for l, p in dec_variants],
+                           value=str(dec_variants[0][1]))
+                 if dec_variants else gr.update(choices=[], value=None))
+        return var_u, gr.update(value=suggested), dec_u
 
     def on_decoder_change(decoder_name):
-        """When user picks a new decoder, refresh decoder-variant choices."""
-        dec_variants = discover_decoder_variants(decoder_name)
-        if not dec_variants:
+        dv = discover_decoder_variants(decoder_name)
+        if not dv:
             return gr.update(choices=[], value=None)
-        return gr.update(choices=[(lbl, str(p)) for lbl, p in dec_variants],
-                          value=str(dec_variants[0][1]))
+        return gr.update(choices=[(l, str(p)) for l, p in dv], value=str(dv[0][1]))
 
-    def generate(dit_name, decoder_name, variant_path, dec_variant_path,
-                 prompt, seconds, steps, seed_text):
-        if not prompt or not prompt.strip():
-            return "", "", "", "<span style='color:#f88'>error: empty prompt</span>"
+    def on_seconds_change(sec):
+        """Keep the inpaint range inside the clip length."""
+        return gr.update(maximum=float(sec)), gr.update(maximum=float(sec))
+
+    # ── one generation, packaged as a history entry ──────────────────────────────────────────
+    def _entry(dit_name, decoder_name, variant_path, dec_variant_path, prompt, negative_prompt,
+               seconds, steps, seed_text, cfg, apg, sigma_max, chunking, fmt,
+               a2a_path, a2a_sigma, inpaint_path, inp_start, inp_end, debug=False):
+        # An empty prompt is a legitimate request, not an error: it generates
+        # unconditionally. The encoder takes the empty string happily, and both
+        # renderers already caption it "(no prompt)".
+        prompt = (prompt or "").strip()
         try:
             seed = int(seed_text.strip()) if seed_text and seed_text.strip() else None
         except ValueError:
-            return "", "", "", "<span style='color:#f88'>error: seed must be an integer</span>"
-
-        # PT-eager dispatch (if the user picked the GT pseudo-variant).
-        is_pt_eager = str(variant_path) == PT_EAGER_VARIANT
-        load_ms = 0.0
-        t0 = time.time()
+            return None, "seed must be an integer"
+        if str(variant_path) == PT_EAGER_VARIANT:
+            return None, "PT FP32 GT is not wired through this backend yet"
         try:
-            if is_pt_eager:
-                if dit_name != "medium":
-                    return "", "", "", ("<span style='color:#f88'>PT FP32 GT is currently "
-                                          "only wired for medium DiT.</span>")
-                from pt_inference import get_pt_inference
-                inf = get_pt_inference()
-                load_ms = (time.time() - t0) * 1000
-            else:
-                inf = get_inference(dit_name, decoder_name, variant_path, dec_variant_path,
-                                     default_T_lat, default_steps, default_seconds, quiet)
-                load_ms = (time.time() - t0) * 1000
+            inf = get_inference(dit_name, decoder_name, str(variant_path), str(dec_variant_path),
+                                default_T_lat, default_steps, default_seconds, quiet,
+                                chunking=bool(chunking))
         except Exception as e:
-            return "", "", "", f"<span style='color:#f88'>load failed: {type(e).__name__}: {e}</span>"
+            return None, f"load failed: {type(e).__name__}: {e}"
 
-        # Run.
+        # Which reference wins, and -- just as important -- SAY SO when something the user
+        # supplied is being dropped. Silently falling through to a different mode is the
+        # worst outcome here: upload an inpaint reference, forget the range sliders, and a
+        # bare if/elif quietly runs audio-to-audio instead.
+        #
+        # The engines take ONE reference (generate_eager reads a single init_audio_path and
+        # derives the inpaint keep-mask from its latents), so inpaint and audio-to-audio
+        # cannot use two different files the way the MLX backend can.
+        kw, mode, notes = {}, "text-to-audio", []
+        sec = float(seconds)
+        rng = None
+        if inpaint_path and float(inp_end) > float(inp_start) and float(inp_start) < sec:
+            if float(inp_end) > sec:
+                notes.append(f"inpaint end clamped to the clip length ({sec:g}s)")
+            rng = (float(inp_start), float(min(float(inp_end), sec)))
+        elif inpaint_path and float(inp_end) <= float(inp_start):
+            notes.append("inpainting ignored — set the start/end range sliders")
+        elif inpaint_path:
+            notes.append(f"inpainting ignored — start ({float(inp_start):g}s) is past "
+                         f"the end of the clip ({sec:g}s)")
+        elif float(inp_end) > float(inp_start):
+            notes.append("inpaint range ignored — no reference audio uploaded")
+
+        if rng is not None:
+            kw = dict(init_audio_path=inpaint_path, inpaint_range=rng,
+                      init_noise_level=float(sigma_max))
+            mode = "inpaint"
+            if a2a_path:
+                notes.append("using the inpaint reference — one reference per render, and "
+                             "inpainting needs it to keep the untouched part")
+        elif a2a_path:
+            # a2a's own slider IS the schedule start (parent-repo semantics), so it
+            # overrides sigma_max rather than stacking with it.
+            kw = dict(init_audio_path=a2a_path, init_noise_level=float(a2a_sigma))
+            mode = "audio-to-audio"
+            if float(sigma_max) != 1.0:
+                notes.append(f"sigma_max {float(sigma_max):g} ignored — audio-to-audio uses "
+                             f"its own noise level ({float(a2a_sigma):g})")
+        elif float(sigma_max) != 1.0:
+            kw = dict(init_noise_level=float(sigma_max))
+        neg = (negative_prompt or "").strip()
+        if float(cfg) != 1.0:
+            kw.update(cfg=float(cfg), apg=float(apg), negative_prompt=neg or None)
+        elif neg:
+            notes.append("negative prompt ignored — it only applies when CFG > 1")
         try:
-            pcm, t = inf.generate(prompt.strip(), seconds=float(seconds),
-                                   steps=int(steps), seed=seed)
+            pcm, t = inf.generate(prompt, seconds=float(seconds), steps=int(steps),
+                                  seed=seed, **kw)
         except NotImplementedError as e:
-            return "", "", "", f"<span style='color:#f88'>not yet implemented: {e}</span>"
+            return None, f"not supported by this engine: {e}"
         except Exception as e:
-            return "", "", "", f"<span style='color:#f88'>error: {type(e).__name__}: {e}</span>"
+            return None, f"{type(e).__name__}: {e}"
 
-        # WAV (persist + base64 inline)
-        out_path = OUTPUT_DIR / f"sa3-{uuid.uuid4().hex[:10]}.wav"
+        debug_html = ""
+        if debug:
+            try:
+                # Reuse the seed so the second pass is the same take, then hand both timing
+                # dicts to the renderer. When the render already went eager there is nothing
+                # to compare against, so skip the extra pass entirely.
+                if not t.get("eager") and not getattr(inf, "_debug_warmed", False):
+                    # First eager call on this instance builds the _SecondContext set and its
+                    # buffers. Timing that pass charges ~600 ms of one-off setup to "unfused"
+                    # and makes the fusion win look far bigger than it is. Burn one pass.
+                    inf.generate_eager(prompt, seconds=float(seconds), steps=int(steps),
+                                       seed=t["seed"], **kw)
+                    inf._debug_warmed = True
+                t_stage = t if t.get("eager") else inf.generate_eager(
+                    prompt, seconds=float(seconds), steps=int(steps), seed=t["seed"], **kw)[1]
+                debug_html = render_debug(inf, t, t_stage)
+            except Exception as e:
+                debug_html = (f"<div style='color:#e8a33d; font-size:0.82em'>debug pass failed: "
+                              f"{html_lib.escape(type(e).__name__)}: {html_lib.escape(str(e))}</div>")
+        base = verbose_basename(prompt or "unconditional", neg,
+                                float(cfg), float(sigma_max), t["seed"])
+        out_path = OUTPUT_DIR / f"{base}.wav"
         _save_wav(pcm, out_path)
-        _prune_old_outputs()
-        wav_bytes = out_path.read_bytes()
-        b64 = base64.b64encode(wav_bytes).decode("ascii")
-        audio_html = (
-            f'<audio controls autoplay style="width:100%" '
-            f'src="data:audio/wav;base64,{b64}"></audio>'
-            f'<div style="font-size:0.85em; margin-top:4px; color:#888">'
-            f'{len(wav_bytes)/1e6:.1f} MB · right-click or use player menu to download'
-            f'</div>'
-        )
-
-        # Spectrogram (Underfit algorithm)
+        if fmt in ("flac", "mp3"):
+            conv = out_path.with_suffix("." + fmt)
+            rc = subprocess.run(["ffmpeg", "-y", "-loglevel", "error",
+                                 "-i", str(out_path), str(conv)],
+                                capture_output=True).returncode
+            if rc == 0 and conv.exists():
+                out_path = conv
+        mime = {"wav": "audio/wav", "flac": "audio/flac", "mp3": "audio/mpeg"}[out_path.suffix[1:]]
         try:
             t0 = time.time()
-            spec_png = render_spectrogram_png(pcm, sample_rate=SAMPLE_RATE,
-                                                width=1200, height=240)
+            png = render_spectrogram_png(pcm, sample_rate=SAMPLE_RATE, width=1400, height=280)
+            spec_b64 = base64.b64encode(png).decode("ascii")
             spec_ms = (time.time() - t0) * 1000
-            spec_b64 = base64.b64encode(spec_png).decode("ascii")
-            spec_html = (
-                f'<img src="data:image/png;base64,{spec_b64}" '
-                f'style="width:100%; image-rendering:pixelated; border:1px solid #333" '
-                f'alt="spectrogram"/>'
-                f'<div style="font-size:0.75em; color:#666; margin-top:2px">'
-                f'underfit-style 3-band tinted stereo mel spec · '
-                f'red=bass / green=mid / blue=high · L on top, R on bottom · '
-                f'rendered in {spec_ms:.0f} ms</div>'
-            )
-        except Exception as e:
-            spec_html = (f"<span style='color:#fa3'>spectrogram failed: "
-                          f"{type(e).__name__}: {e}</span>")
+        except Exception:
+            spec_b64, spec_ms = "", 0.0
+        timing = (f"engine-load {t.get('graph_build_ms', 0):.0f} ms &nbsp;·&nbsp; "
+                  f"Inference : {t['inference_ms']:.1f} ms &nbsp;·&nbsp; "
+                  f"{t.get('realtime', 0):.0f}× realtime &nbsp;·&nbsp; "
+                  f"seed : {t['seed']} &nbsp;·&nbsp; T_lat : {t['T_lat']} &nbsp;·&nbsp; "
+                  f"samples : {t['samples']} &nbsp;·&nbsp; spec {spec_ms:.0f} ms")
+        return {
+            "notes": notes, "debug_html": debug_html,
+            "key": f"k{time.time_ns()}", "ts": time.time(), "dit": dit_name,
+            "neg": neg, "cfg": float(cfg), "smx": float(sigma_max),
+            "path": str(out_path), "mime": mime, "name": out_path.name,
+            "size_mb": out_path.stat().st_size / 1e6, "mode": mode,
+            "prompt": prompt, "seed": t["seed"],
+            "lora": "",                       # kept for the shared renderer's contract
+            "spec_b64": spec_b64, "timing": timing,
+        }, None
 
-        # Timing
-        load_note = (f"engine-load {load_ms:.0f} ms ·&nbsp; "
-                     if load_ms > 100 else "")
-        build_note = (f"graph-build {t['graph_build_ms']:.0f} ms ·&nbsp; "
-                      if t.get("graph_build_ms", 0) > 1 else "")
-        backend_tag = (
-            "<span style='background:#fae;color:#603;padding:1px 6px;border-radius:3px'>"
-            "PT FP32 GT (vanilla eager)</span> &nbsp; "
-            if is_pt_eager else ""
-        )
-        pt_breakdown = (
-            f" &nbsp;<span style='color:#888'>(t5={t.get('t5_ms', 0):.0f} ms · "
-            f"sample={t.get('sampling_ms', 0):.0f} ms · "
-            f"decode={t.get('decode_ms', 0):.0f} ms)</span>"
-            if is_pt_eager else ""
-        )
-        timing_html = (
-            f"{backend_tag}{load_note}{build_note}"
-            f"<b>Inference</b>: {t['inference_ms']:.1f} ms{pt_breakdown} ·&nbsp; "
-            f"<b>{t['realtime']:.0f}× realtime</b> ·&nbsp; "
-            f"<b>seed</b>: <code>{t['seed']}</code> ·&nbsp; "
-            f"<b>T_lat</b>: {t['T_lat']} ·&nbsp; "
-            f"<b>samples</b>: {t['samples']}"
-        )
-        if t["T_lat"] < 256:
-            timing_html += (" ·&nbsp; <span style='color:#fa3'>warning: T_lat &lt; 256 "
-                            "is below the DiT's trained range; output quality "
-                            "is undefined.</span>")
-        return audio_html, spec_html, timing_html, ""
+    def _present(state, entry, opts, queued_panel, *, force_autoplay=False):
+        """(player, timing, error, history, queued, state) for the shared renderers."""
+        auto = force_autoplay or ("Auto-play" in (opts or []))
+        radio = "Radio" in (opts or [])
+        loop = "Loop" in (opts or [])
+        hist = state.get("history", [])
+        player = render_player(entry, autoplay=auto, radio=radio, advance=radio, loop=loop,
+                               autodl=("Auto-download" in (opts or []))) if entry else ""
+        note_html = "".join(
+            f"<div style='color:#e8a33d;font-size:0.85em'>note: {html_lib.escape(n)}</div>"
+            for n in (entry.get("notes") or [])) if entry else ""
+        return (player, (entry.get("timing", "") + note_html
+                         + entry.get("debug_html", "")) if entry else "", "",
+                render_history(hist, advance=radio, loop=loop),
+                queued_panel, state)
 
-    with gr.Blocks(title=f"SA3 TRT — debug") as demo:
-        gr.Markdown(
-            "# SA3 TRT — debug build\n"
-            "Loaded engines auto-cache by (model, variant). First switch to a "
-            "new combo is slow (~5-7s); subsequent uses replay in ~30-100 ms."
-        )
+    CTRL = None  # bound after the widgets exist
 
+    def _sig(ctrl):
+        """What the queued take was rendered FROM.
+
+        A pre-rendered take is only reusable while the controls still describe it. Serving
+        it blind means the click after any edit silently returns the OLD settings: generate
+        30 s, drag Seconds to 380, hit Generate, and you get 30 s of audio back. Everything
+        in CTRL is a str/float/bool/None (audio inputs are filepaths), so str() over the
+        tuple is a sound identity -- and it fails CLOSED, since anything it cannot compare
+        simply looks different and forces a fresh render.
+        """
+        return tuple(str(c) for c in ctrl)
+
+    _BLANK = {"current": None, "queued": None, "queued_sig": None, "history": []}
+
+    def generate(*args):
+        *ctrl, opts, state = args
+        state = dict(state or _BLANK)
+        q = state.get("queued")
+        if q is not None and state.get("queued_sig") == _sig(ctrl):
+            # still the same request — show the pre-rendered take instantly
+            state["queued"] = state["queued_sig"] = None
+            state["current"] = q
+            state["history"] = ([q] + state.get("history", []))[:24]
+            return _present(state, q, opts, render_queue_status(generating=True),
+                            force_autoplay=True)
+        # a control moved since it was queued: that take answers a question no longer
+        # being asked, so drop it and render what the controls say now.
+        state["queued"] = state["queued_sig"] = None
+        entry, err = _entry(*ctrl)
+        if err:
+            return ("", "", f"<span style='color:#f88'>error: {html_lib.escape(err)}</span>",
+                    render_history(state.get("history", [])), render_queue_status(), state)
+        state["current"] = entry
+        state["history"] = ([entry] + state.get("history", []))[:24]
+        return _present(state, entry, opts, render_queue_status(), force_autoplay=True)
+
+    def pregen(*args):
+        """Render the NEXT take in the background so the following click is instant."""
+        *ctrl, opts, state = args
+        state = dict(state or _BLANK)
+        if ctrl[-1]:
+            # Debug mode already renders twice (fused + unfused). Pre-rendering on top would
+            # make it four renders per click for a take whose numbers may never be looked at.
+            return "", state
+        sig = _sig(ctrl)
+        if state.get("queued") is not None and state.get("queued_sig") == sig:
+            return render_queue_status(state["queued"]), state
+        entry, err = _entry(*ctrl)
+        state["queued"] = entry if not err else None
+        state["queued_sig"] = sig if not err else None
+        return render_queue_status(state.get("queued")), state
+
+    with gr.Blocks(title="SA3 · TensorRT", css=_css) as demo:
+        st = gr.State(dict(_BLANK))
         with gr.Row():
             with gr.Column(scale=3):
                 with gr.Row():
                     dit_dd = gr.Dropdown(label="DiT model", choices=DIT_OPTIONS,
-                                          value=initial_dit, scale=1)
-                    decoder_dd = gr.Dropdown(label="Decoder",
-                                              choices=["same-s", "same-l"],
-                                              value=initial_decoder, scale=1)
+                                         value=initial_dit, scale=1)
+                    dec_dd = gr.Dropdown(label="Decoder", choices=["same-s", "same-l"],
+                                         value=initial_decoder, scale=1)
                 with gr.Row():
-                    variant_dd = gr.Dropdown(label="DiT variant",
-                                              choices=[(lbl, str(p)) for lbl, p in initial_variants],
-                                              value=initial_variant_path, scale=1)
-                    dec_variant_dd = gr.Dropdown(label="Decoder variant",
-                                                  choices=[(lbl, str(p)) for lbl, p in initial_dec_variants],
-                                                  value=initial_dec_variant_path, scale=1)
-
-                prompt = gr.Textbox(label="Prompt", lines=2,
-                                     placeholder="e.g. 'Death Metal'")
+                    var_dd = gr.Dropdown(label="DiT variant", allow_custom_value=True,
+                                         choices=[(l, str(p)) for l, p in initial_variants],
+                                         value=initial_variant_path, scale=1)
+                    dec_var_dd = gr.Dropdown(label="Decoder variant", allow_custom_value=True,
+                                             choices=[(l, str(p)) for l, p in initial_dec_variants],
+                                             value=initial_dec_variant_path, scale=1)
                 with gr.Row():
-                    seconds = gr.Slider(label="Seconds", minimum=1, maximum=120,
-                                         value=120, step=1)
-                    steps = gr.Slider(label="Steps", minimum=1, maximum=16,
-                                       value=8, step=1)
-                seed = gr.Textbox(label="Seed (optional, blank = random)",
-                                   max_lines=1, value="1")
+                    prompt = gr.Textbox(label="Prompt", lines=2, scale=6,
+                                        placeholder="warm analog house groove")
+                    seed = gr.Textbox(label="Seed (optional)", max_lines=1, value="", scale=1)
+                with gr.Row():
+                    seconds = gr.Slider(label="Seconds", minimum=MIN_SECONDS,
+                                        maximum=MAX_SECONDS, step=1,
+                                        value=default_seconds, scale=2)
+                    steps = gr.Slider(label="Steps", minimum=1, maximum=16, step=1,
+                                      value=default_steps, scale=1)
+                    cfg = gr.Slider(label="CFG", minimum=0.0, maximum=10.0, step=0.1,
+                                    value=1.0, scale=1)
+                with gr.Accordion("Advanced", open=False):
+                    with gr.Row():
+                        apg = gr.Slider(label="APG (only applies when CFG > 1)",
+                                        minimum=0.0, maximum=1.0, step=0.05, value=1.0)
+                        sigma_global = gr.Slider(label="sigma_max", minimum=0.05, maximum=1.0,
+                                                 step=0.05, value=1.0)
+                    negative_prompt = gr.Textbox(label="Negative prompt", lines=1)
+                    debug = gr.Checkbox(
+                        label="Debug: per-stage ms + VRAM", value=False,
+                        info="Adds a stage table under the timings. The mega-graph cannot be "
+                             "instrumented from inside (a captured graph rejects event records), "
+                             "so the split is measured by re-running the same engines unfused — "
+                             "which roughly doubles the render. The fused total is shown beside "
+                             "it, so the gap is the fusion win.")
+                    chunking = gr.Checkbox(
+                        label="Chunked decode (low VRAM)", value=True,
+                        info="On: 256-latent windows — 485 MB of decoder scratch on SAME-L, 346 MB "
+                             "on SAME-S. Off: single-shot on the wide profile — only 2-5% faster "
+                             "end-to-end (the DiT dominates), but 5-7 GB more resident. The scratch "
+                             "is a profile-ceiling reservation, so switching it off costs the same "
+                             "at 30 s as at 380 s.")
+                with gr.Accordion("Audio-to-audio (guide the whole clip)", open=False):
+                    a2a_audio = gr.Audio(label="Guide audio — generation starts from its latents",
+                                         type="filepath")
+                    a2a_sigma = gr.Slider(label="sigma_max (lower = closer to the guide)",
+                                          minimum=0.05, maximum=1.0, step=0.05, value=0.6)
+                with gr.Accordion("Inpainting (regenerate a span)", open=False):
+                    inpaint_audio = gr.Audio(label="Reference audio", type="filepath")
+                    with gr.Row():
+                        inp_start = gr.Slider(label="Start (s)", minimum=0,
+                                              maximum=default_seconds, step=0.5, value=0)
+                        inp_end = gr.Slider(label="End (s)", minimum=0,
+                                            maximum=default_seconds, step=0.5, value=0)
+                with gr.Accordion("Output", open=False):
+                    output_opts = gr.CheckboxGroup(
+                        label="Playback", choices=["Auto-play", "Radio", "Loop", "Auto-download"],
+                        value=["Auto-play"])
+                    file_format = gr.Radio(label="File format", choices=["wav", "flac", "mp3"],
+                                           value="wav")
                 generate_btn = gr.Button("Generate", variant="primary", size="lg")
-
-                with gr.Accordion("Advanced (coming soon)", open=False):
-                    gr.Markdown(
-                        "These don't work yet — wiring through SA3Inference.generate "
-                        "for CFG / negative prompt / init audio / inpaint coming next."
-                    )
-                    gr.Slider(label="CFG", minimum=1.0, maximum=10.0, value=1.0,
-                              step=0.1, interactive=False)
-                    gr.Textbox(label="Negative prompt", interactive=False)
-                    gr.Slider(label="Init noise level (σmax)", minimum=0.1,
-                              maximum=1.2, value=1.0, step=0.05, interactive=False)
-                    gr.Audio(label="Init audio", type="filepath", interactive=False)
-                    gr.Textbox(label="Inpaint range", interactive=False)
-
-            with gr.Column(scale=2):
-                gr.Markdown("**Audio**")
-                output_audio = gr.HTML()
-                gr.Markdown("**Spectrogram** (Underfit-style)")
-                output_spec = gr.HTML()
+                promote_btn = gr.Button("", elem_id="sa3-promote")   # CSS-hidden, DOM-present
+            with gr.Column(scale=4):
+                output_player = gr.HTML()
                 timing = gr.HTML()
                 error_box = gr.HTML()
+                queued_html = gr.HTML()
+                history_html = gr.HTML()
 
-        # Wire pickers to refresh dependent dropdowns
-        dit_dd.change(on_dit_change, inputs=[dit_dd],
-                       outputs=[variant_dd, decoder_dd, dec_variant_dd])
-        decoder_dd.change(on_decoder_change, inputs=[decoder_dd],
-                           outputs=[dec_variant_dd])
+        dit_dd.change(on_dit_change, inputs=[dit_dd], outputs=[var_dd, dec_dd, dec_var_dd])
+        dec_dd.change(on_decoder_change, inputs=[dec_dd], outputs=[dec_var_dd])
+        seconds.change(on_seconds_change, inputs=[seconds], outputs=[inp_start, inp_end]
+                       ).then(None, js=_JS_FIX_SLIDERS)
 
-        generate_btn.click(generate,
-                            inputs=[dit_dd, decoder_dd, variant_dd, dec_variant_dd,
-                                     prompt, seconds, steps, seed],
-                            outputs=[output_audio, output_spec, timing, error_box])
+        CTRL = [dit_dd, dec_dd, var_dd, dec_var_dd, prompt, negative_prompt, seconds, steps,
+                seed, cfg, apg, sigma_global, chunking, file_format,
+                a2a_audio, a2a_sigma, inpaint_audio, inp_start, inp_end, debug]
+        main_out = [output_player, timing, error_box, history_html, queued_html, st]
+        # ⚠ js= takes a JS *function expression* ("() => ...") — gradio evaluates it as one.
+        # _JS_TRY_PLAY is an inline-attribute body (bare statements, `this` = the <audio>),
+        # so passing it here is a syntax error that kills the whole frontend: the config
+        # fails to evaluate and the page sits on "Loading..." forever with zero controls.
+        # The autoplay rescue belongs where it already is — render_player's oncanplay.
+        for btn in (generate_btn, promote_btn):
+            btn.click(generate, inputs=CTRL + [output_opts, st], outputs=main_out
+                      ).then(pregen, inputs=CTRL + [output_opts, st],
+                             outputs=[queued_html, st]
+                      ).then(None, js=_JS_FIX_SLIDERS)
+        gr.Markdown("Renders are written to `output/`. **Radio** auto-advances to the next take as "
+                    "each finishes; the next one is pre-rendered while you listen.")
 
-        gr.Markdown(
-            "<p style='color:#888; font-size:0.85em'>"
-            "WAVs saved under <code>output/gradio/</code> "
-            f"(rotates after {KEEP_RECENT_N} files). "
-            "Variant dropdown auto-scans <code>models/&lt;arch&gt;/&lt;dit&gt;/dit_*.trt</code>."
-            "</p>"
-        )
-
-    demo.queue(max_size=16).launch(share=share, server_name="0.0.0.0",
-                                     theme=gr.themes.Soft(),
-                                     prevent_thread_lock=False,
-                                     show_error=True)
-
-
+    demo.queue(max_size=16).launch(share=share, server_name="0.0.0.0", show_error=True,
+                                   allowed_paths=[str(OUTPUT_DIR)])
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -445,8 +683,14 @@ def main():
     ap.add_argument("--default-steps", type=int, default=8)
     ap.add_argument("--share", action=argparse.BooleanOptionalAction, default=True,
                     help="Create a public gradio.live URL (default on)")
+    ap.add_argument("--chunking", action=argparse.BooleanOptionalAction, default=True,
+                    help="SAME-L: decode/encode in windows on the engines' low profile "
+                         "(509 MB of decoder scratch instead of 8143). --no-chunking uses the "
+                         "wide profile: single-shot, faster above L=256, ~5.4 GB more resident.")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
+    global _CHUNKING
+    _CHUNKING = args.chunking
 
     if args.decoder is None:
         args.decoder = DEFAULT_DECODERS[args.dit]

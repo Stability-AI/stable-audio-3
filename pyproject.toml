@@ -68,3 +68,11 @@ exclude = [
     "stable_audio_3/training",
     "optimized",
 ]
+
+[tool.ruff.lint]
+# Pin the ruleset to the classic essentials. Newer ruff's *default* select is broad
+# (I/UP/B/SIM/PLR/RUF — import-sorting, type-annotation modernization, etc.), which is
+# why CI (ruff >=0.15.9) flagged ~34 style issues across the codebase. This repo only
+# wants real-bug checks, so select them explicitly for version-stable results:
+# E4/E7/E9 (pycodestyle errors) + F (pyflakes: undefined names, unused imports/vars).
+select = ["E4", "E7", "E9", "F"]

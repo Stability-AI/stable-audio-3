@@ -14,7 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Prefer the producer venv (`sa3_torch29`) since it has BOTH gradio + tensorrt
 # + stable_audio_tools — needed for the PT-FP32-GT debug backend. Fall back to
 # the consumer .venv if the producer one isn't available.
-PT_VENV_PY="/admin/home-cj/sa/venvs/sa3_torch29/bin/python"
+PT_VENV_PY="/path/to/venvs/sa3_torch29/bin/python"
 CONSUMER_VENV_PY="${SCRIPT_DIR}/.venv/bin/python"
 
 if [ -x "${PT_VENV_PY}" ]; then

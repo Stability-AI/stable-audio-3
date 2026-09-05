@@ -10,7 +10,7 @@ Usage:
 If --dit or --decoder is omitted, the script prompts the user interactively.
 """
 from __future__ import annotations
-import argparse, math, os, random, sys, termios, time, tty, wave
+import argparse, math, os, random, subprocess, sys, termios, time, tty, wave
 from pathlib import Path
 
 import numpy as np
@@ -95,127 +95,127 @@ def _detect_gpu_arch() -> str:
 ARCH = _detect_gpu_arch()
 ARCH_DIR = MODELS_DIR / ARCH
 HF_SUBDIR = f"tensorRT/{ARCH}"
-T5GEMMA_PATH = ARCH_DIR / "t5gemma" / "t5gemma_fp16mixed.trt"
+T5GEMMA_PATH = ARCH_DIR / "t5gemma" / "t5gemma_fp16.trt"
 
 # What engine files each DiT choice needs (relative to MODELS_DIR, mirroring HF repo layout).
 # Each DiT engine bundles its conditioner tensors (padding_embedding + seconds_total
 # Linear) as graph Constants, so no sidecar weight files are needed.
 DIT_ENGINE_FILES = {
-    "sm-music": ["sa3-sm-music/dit_fp16mixed.trt"],
-    "sm-sfx":   ["sa3-sm-sfx/dit_fp16mixed.trt"],
-    "medium":   ["sa3-m/dit_fp16mixed.trt"],   # fp16mixed is the medium default
+    "sm-music": ["sa3-sm-music/dit_fp16.trt"],
+    "sm-sfx":   ["sa3-sm-sfx/dit_fp16.trt"],
+    "medium":   ["sa3-m/dit_fp16.trt"],   # fp16 is the medium default
 }
 DECODER_FILES = {
     "same-s": [
-        "same-s/dec_dynamic_bf16.trt",
+        "same-s/dec_bf16_chunkable_limiter.trt",
     ],
     "same-l": [
-        "same-l/dec_dynamic_triton_swa.trt",
+        "same-l/dec_fp16_chunkable_limiter.trt",
     ],
 }
 ENCODER_FILES = {
-    "same-s": ["same-s/enc_dynamic_bf16.trt"],
-    "same-l": ["same-l/enc_dynamic_triton_swa.trt"],
+    "same-s": ["same-s/enc_bf16_chunkable.trt"],
+    "same-l": ["same-l/enc_fp16_chunkable.trt"],
 }
 SHARED_FILES = [
     # T5Gemma engine — downloaded from HF per-arch. (The tokenizer.json is
     # arch-agnostic and ships bundled with the repo at scripts/tokenizer.json,
     # so it's NOT in this list.)
-    "t5gemma/t5gemma_fp16mixed.trt",
+    "t5gemma/t5gemma_fp16.trt",
 ]
 
 DIT_CHOICES = {
-    "sm-music": {"engine": ARCH_DIR / "sa3-sm-music" / "dit_fp16mixed.trt",
+    "sm-music": {"engine": ARCH_DIR / "sa3-sm-music" / "dit_fp16.trt",
                  "default_decoder": "same-s"},
-    "sm-sfx":   {"engine": ARCH_DIR / "sa3-sm-sfx" / "dit_fp16mixed.trt",
+    "sm-sfx":   {"engine": ARCH_DIR / "sa3-sm-sfx" / "dit_fp16.trt",
                  "default_decoder": "same-s"},
-    "medium":   {"engine": ARCH_DIR / "sa3-m" / "dit_fp16mixed.trt",  # medium default
+    "medium":   {"engine": ARCH_DIR / "sa3-m" / "dit_fp16.trt",  # medium default
                  "default_decoder": "same-l"},
 }
+# SAME-L now points at the CHUNKABLE engines. Each carries two optimization profiles -- a
+# 256-latent (decoder) / 64-latent (encoder) low band for minimum VRAM, and a 4096 wide band for
+# single-shot -- plus, on the decoder, the shipped limiter with its ceiling as a runtime input.
+# Scratch is committed per profile, so the low band costs 509 MB where the old single-profile
+# engine reserved 8143 MB regardless of render length. The previous engines remain on the model
+# repo and are reachable through the "legacy" tier below; nothing was moved or deleted, so an
+# older checkout still resolves its own filenames.
 DECODER_PATHS = {
-    "same-s": ARCH_DIR / "same-s" / "dec_dynamic_bf16.trt",
-    "same-l": ARCH_DIR / "same-l" / "dec_dynamic_triton_swa.trt",
+    "same-s": ARCH_DIR / "same-s" / "dec_bf16_chunkable_limiter.trt",
+    "same-l": ARCH_DIR / "same-l" / "dec_fp16_chunkable_limiter.trt",
 }
 ENCODER_PATHS = {
-    "same-s": ARCH_DIR / "same-s" / "enc_dynamic_bf16.trt",
-    "same-l": ARCH_DIR / "same-l" / "enc_dynamic_triton_swa.trt",
+    "same-s": ARCH_DIR / "same-s" / "enc_bf16_chunkable.trt",
+    "same-l": ARCH_DIR / "same-l" / "enc_fp16_chunkable.trt",
 }
 
 
 # ─── Precision-keyed engine maps ─────────────────────────────────────────
 #
-# Three DiT precisions:
-#   fp16mixed  — canonical AND the default for every DiT, medium included since
-#                2026-07. FP16 trunk with FP32 islands around RMSNorm and the RoPE
-#                *generation*; the attention core (QK^T → Softmax → P·V) runs FP16
-#                so TRT's FMHA fuser fires (96 fused nodes on medium). Before that
-#                island was bounded the whole O(L²) core sat in FP32 unfused, which
-#                is what made bf16 look 4.7× faster. Now: teacher-forced velocity
-#                cos 1.0000 vs the FP32 engine at every length, and within ~3% of
-#                bf16's speed. Requires STRONGLY_TYPED (see build_dit_fp16mixed.py).
-#   bf16       — medium ONLY. Same dit.onnx as fp32, built with BuilderFlag.BF16
-#                (EXPLICIT_BATCH), which lets the FMHA fuser fire on a uniform bf16
-#                trunk. Marginally the fastest engine, but LOW-FIDELITY AT LONG
-#                SEQUENCE: it evaluates RoPE's rotation angle in bf16, and that
-#                angle reaches ~4155 rad at L=4092 where bf16's spacing is 32 rad
-#                (> 2π), so position information for the fast-rotating dims is
-#                destroyed. Over 8 sampling steps the latent inflates ~2.5× and the
-#                decoder clips 2–3% of samples on a 6-min render. Fine at short
-#                lengths (clean at L=256); prefer fp16mixed for anything long.
-#                Also not seed-reproducible vs fp16mixed.
+# Three DiT precisions (fp16mixed was renamed → fp16 — every tier is mixed, so the
+# qualifier was noise; the medium-only bf16 tier was retired. Both old tokens alias
+# to fp16, see _PRECISION_ALIAS):
+#   fp16       — canonical AND the default for every DiT. FP16 trunk with FP32
+#                islands around RMSNorm and the RoPE *generation*; the attention
+#                core (QK^T → Softmax → P·V) runs FP16 so TRT's FMHA fuser fires
+#                (96 fused nodes on medium). Bounding that island is what lets the
+#                core fuse — before it, the whole O(L²) core sat in FP32 unfused
+#                (which is what made the retired bf16 tier look 4.7× faster). Now:
+#                teacher-forced velocity cos 1.0000 vs the FP32 engine at every
+#                length, ~3% off the old bf16 speed, and accurate at long sequence
+#                (bf16 drifted — it evaluated RoPE's angle too coarsely past ~2048
+#                rad, ~4155 rad @L4092 vs bf16 spacing 32 rad, clipping 2–3% of a
+#                6-min render). Requires STRONGLY_TYPED (see build_dit_fp16.py).
 #   fp8        — all DiTs, fp8 E4M3 on the linear GEMMs (attention + RoPE kept
 #                higher precision). On MEDIUM it's a max-speed clean tier (~1.3×
-#                over fp16mixed) via the recipe described below. On sm-music /
+#                over fp16) via the recipe described below. On sm-music /
 #                sm-sfx it is a CLEAN WEIGHT-HALVING tier (engine 479 vs 936 MB),
 #                only marginally faster (~1.10–1.17×): those DiTs' ~5 ms forward is
 #                overhead-bound at batch 1, so fp8's GEMM-math savings barely show.
-#                Their fp8 is an fp8-QDQ graft onto the fp16mixed graph (fp8 linears
-#                + fp16 fused attention + the fp16mixed fp32 islands, STRONGLY_TYPED),
-#                velocity-cos ~0.99 vs eager, clip% at/below fp16mixed. medium recipe:
+#                Their fp8 is an fp8-QDQ graft onto the fp16 graph (fp8 linears
+#                + fp16 fused attention + the fp16 fp32 islands, STRONGLY_TYPED),
+#                velocity-cos ~0.99 vs eager, clip% at/below fp16. medium recipe:
 #                MAX-SPEED clean tier. fp8 E4M3 on the 176 linear
 #                GEMMs + bf16 fused FMHA (96 nodes) + a BAKED fp32 RoPE constant
 #                table: position cos/sin are computed host-side at build time and
 #                frozen as a graph Constant (no in-graph trig), so the island is
 #                precision-policy-robust and cross-runtime-stable — a constant
 #                can't be re-fused to bf16 the way a runtime pin can. ~1.3× faster
-#                than fp16mixed at every length (measured H200, same-run round-
+#                than fp16 at every length (measured H200, same-run round-
 #                robin: 1.40× @L129 / 1.32× @L1292 / 1.30× @L4092) and CLEAN at
 #                long sequence (latent std 0.86 vs eager 0.95, 0.000% clip @2min &
 #                full) — the baked RoPE dodges bf16's long-angle drift. It is a
 #                SPEED tier over an already-good default, NOT a fidelity upgrade:
-#                single-step velocity cos vs fp32 is ~0.92–0.97 (below fp16mixed's
+#                single-step velocity cos vs fp32 is ~0.92–0.97 (below fp16's
 #                ~1.0) but the 8-step render stays coherent. Built weakly-typed
 #                EXPLICIT_BATCH + BF16 + FP8 + OBEY_PRECISION_CONSTRAINTS (the
-#                opposite of fp16mixed's STRONGLY_TYPED — see build_from_onnx.py).
+#                opposite of fp16's STRONGLY_TYPED — see build_from_onnx.py).
 #                The baked table is sized to the profile max L=4096 (= the SAME-L
 #                decoder's own cap), so within the shipped range no re-bake is
 #                needed; L>4096 is rejected (a re-bake would be required).
 #   fp32       — pure-FP32, bit-equivalent to PyTorch eager. ~2× size/latency.
 #
 # The lookup tables below resolve the engine filename per (dit/decoder,
-# precision). The bf16 DiT recipe is a build-time precision change only (no new
-# ONNX): reuse sa3-m/dit.onnx, build with BF16. Decoders/encoders are unchanged
-# by bf16 (it's a DiT-trunk fusion recipe), so decoder "bf16" reuses the
-# canonical decoder engine. Encoders are FP16-mixed only.
+# precision). Decoders/encoders have no DiT-specific recipe, so they reuse their
+# canonical fp16 engine for every precision. Encoders are fp16 only.
 DIT_ENGINE_FILENAME = {
-    "bf16":      "dit_bf16.trt",        # medium only; drifts at long sequence
-    "fp8":       "dit_fp8.trt",         # all DiTs; fp8 linears (medium: +baked RoPE; small: graft on fp16mixed)
-    "fp16mixed": "dit_fp16mixed.trt",
-    "fp32":      "dit_fp32.trt",
+    "fp8":  "dit_fp8.trt",   # all DiTs; fp8 linears (medium: +baked RoPE; small: graft on fp16)
+    "fp16": "dit_fp16.trt",  # canonical + default for every DiT (fp16 trunk + fp32 RMSNorm/RoPE islands)
+    "fp32": "dit_fp32.trt",  # pure fp32, bit-equivalent to eager
 }
-# DiT precisions actually built per model. bf16 is medium-only; fp8 is available
-# for all three (medium via baked-RoPE/bf16-attn; sm-music/sm-sfx via an fp8-QDQ
-# graft onto their fp16mixed graph — fp8 linears + fp16 fused attn + fp32 islands).
+# DiT precisions actually built per model. fp8 is available for all three (medium
+# via baked-RoPE/bf16-attn; sm-music/sm-sfx via an fp8-QDQ graft onto their fp16
+# graph — fp8 linears + fp16 fused attn + fp32 islands). The retired medium-only
+# bf16 tier (drifted at long sequence) now aliases to fp16 — see _PRECISION_ALIAS.
 _DIT_PRECISIONS = {
-    "sm-music": ("fp16mixed", "fp8", "fp32"),
-    "sm-sfx":   ("fp16mixed", "fp8", "fp32"),
-    "medium":   ("bf16", "fp8", "fp16mixed", "fp32"),
+    "sm-music": ("fp16", "fp8", "fp32"),
+    "sm-sfx":   ("fp16", "fp8", "fp32"),
+    "medium":   ("fp8", "fp16", "fp32"),
 }
-# Per-DiT default precision — fp16mixed everywhere. Medium moved off bf16 once
-# fp16mixed's attention core was fused (4.3x faster than the old fp16mixed engine,
+# Per-DiT default precision — fp16 everywhere. Medium moved off bf16 once
+# fp16's attention core was fused (4.3x faster than the old fp16 engine,
 # ~3% off bf16, and fp32-accurate at every sequence length).
-DIT_DEFAULT_PRECISION = {"sm-music": "fp16mixed", "sm-sfx": "fp16mixed",
-                         "medium": "fp16mixed"}
+DIT_DEFAULT_PRECISION = {"sm-music": "fp16", "sm-sfx": "fp16",
+                         "medium": "fp16"}
 _DIT_SUBDIR = {"sm-music": "sa3-sm-music", "sm-sfx": "sa3-sm-sfx", "medium": "sa3-m"}
 # Both SAME decoders' latent profiles start at L=32 (verified against the engines:
 # min=(1,256,32) for same-l and same-s; the DiT's starts at 1). Below 32,
@@ -228,31 +228,113 @@ DECODER_MIN_L = 32
 
 DECODER_ENGINE_FILENAME = {
     "same-l": {
-        # bf16/fp8 are DiT-only recipes → decoder reuses its canonical fp16-mixed engine.
-        "bf16":      "dec_dynamic_triton_swa.trt",
-        "fp8":       "dec_dynamic_triton_swa.trt",
-        "fp16mixed": "dec_dynamic_triton_swa.trt",
-        "fp32":      "dec_dynamic_fp32.trt",
+        # The DiT precision selects the DECODER only through this map. Both fp8 and fp16 DiTs
+        # get the fp16 chunkable decoder; an fp8 DECODER is a separate choice made with
+        # --dec-precision fp8 (see DECODER_TIER_FILENAME), because it is a quantisation of the
+        # decoder itself rather than a consequence of the DiT's precision.
+        "fp8":  "dec_fp16_chunkable_limiter.trt",
+        "fp16": "dec_fp16_chunkable_limiter.trt",
+        "fp32": "dec_fp16_chunkable_limiter.trt",
     },
     "same-s": {
-        "bf16":      "dec_dynamic_bf16.trt",
-        "fp8":       "dec_dynamic_bf16.trt",
-        "fp16mixed": "dec_dynamic_bf16.trt",
-        "fp32":      "dec_dynamic_fp32.trt",
+        "fp8":  "dec_bf16_chunkable_limiter.trt",
+        "fp16": "dec_bf16_chunkable_limiter.trt",
+        "fp32": "dec_bf16_chunkable_limiter.trt",
     },
 }
-PRECISIONS = ("bf16", "fp8", "fp16mixed", "fp32")
+PRECISIONS = ("fp8", "fp16", "fp32")
+# Back-compat: retired precision tokens resolve to their replacement.
+#   fp16mixed → fp16 : every tier is mixed-precision, so the qualifier was noise.
+#   bf16      → fp16 : the medium-only bf16 DiT drifted at long sequence; retired.
+_PRECISION_ALIAS = {"fp16mixed": "fp16", "bf16": "fp16"}
+def normalize_precision(precision):
+    """Map a (possibly retired) precision token to its canonical name."""
+    return _PRECISION_ALIAS.get(precision, precision) if precision else precision
+
+# ── Decoder / encoder quantization TIERS (orthogonal to the DiT --precision) ──
+# Train-free fp8 tiers grafted onto the bf16 export (see quantize/README.md).
+# "canonical" = the shipped default decoder engine. Both tiers are CHUNKABLE: two optimization
+# profiles (a 256-latent low band for minimum scratch, a 4096 wide band for single-shot) and a
+# baked limiter. The pre-chunkable engines are no longer reachable from the runtime -- they have
+# no limiter, reserve 5.7-8.1 GB regardless of render length, and SAME-S's was stochastic. Build
+# them with build/build_autoencoders.py, not by hand.
+#   fp8       fp8 FFN GEMMs (near-transparent, ~1.14×) — the speed pick
+# (the SAME-S-only "fp8_fast" tier — fp8 on the attention projections too — is RETIRED. It put fp8
+#  compute on exactly the layers with the outlier activations, and measured 9.21 dB against eager
+#  fp32 where plain fp8 measures 15.78 and bf16 18.53: a 9 dB drop for ~1.07x over fp8.)
+# (int8-weight-only "w8_bf16" was retired: its DequantizeLinear constant-folds to bf16 at build, so
+#  the engine was byte-for-byte the size/speed of the bf16 baseline with slightly lossier weights —
+#  strictly dominated. For a max-fidelity decoder use --precision fp32.)
+DECODER_TIER_FILENAME = {
+    # ⚠ SAME-S is BF16 -- SAME-L is the fp16 one. Its chunkable decoder is also the DETERMINISTIC
+    # rebuild: the legacy engine has a RandomNormalLike at its bottleneck, so two runs of it differ
+    # by ~0.9989 and any A/B against it is floored there.
+    "same-s": {"canonical": "dec_bf16_chunkable_limiter.trt",
+               "fp8": "dec_fp8_chunkable_limiter.trt"},
+    "same-l": {"canonical": "dec_fp16_chunkable_limiter.trt",
+               "fp8": "dec_fp8_chunkable_limiter.trt"},
+}
+ENCODER_TIER_FILENAME = {
+    "same-s": {"canonical": "enc_bf16_chunkable.trt",
+               "fp8": "enc_fp8_chunkable.trt"},
+    # ⚠ the old same-l enc_fp8.trt was REMOVED from the model repo: its activation quantisers
+    # were calibrated with p99.9-within-clip → p90-across-clips → a 1e-4 floor, putting the clip
+    # points at 0.04-1.22 where the decoder's plain amax puts them at 22.4. That cost up to
+    # 2.16 dB of round trip on clean acoustic material. enc_fp8_chunkable.trt is the same weights
+    # recalibrated with amax (build/recalib_enc_fp8.py) and measures 30.9 dB where the old one
+    # measured 18.3.
+    "same-l": {"canonical": "enc_fp16_chunkable.trt",
+               "fp8": "enc_fp8_chunkable.trt"},
+}
+DECODER_TIERS = ("canonical", "fp8")
+
+
+def get_decoder_tier_path(decoder_name: str, tier: str = "canonical") -> Path:
+    tiers = DECODER_TIER_FILENAME.get(decoder_name)
+    if tiers is None:
+        raise ValueError(f"unknown decoder={decoder_name!r}; valid: {list(DECODER_TIER_FILENAME)}")
+    if tier not in tiers:
+        raise ValueError(f"decoder tier {tier!r} not available for {decoder_name}; valid: {list(tiers)}")
+    return ARCH_DIR / decoder_name / tiers[tier]
+
+
+def get_encoder_tier_path(decoder_name: str, tier: str = "canonical") -> Path:
+    tiers = ENCODER_TIER_FILENAME[decoder_name]
+    return ARCH_DIR / decoder_name / tiers.get(tier, tiers["canonical"])   # enc falls back if a tier is decoder-only
+
+
+def decoder_tier_from_filename(decoder_name: str, filename: str) -> str:
+    """Reverse-map a decoder engine filename (e.g. 'dec_fp8.trt') to its tier name
+    ('fp8'); used by the gradio variant picker. Falls back to 'canonical'."""
+    for tier, fname in DECODER_TIER_FILENAME.get(decoder_name, {}).items():
+        if fname == filename:
+            return tier
+    return "canonical"
+
+
+def resolve_decoder_engine(decoder_name: str, precision: str = None, dec_tier: str = "canonical") -> Path:
+    """dec_tier 'canonical' → the precision-driven canonical/fp32 decoder (back-compat with
+    --precision, e.g. fp32 still yields dec_dynamic_fp32.trt); any other tier → its engine."""
+    if dec_tier == "canonical":
+        return get_decoder_engine_path(decoder_name, precision)
+    return get_decoder_tier_path(decoder_name, dec_tier)
+
+
+def resolve_encoder_engine(decoder_name: str, dec_tier: str = "canonical") -> Path:
+    if dec_tier == "canonical":
+        return ENCODER_PATHS[decoder_name]
+    return get_encoder_tier_path(decoder_name, dec_tier)
 
 
 def default_precision(dit_name: str) -> str:
-    """Default DiT precision: fp16-mixed for every model.
+    """Default DiT precision: fp16 for every model.
 
-    Medium used bf16 until 2026-07, when bounding the fp16-mixed RoPE island let
-    its attention core fuse — that made fp16-mixed 4.3x faster than before and
-    within ~3% of bf16, while staying accurate at long sequence (bf16 evaluates
-    RoPE's angle too coarsely past ~2048 rad and drifts).
+    (fp16 = FP16 trunk + FP32 RMSNorm/RoPE islands + an FMHA-fused FP16 attention
+    core. Medium used the now-retired bf16 tier until 2026-07, when bounding the
+    fp16 RoPE island let its attention core fuse — 4.3x faster than before and
+    accurate at long sequence, where bf16 drifted.)
     """
-    return DIT_DEFAULT_PRECISION.get(dit_name, "fp16mixed")
+    return DIT_DEFAULT_PRECISION.get(dit_name, "fp16")
 
 
 def get_dit_engine_path(dit_name: str, precision: str = None) -> Path:
@@ -260,15 +342,11 @@ def get_dit_engine_path(dit_name: str, precision: str = None) -> Path:
         raise ValueError(f"unknown dit={dit_name!r}; valid: {list(_DIT_SUBDIR)}")
     if precision is None:
         precision = default_precision(dit_name)
+    precision = normalize_precision(precision)
     if precision not in DIT_ENGINE_FILENAME:
         raise ValueError(f"unknown precision={precision!r}; valid: {PRECISIONS}")
-    if precision == "bf16" and dit_name != "medium":
-        raise ValueError(
-            f"precision='bf16' is only available for --dit medium (FMHA-fused); "
-            f"{dit_name} uses standard attention and already fuses in fp16mixed. "
-            f"Valid for {dit_name}: {_DIT_PRECISIONS.get(dit_name)}")
     # fp8 is available for all three DiTs (medium: baked-RoPE + bf16 attn; sm-music/
-    # sm-sfx: fp8-QDQ graft on their fp16mixed graph). Only bf16 stays medium-only.
+    # sm-sfx: fp8-QDQ graft on their fp16 graph).
     return ARCH_DIR / _DIT_SUBDIR[dit_name] / DIT_ENGINE_FILENAME[precision]
 
 
@@ -276,24 +354,33 @@ def get_decoder_engine_path(decoder_name: str, precision: str = None) -> Path:
     if decoder_name not in DECODER_ENGINE_FILENAME:
         raise ValueError(f"unknown decoder={decoder_name!r}; valid: {list(DECODER_ENGINE_FILENAME)}")
     if precision is None:
-        precision = "fp16mixed"   # decoders have no bf16-specific engine; canonical
+        precision = "fp16"   # decoders track the canonical (fp16) engine
+    precision = normalize_precision(precision)
     if precision not in DECODER_ENGINE_FILENAME[decoder_name]:
         raise ValueError(f"unknown precision={precision!r}; valid: {PRECISIONS}")
     return ARCH_DIR / decoder_name / DECODER_ENGINE_FILENAME[decoder_name][precision]
 
 
 def get_engine_files(dit_name: str, decoder_name: str, precision: str = None,
-                       with_encoder: bool = False) -> list[str]:
+                       with_encoder: bool = False, dec_tier: str = "canonical") -> list[str]:
     """Relative paths (under ARCH_DIR) needed for the chosen pipeline. Pass this
     list to _ensure_files() to auto-download anything missing from HF.
-    precision=None resolves to the per-model default (fp16-mixed)."""
+    precision=None resolves to the per-model default (fp16); dec_tier picks the
+    decoder/encoder quantization tier (canonical / fp8 / fp8_fast)."""
     if precision is None:
         precision = default_precision(dit_name)
+    precision = normalize_precision(precision)
     files = list(SHARED_FILES)
     files.append(f"{_DIT_SUBDIR[dit_name]}/{DIT_ENGINE_FILENAME[precision]}")
-    files.append(f"{decoder_name}/{DECODER_ENGINE_FILENAME[decoder_name][precision]}")
-    if with_encoder:
-        files.append(f"{decoder_name}/" + ENCODER_PATHS[decoder_name].name)
+    if dec_tier == "canonical":   # precision-driven canonical/fp32 decoder (back-compat)
+        files.append(f"{decoder_name}/{DECODER_ENGINE_FILENAME[decoder_name][precision]}")
+        if with_encoder:
+            files.append(f"{decoder_name}/{ENCODER_PATHS[decoder_name].name}")
+    else:                          # a quantization tier
+        files.append(f"{decoder_name}/{DECODER_TIER_FILENAME[decoder_name][dec_tier]}")
+        if with_encoder:
+            enc = ENCODER_TIER_FILENAME[decoder_name]
+            files.append(f"{decoder_name}/{enc.get(dec_tier, enc['canonical'])}")
     return files
 
 # ─── Display helpers (ANSI color when stdout is a TTY) ───────────────────
@@ -338,6 +425,75 @@ def sub(text: str):
 
 
 # ─── Lazy download from HuggingFace ──────────────────────────────────────
+# Autoencoder engines the local build script knows how to produce. Anything else
+# (DiT, T5Gemma) has to come from the model repo or build_from_onnx.py.
+_BUILDABLE_PREFIXES = ("same-l/", "same-s/")
+
+
+def _build_autoencoders(targets: list[str]) -> None:
+    """Run build/build_autoencoders.py for the missing autoencoder engines."""
+    script = Path(__file__).resolve().parent.parent / "build" / "build_autoencoders.py"
+    if not script.exists():
+        raise FileNotFoundError(f"build script not found at {script}")
+    # One invocation per MODEL, not per (model, kind): the decoder check is an
+    # encode->decode round trip, so asking for --kind dec alone leaves it unverifiable.
+    # Engines that already exist are skipped by the build script anyway, so covering both
+    # kinds costs nothing when only one is actually missing.
+    models = []
+    for t in targets:
+        model = t.split("/", 1)[0]
+        if model not in models:
+            models.append(model)
+    for model in models:
+        cmd = [sys.executable, str(script), "--model", model]
+        print(f"\n  {dim('$')} {' '.join(cmd[1:])}", flush=True)
+        rc = subprocess.call(cmd)
+        if rc != 0:
+            raise RuntimeError(f"build_autoencoders.py --model {model} exited {rc}")
+
+
+def _build_or_die(absent: list[str], missing: list[str]) -> None:
+    """Offer to build what is missing; raise with instructions if we cannot.
+
+    Prebuilt engines exist only for the architectures we have hardware to build and
+    verify on. On anything else the autoencoders are a ~10 minute local build, so ask
+    rather than dumping a 404 — and ask BEFORE downloading, so nobody pays 3 GB for a
+    DiT only to hit a missing decoder afterwards.
+    """
+    arch = Path(HF_SUBDIR).name
+    buildable = [a for a in absent if a.startswith(_BUILDABLE_PREFIXES)]
+    other = [a for a in absent if a not in buildable]
+    print(f"\n  {bold(f'No prebuilt engines for {arch}')} — "
+          f"{len(absent)} of the {len(missing)} file(s) this configuration needs "
+          f"are not published:")
+    for a in absent:
+        print(f"    {a}" + ("" if a in buildable else dim("   (not locally buildable)")))
+    if other:
+        raise FileNotFoundError(
+            f"{len(other)} engine(s) cannot be built by build_autoencoders.py: "
+            + ", ".join(other)
+            + f"\n  Build them with optimized/tensorRT/build/build_from_onnx.py, or pick a "
+              f"configuration whose engines are published for {arch}.")
+    print(f"\n  These are autoencoders — buildable here from the published ONNX in about "
+          f"10 minutes.")
+    if not sys.stdin.isatty():
+        raise FileNotFoundError(
+            f"cannot prompt (stdin is not a terminal). Build them with:\n"
+            f"    python optimized/tensorRT/build/build_autoencoders.py\n"
+            f"  They land in optimized/tensorRT/models/{arch}/ and are picked up "
+            f"automatically.")
+    try:
+        ans = input(f"  Build them now for {arch}? [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = "n"
+    if ans in ("", "y", "yes"):
+        _build_autoencoders(buildable)
+    else:
+        raise FileNotFoundError(
+            f"declined. Build them later with:\n"
+            f"    python optimized/tensorRT/build/build_autoencoders.py")
+
+
 def _ensure_files(rel_paths: list[str]) -> None:
     """Download any of these (relative to ARCH_DIR) that don't exist locally.
 
@@ -354,6 +510,36 @@ def _ensure_files(rel_paths: list[str]) -> None:
         sys.exit("error: huggingface_hub not installed. "
                  "Re-run install.sh (or pip install huggingface-hub).")
     import shutil
+
+    # Pre-flight the whole list against the repo before fetching a byte. Prebuilt engines
+    # exist only for the architectures we publish; on anything else (sm_120, sm_89, ...)
+    # some or all of them are absent. Downloading first means the user pays 3+ GB for
+    # T5Gemma and the DiT and THEN gets a bare hf_hub_download 404 traceback naming one
+    # file, with no hint that building locally is the supported path.
+    try:
+        from huggingface_hub import HfApi
+        published = {f for f in HfApi().list_repo_files(HF_REPO_ID)}
+    except Exception:
+        published = None          # offline or API trouble: fall through to per-file errors
+    if published is not None:
+        absent = [r for r in missing if f"{HF_SUBDIR}/{r}" not in published]
+        if absent:
+            _build_or_die(absent, missing)
+            missing = [p for p in missing if not (ARCH_DIR / p).exists() or
+                                             (ARCH_DIR / p).stat().st_size == 0]
+            # Anything still absent locally AND absent from the Hub would otherwise fall
+            # into the download loop below and 404 — the exact bare traceback this whole
+            # path exists to avoid.
+            still = [r for r in missing if f"{HF_SUBDIR}/{r}" not in published]
+            if still:
+                raise FileNotFoundError(
+                    "the build finished but these engines are still missing, and they are "
+                    "not on the Hub either:\n"
+                    + "".join(f"    {r}\n" for r in still)
+                    + "  Check the build output above for the failure.")
+            if not missing:
+                return
+
     print(f"  {dim('downloading')} {len(missing)} missing file(s) from {HF_REPO_ID}/{HF_SUBDIR}")
     for rel in missing:
         hf_path = f"{HF_SUBDIR}/{rel}"
@@ -418,7 +604,19 @@ class TRTRunner:
     # attribute because torch/trt aren't imported until main() runs.
     _DT = None
 
-    def __init__(self, engine_path: Path, logger_level=None):
+    def __init__(self, engine_path: Path, logger_level=None, user_managed: bool = False,
+                 profile: int = 0):
+        """user_managed=True creates the execution context WITHOUT its own scratch allocation.
+
+        TensorRT commits a context's scratch at create_execution_context(), sized from the
+        selected profile -- so on a multi-profile engine a DEFAULT context reserves the MAX
+        ACROSS profiles and a low-memory band saves nothing. USER_MANAGED lets the caller
+        allocate exactly get_device_memory_size_for_profile_v2(profile) and, where several
+        engines run sequentially on one stream, share a single buffer between them.
+
+        profile selects the optimization profile (band). The SAME-L engines ship two: 0 is the
+        low-ceiling chunked band, 1 is the wide single-shot band.
+        """
         if logger_level is None:
             logger_level = trt.Logger.ERROR
         if TRTRunner._DT is None:
@@ -437,7 +635,29 @@ class TRTRunner:
             self.engine = runtime.deserialize_cuda_engine(f.read())
         if self.engine is None:
             raise RuntimeError(f"failed to deserialize {engine_path}")
-        self.context = self.engine.create_execution_context()
+        # Kept for reporting: TRT exposes no API for an engine's weight allocation, so the
+        # serialised file size is the proxy the debug view uses.
+        self.engine_path = Path(engine_path)
+        self.profile = int(profile or 0)
+        self._scratch = None
+        # ⚠ NEVER create_execution_context() with no strategy on a multi-profile engine. A DEFAULT
+        # context reserves `device_memory_size`, which is the MAX ACROSS PROFILES -- on the
+        # two-profile autoencoders that is the wide band, 8143 MB where the low band needs 509, so
+        # selecting the low profile would save exactly nothing. Measured: a default context on the
+        # SAME-L decoder took 9608 MiB where the same engine on profile 0 takes 1840.
+        self.context = self.engine.create_execution_context(
+            trt.ExecutionContextAllocationStrategy.USER_MANAGED)
+        if self.profile and self.engine.num_optimization_profiles > 1:
+            st = torch.cuda.current_stream()
+            self.context.set_optimization_profile_async(self.profile, st.cuda_stream)
+            st.synchronize()
+        if not user_managed:
+            # Own exactly the selected profile's requirement. user_managed=True means the caller
+            # supplies the buffer instead (see SA3Inference._share_scratch, which gives one
+            # allocation to every engine because they run sequentially on one stream).
+            need = self.engine.get_device_memory_size_for_profile_v2(self.profile)
+            self._scratch = torch.empty(need, dtype=torch.uint8, device="cuda")
+            self.context.set_device_memory(self._scratch.data_ptr(), need)
         self.stream = torch.cuda.Stream()
         # I/O dtype/name maps
         self.in_dtype = {}
@@ -453,8 +673,58 @@ class TRTRunner:
     def free(self):
         """Best-effort engine teardown — frees device memory back to CUDA."""
         del self.context
+        self._scratch = None          # release the scratch this runner owns, if any
         del self.engine
         torch.cuda.empty_cache()
+
+
+def share_scratch(runners: dict, order=("t5", "dit", "dec", "enc")):
+    """Give every engine ONE scratch buffer, sized to what the bound shapes actually need.
+
+    Two independent wins, both pure allocation -- no rebuild, no numerical change:
+
+    1. SHAPE-EXACT sizing. `device_memory_size` is the worst case TRT commits for a whole profile;
+       `update_device_memory_size_for_shapes()` reports what the bound shapes need. On the large
+       fp16 DiT those differ by 44%.
+    2. SHARING. T5 -> DiT (xN) -> decoder run strictly sequentially on one stream, and the encoder
+       runs before them, so one buffer serves all of them instead of each holding its own.
+
+    ⚠ The per-engine fallback is get_device_memory_size_for_profile_v2(idx), NOT
+    device_memory_size: on a multi-profile engine the latter is the MAX ACROSS PROFILES, so a
+    low-band deployment would size the buffer for the wide band and save nothing.
+
+    Returns the buffer; keep a reference alive for as long as the runners are used.
+    """
+    names = [n for n in order if n in runners]
+    need, ctxs = 0, {}
+    for n in names:
+        r = runners[n]
+        e = r.engine
+        ctx = e.create_execution_context(trt.ExecutionContextAllocationStrategy.USER_MANAGED)
+        idx = getattr(r, "profile", 0) or 0
+        if e.num_optimization_profiles > 1 and idx:
+            st = torch.cuda.current_stream()
+            ctx.set_optimization_profile_async(idx, st.cuda_stream)
+            st.synchronize()
+        for i in range(e.num_io_tensors):
+            tn = e.get_tensor_name(i)
+            if e.get_tensor_mode(tn) != trt.TensorIOMode.INPUT:
+                continue
+            _, _, hi = e.get_tensor_profile_shape(tn, idx)
+            ctx.set_input_shape(tn, tuple(hi))
+        try:
+            need = max(need, ctx.update_device_memory_size_for_shapes())
+        except Exception:
+            need = max(need, e.get_device_memory_size_for_profile_v2(idx))
+        ctxs[n] = ctx
+    if need <= 0:
+        return None
+    buf = torch.empty(need, dtype=torch.uint8, device="cuda")
+    for n, ctx in ctxs.items():
+        ctx.set_device_memory(buf.data_ptr(), need)
+        runners[n].context = ctx   # drops the runner's own context + its private scratch
+        runners[n]._scratch = None
+    return buf
 
 
 def _run_engine(runner: "TRTRunner", ctx, what: str) -> None:
@@ -532,6 +802,55 @@ def t5gemma_encode(runner: TRTRunner, tokenizer, prompt: str):
     return out.float(), mask
 
 
+def profile_bounds(runner: "TRTRunner", tensor: str) -> tuple[int, int]:
+    """(min, max) for `tensor` on the runner's ACTIVE profile, not profile 0.
+
+    With one band per setting, reading profile 0 would report the low band's ceiling even when the
+    wide band is selected -- and the windowing decision is derived from that number.
+    """
+    idx = getattr(runner, "profile", 0) or 0
+    lo, _, hi = runner.engine.get_tensor_profile_shape(tensor, idx)
+    return int(lo[-1]), int(hi[-1])
+
+
+def _window_owners(starts, sizes, N):
+    """Which window should supply each position: the one holding it FURTHEST from its own edges.
+
+    The fixed half-overlap trim (keep [s+half, s+chunk-half)) assumes every window overlaps its
+    neighbour by exactly `overlap`. When the final hop is irregular -- covering N=646 with 50-latent
+    windows at hop 42 leaves a last hop of 8 -- the tail window overwrites a wide region using
+    near-edge estimates, discarding better central ones from the previous window. That showed up as
+    a single latent (index 126 at T_lat=645) with 0.364 relative error against a 0.0158 median.
+
+    Centrality is min(pos, size-1-pos) within a window; the winner per position is unimodal per
+    window, so each window ends up owning ONE contiguous run and the writes stay slice-shaped.
+    Window STARTS are untouched, so the even-alignment (SAME-S pair grid) still holds.
+
+    Returns [(dst_lo, dst_hi, src_lo, src_hi)] per window, empty runs dropped.
+    """
+    best = [-1] * N
+    owner = [-1] * N
+    for i, (st, sz) in enumerate(zip(starts, sizes)):
+        for j in range(sz):
+            x = st + j
+            if x >= N:
+                break
+            c = j if j < sz - 1 - j else sz - 1 - j
+            if c > best[x]:
+                best[x] = c
+                owner[x] = i
+    runs = []
+    for i, (st, sz) in enumerate(zip(starts, sizes)):
+        idx = [x for x in range(st, min(st + sz, N)) if owner[x] == i]
+        if not idx:
+            runs.append(None)
+            continue
+        lo, hi = idx[0], idx[-1] + 1
+        assert hi - lo == len(idx), f"window {i} owns a non-contiguous run"
+        runs.append((lo, hi, lo - st, hi - st))
+    return runs
+
+
 def encoder_encode(runner: TRTRunner, audio: torch.Tensor) -> torch.Tensor:
     """SAME-S/L encoder, single-shot. audio: (1, 2, T_samples). Returns (1, 256, L).
 
@@ -548,7 +867,21 @@ def encoder_encode(runner: TRTRunner, audio: torch.Tensor) -> torch.Tensor:
     in_dt = runner.in_dtype["audio"]
     out_dt = runner.out_dtype["latent"]
     a = audio.to(in_dt).contiguous()
-    ctx.set_input_shape("audio", tuple(a.shape))
+    if not ctx.set_input_shape("audio", tuple(a.shape)):
+        # Same silent-failure class as the decoder: a refused shape leaves the context on whatever
+        # it last held, so the call returns the previous request's latents instead of raising.
+        # A capped encoder is the normal case now -- its ceiling is deliberately near
+        # encode_chunked's 50-latent window, because single-shot long encodes are ALREADY wrong
+        # (see the warning above: SAME-L NaNs past ~200 latents, SAME-S drifts to cos ~0.4 past
+        # ~108). So this guard mostly catches callers that should be using encode_chunked().
+        idx = getattr(ctx, "active_optimization_profile", 0) or 0
+        lo, _, hi = runner.engine.get_tensor_profile_shape("audio", idx)
+        raise ValueError(
+            f"encoder: audio length {a.shape[-1]} samples "
+            f"({a.shape[-1] // SAMPLES_PER_LATENT} latents) is outside the engine profile "
+            f"[{lo[-1] // SAMPLES_PER_LATENT}, {hi[-1] // SAMPLES_PER_LATENT}] latents "
+            f"(profile {idx}). Use encode_chunked() -- it windows to a safe length, which long "
+            f"single-shot encodes require for CORRECTNESS as well as memory.")
     out_shape = tuple(ctx.get_tensor_shape("latent"))
     out = torch.empty(out_shape, dtype=out_dt, device="cuda")
     ctx.set_tensor_address("audio", a.data_ptr())
@@ -567,7 +900,8 @@ DEFAULT_ENCODER_OVERLAP_LAT = 8   # 4 latents trimmed from each interior edge
 def encode_chunked(runner: TRTRunner, audio: torch.Tensor, *,
                     chunk_lat: int = DEFAULT_ENCODER_CHUNK_LAT,
                     overlap_lat: int = DEFAULT_ENCODER_OVERLAP_LAT,
-                    warmup_passes: int = 2) -> torch.Tensor:
+                    warmup_passes: int = 2,
+                    balance: bool = False, max_chunk: int = 0) -> torch.Tensor:
     """Chunked SAME-S/L encode. Equivalent to encoder_encode for short audio,
     but reliably accurate at any length.
 
@@ -584,6 +918,14 @@ def encode_chunked(runner: TRTRunner, audio: torch.Tensor, *,
                     trimmed from each interior edge).
       warmup_passes: zero-audio calls at chunk_lat before the real chunks,
                     to stabilise engine state. Default 2.
+      balance:      shrink/grow every window to the smallest uniform width that still covers the
+                    request. Total work is T_lat + (n-1)*overlap_lat, so the cheapest plan is the
+                    one with the FEWEST windows -- and since every stitch is a small error, it is
+                    also the most accurate. Measured on SAME-L: bit-exact wherever the request
+                    fits in one call (fixed-50 splits the same request in two and lands 50-59 dB
+                    away), and +0.02 to +0.04 dB of round trip beyond that.
+      max_chunk:    widest window balancing may use. 0 = read the engine's profile ceiling, which
+                    is the right answer and needs no constant.
 
     Returns: (1, 256, T_lat) where T_lat = T_samples // 4096.
     """
@@ -598,35 +940,255 @@ def encode_chunked(runner: TRTRunner, audio: torch.Tensor, *,
             _ = encoder_encode(runner, warm)
         return encoder_encode(runner, audio)
 
+    if balance:
+        # Every interior boundary costs one `overlap_lat` of re-encoded audio, so total work is
+        # T_lat + (n-1)*overlap_lat and the cheapest plan is simply the one with the FEWEST
+        # windows -- i.e. the widest window allowed. Balancing then shrinks that width back to the
+        # smallest value that still covers the request, which changes nothing about the cost but
+        # spreads the work evenly and avoids a nearly-empty final window.
+        #
+        # `max_chunk` is the allowance and defaults to chunk_lat, so by default balancing only
+        # REDISTRIBUTES. Raising it to the engine ceiling also cuts the window count -- but
+        # chunk_lat=50 was chosen for ACCURACY (cos >= 0.998 vs PT eager), not for the profile, so
+        # a wider window is a quality decision and has to be measured, not assumed.
+        #
+        # Balance BEFORE the pre-warm below: warming at a width the real windows do not use
+        # reintroduces exactly the in-loop shape transition the warm-up exists to prevent.
+        # Derive the allowance from the ENGINE rather than a constant. The widest window an
+        # engine can take is its profile ceiling, and that is exactly the width that minimises
+        # window count -- so there is nothing left to hardcode. (The old default, 50 latents, was
+        # picked when windows were fixed-width; balancing supersedes it, and for every realistic
+        # length the balanced width lands at 58-64 on a 64-ceiling encoder, never 50.)
+        if max_chunk:
+            cap = max(chunk_lat, int(max_chunk))
+        else:
+            try:
+                cap = max(chunk_lat, profile_bounds(runner, "audio")[1] // SAMPLES_PER_LATENT_)
+            except Exception:
+                cap = chunk_lat
+        T_pad = T_lat + (T_lat & 1)
+        for n in range(1, T_pad + 1):
+            w = -(-(T_pad + (n - 1) * overlap_lat) // n)
+            w += w & 1                      # even width keeps every start even
+            if w <= cap:
+                chunk_lat = max(w, overlap_lat + 2)
+                break
+
     # Pre-warm at chunk_lat (zero audio, same shape as real chunks)
     warm = torch.zeros(1, 2, chunk_lat * SAMPLES_PER_LATENT_,
                         device=audio.device, dtype=torch.float32)
     for _ in range(warmup_passes):
         _ = encoder_encode(runner, warm)
 
-    # Chunk start positions; last chunk anchored to the end
+    # Chunk start positions. EVERY start must be EVEN: the encoder is the same
+    # TransformerResamplingBlock as the decoder (stride 16, chunk_size 32, chunk_midpoint_shift,
+    # 17 tokens per latent => 34-token = 2-latent transformer chunks), so a window starting on an
+    # odd latent has that entire grid shifted by one and encodes measurably worse -- 0.988-0.990
+    # against 0.9985-0.9996 for even starts.
+    #
+    # `step` is even (50-8=42), so interior starts are even; the TAIL is the trap. Anchoring it at
+    # T_lat - chunk_lat is odd whenever T_lat is odd, which degraded the final ~46 latents (~4 s)
+    # of every odd-length encode to cos 0.9922 vs 0.9998. Rounding the tail start DOWN to even and
+    # letting that one window grow to reach the end restores 0.9996.
+    # Pad an ODD latent count to even, so every window is exactly chunk_lat and the engine sees
+    # ONE shape. Growing the tail to chunk_lat+1 instead (the previous fix for the odd-start parity
+    # problem) keeps starts even but introduces an in-loop SHAPE TRANSITION, and that costs +74 ms
+    # on the SAME-L encoder (107.0 ms vs 33.1 at T_lat=323) and +2.9 ms on SAME-S. Same failure the
+    # docstring's "all chunks same shape => stable engine state" is guarding against. One
+    # replicated latent of audio is cheaper than the transition, and the extra latent is sliced off.
+    T_req = T_lat
+    if T_lat % 2:
+        audio = torch.cat([audio, audio[..., -SAMPLES_PER_LATENT_:]], dim=-1)
+        T_lat += 1
     step = chunk_lat - overlap_lat
     starts = list(range(0, T_lat - chunk_lat, step))
-    if not starts or starts[-1] != T_lat - chunk_lat:
-        starts.append(T_lat - chunk_lat)
+    last = T_lat - chunk_lat               # even now, since T_lat and chunk_lat both are
+    if not starts or starts[-1] != last:
+        starts.append(last)
+    assert last % 2 == 0, f"odd tail start {last} would break SAME-S pair alignment"
+    tail_len = chunk_lat                   # uniform: one shape for every window
 
     # Run all chunks (all same shape ⇒ stable engine state)
     chunks = []
-    for s in starts:
-        chunk_audio = audio[..., s * SAMPLES_PER_LATENT_ : (s + chunk_lat) * SAMPLES_PER_LATENT_].contiguous()
+    for i, s in enumerate(starts):
+        sz = tail_len if i == len(starts) - 1 else chunk_lat
+        chunk_audio = audio[..., s * SAMPLES_PER_LATENT_ : (s + sz) * SAMPLES_PER_LATENT_].contiguous()
         chunks.append((s, encoder_encode(runner, chunk_audio)))
 
     # Stitch: take the interior of each chunk (first/last include their outer edge)
     out = torch.zeros(1, 256, T_lat, device=audio.device, dtype=torch.float32)
-    half = overlap_lat // 2
-    for i, (s, z) in enumerate(chunks):
-        kl = 0 if i == 0 else half
-        kr = chunk_lat if i == len(chunks) - 1 else chunk_lat - (overlap_lat - half)
-        out[..., s + kl : s + kr] = z[..., kl:kr]
+    runs = _window_owners([s for s, _ in chunks], [chunk_lat]*len(chunks), T_lat)
+    for (s, z), run in zip(chunks, runs):
+        if run is None:
+            continue
+        dlo, dhi, slo, shi = run
+        out[..., dlo:dhi] = z[..., slo:shi]
+    return out[..., :T_req]                # drop the replicated latent
+
+
+# ⚠ The SHIPPED decoders BAKE this value: their IO is ('latent', 'pcm'), matching the
+# pre-limiter engines, so they are drop-in for any caller that binds two tensors. Baked and
+# runtime-input builds are BIT-EXACT given the same scales, and baked is ~4% faster (one fewer
+# scalar Mul plus constant folding). Build with --ceiling-input if you want the knob back.
+#
+# The limiter ceiling, when the decoder exposes it as a runtime input. TensorRT has NO default
+# for a graph input -- an unbound address makes enqueue fail outright ("Address is not set for
+# input tensor limiter_ceiling") -- so the default lives here and decoder_decode binds it unless
+# the caller overrides. 0.977 = -0.2021 dBFS, the setting decided by the 21,600-cell sweep.
+# A value far above 1 makes the gain identically 1.0, bypassing the limiter and letting the
+# graph's +-1.0 clamp reproduce the old hard-clip behaviour.
+DEFAULT_LIMITER_CEILING = 0.977
+
+
+DEFAULT_DECODER_CHUNK_LAT = 256   # 0.36 GB of scratch for SAME-S, 0.51 GB for SAME-L
+DEFAULT_DECODER_TRIM_LAT = 16     # dropped from each interior edge; must be EVEN
+
+
+def decode_auto(runner: "TRTRunner", latents: torch.Tensor, **kw) -> torch.Tensor:
+    """decoder_decode, or decode_chunked when the request exceeds the runner's bound ceiling.
+
+    The shipped decoders carry two profiles; whichever one the runner selected fixes the largest
+    latent count a single enqueue may bind. Calling decoder_decode past that does not silently
+    truncate -- TRT refuses the shape and the enqueue fails -- so every caller that does not know
+    the render length in advance should come through here.
+    """
+    try:
+        _, hi = profile_bounds(runner, "latent")
+    except Exception:
+        hi = 0
+    if hi and latents.shape[-1] > hi:
+        return decode_chunked(runner, latents, chunk_lat=hi, balance=True, **kw)
+    return decoder_decode(runner, latents, **kw)
+
+
+def decode_chunked(runner: TRTRunner, latents: torch.Tensor, *,
+                   chunk_lat: int = DEFAULT_DECODER_CHUNK_LAT,
+                   trim_lat: int = DEFAULT_DECODER_TRIM_LAT,
+                   warmup_passes: int = 2, balance: bool = True,
+                   limiter_ceiling: float | None = None) -> torch.Tensor:
+    """Chunked SAME-S/L decode, so the engine's PROFILE CEILING can be lowered.
+
+    Decoder scratch is linear in the profile ceiling (SAME-S 1.40 MB per latent of ceiling,
+    SAME-L 1.99) and is committed at create_execution_context() -- before any shape is bound.
+    A 4096-ceiling decoder therefore reserves 5.72 GB (SAME-S) / 8.14 GB (SAME-L) whether you
+    decode 6 minutes or 5 seconds. Decoding in windows lets the engine be built with a ceiling
+    of `chunk_lat` instead, which is the only thing that reduces that reservation.
+
+    ⚠ EVERY CHUNK START MUST BE EVEN. The latent->audio path carries a stride-2 structure:
+    a window starting at an even latent decodes at the noise floor, and one starting at an ODD
+    latent collapses to cos 0.978 against the single-shot decode. The failure is binary (no
+    gradation between even and odd) and CANNOT be recovered by overlap or by left warm-up
+    context -- 0 through 192 latents of warm-up all measure identically wrong. The natural way
+    to hit it is the final chunk: anchoring the tail at N-chunk_lat gives an odd start whenever
+    N is odd, so the tail start is rounded UP to even here and the last window is simply shorter.
+
+    Measured against a single-shot decode, chunked output lands on SAME-S's own noise floor
+    (~0.9989, set by its RandomNormalLike bottleneck -- i.e. as close as two decodes of the same
+    latent get to each other) at every length from 12 s to 6 min and every chunk size 64..2048.
+    SAME-L is bit-deterministic and chunks to ~0.9998; its residual is a sliding-window edge
+    effect that more trim does not remove (trim 16/32/64 all measure the same).
+
+    Args:
+      latents:       (1, 256, N)
+      chunk_lat:     the engine's profile ceiling -- the LARGEST window allowed. With
+                     balance=True the actual window shrinks to spread the work evenly, which
+                     never costs VRAM and avoids decoding up to 1.59x the needed latents.
+      trim_lat:      dropped from each interior edge (half per side). Must be even to keep
+                     every start even.
+      warmup_passes: zero-latent calls at chunk_lat before the real windows, matching
+                     encode_chunked -- these engines dislike in-loop shape transitions.
+
+    Returns: same LAYOUT as decoder_decode, but for pcm-flavour engines the accumulator is
+    **int16, not int32** -- the values are already clamped to int16 range and holding the
+    full-length output in int32 would double the one buffer chunking exists to shrink. Callers
+    must therefore test for an INTEGER dtype, not specifically int32: treating int16 pcm as float
+    audio scales it by 32767 a second time and saturates every sample (rms 0.9997, exit 0).
+    """
+    if trim_lat % 2:
+        raise ValueError(f"trim_lat must be even to keep chunk starts even, got {trim_lat}")
+    N_req = latents.shape[-1]
+    if N_req <= chunk_lat:
+        # Pass the ceiling THROUGH. Dropping it here silently re-enabled the limiter for every
+        # request short enough to fit one window, so a caller asking for LIMITER_BYPASS got
+        # bypass above the chunk size and 0.977 below it -- which reads as a length-dependent
+        # quality cliff in any A/B that spans the boundary.
+        return decoder_decode(runner, latents, limiter_ceiling=limiter_ceiling)
+
+    # Pad an ODD length to even before planning. With N odd the balanced plan cannot give every
+    # window the same size -- L=1291 yields five windows of 230 and a tail of 229 -- and that single
+    # in-loop SHAPE TRANSITION costs ~54 ms on SAME-L (126.8 ms vs 72.2 ms for L=1292, same window
+    # count). It is the instability the repo's encode_chunked already guards against by holding one
+    # shape and pre-warming. One replicated latent makes every window identical; the extra audio is
+    # sliced off at the end. (A single odd-length window is NOT slow on its own -- 169 vs 170
+    # latents measures 8.82 vs 8.72 ms -- so this is the transition, not the shape.)
+    if N_req % 2:
+        latents = torch.cat([latents, latents[..., -1:]], dim=-1)
+    N = latents.shape[-1]
+
+    if balance:
+        # chunk_lat is the engine's CEILING; the actual window may be smaller. Anchoring a
+        # fixed-size tail wastes work whenever N sits just above a multiple of the window:
+        # covering N=646 with 512-windows decodes 1024 latents (1.59x the work) because the
+        # last window overlaps the first by 378. Spreading the same number of windows evenly
+        # costs 1.03x instead -- same chunk count, same VRAM, ~35% less decoding. Chunk count
+        # is what the ceiling forces; only the size within it is free.
+        n = max(1, -(-(N - trim_lat) // (chunk_lat - trim_lat)))
+        chunk_lat = min(chunk_lat, -(-(N + (n - 1) * trim_lat) // n // 2) * 2)
+        if chunk_lat <= trim_lat:
+            raise ValueError(f"balanced chunk {chunk_lat} <= trim {trim_lat}")
+
+    step = (chunk_lat - trim_lat) // 2 * 2
+    starts = list(range(0, N - chunk_lat, step))
+    last = -(-(N - chunk_lat) // 2) * 2          # round UP -> stays even, covers the final latent
+    if not starts or starts[-1] != last:
+        starts.append(last)
+
+    warm = torch.zeros(1, IO_CHANNELS, chunk_lat, device=latents.device, dtype=latents.dtype)
+    for _ in range(warmup_passes):
+        decoder_decode(runner, warm, limiter_ceiling=limiter_ceiling)
+
+    first = decoder_decode(runner, latents[..., starts[0]:starts[0] + chunk_lat].contiguous(),
+                           limiter_ceiling=limiter_ceiling)
+    pcm_flavor = (first.dim() == 3 and first.shape[1] >= first.shape[2])   # (1, T, 2) int32
+    # Accumulate PCM in int16, not the engine's int32. The graph already clamps to +-32767 before
+    # its int32 cast (TRT cannot emit int16), and every caller narrows to int16 immediately, so the
+    # full-length int32 buffer is 2x larger than anything needs. It is also the ONLY term here that
+    # scales with length: at L=16384 it is 537 MB of a 2818 MiB peak, halved to 268 MB. Narrowing
+    # per window keeps the wide dtype confined to one chunk. `.to(torch.int16)` in existing callers
+    # stays valid -- it is a no-op on an int16 tensor.
+    acc_dtype = torch.int16 if (pcm_flavor and first.dtype == torch.int32) else first.dtype
+    out = torch.zeros((1, N * SAMPLES_PER_LATENT, 2) if pcm_flavor
+                      else (1, 2, N * SAMPLES_PER_LATENT),
+                      dtype=acc_dtype, device=first.device)
+
+    def _place(dst_lo, dst_hi, src, src_lo, src_hi):
+        a, b = dst_lo * SAMPLES_PER_LATENT, dst_hi * SAMPLES_PER_LATENT
+        c, d = src_lo * SAMPLES_PER_LATENT, src_hi * SAMPLES_PER_LATENT
+        if pcm_flavor:
+            out[:, a:b, :] = src[:, c:d, :].to(acc_dtype)
+        else:
+            out[:, :, a:b] = src[:, :, c:d]
+
+    sizes = [(N - st) if i == len(starts) - 1 else chunk_lat for i, st in enumerate(starts)]
+    runs = _window_owners(starts, sizes, N)
+    for i, s in enumerate(starts):
+        end = s + sizes[i]
+        piece = (first if i == 0 else
+                 decoder_decode(runner, latents[..., s:end].contiguous(),
+                                limiter_ceiling=limiter_ceiling))
+        run = runs[i]
+        if run is None:
+            continue
+        dlo, dhi, slo, shi = run
+        _place(dlo, dhi, piece, slo, shi)
+    if N != N_req:                       # drop the replicated latent's audio
+        keep = N_req * SAMPLES_PER_LATENT
+        out = out[:, :keep, :] if pcm_flavor else out[:, :, :keep]
     return out
 
 
-def decoder_decode(runner: TRTRunner, latents: torch.Tensor) -> torch.Tensor:
+def decoder_decode(runner: TRTRunner, latents: torch.Tensor, *,
+                   limiter_ceiling: float | None = None) -> torch.Tensor:
     """SAME-S/L decoder.
 
     Two engine flavors are supported (auto-detected by output tensor name):
@@ -651,7 +1213,33 @@ def decoder_decode(runner: TRTRunner, latents: torch.Tensor) -> torch.Tensor:
     out_name = "pcm" if "pcm" in runner.out_dtype else "audio"
     out_dt = runner.out_dtype[out_name]
     lat = latents.to(in_dt).contiguous()
-    ctx.set_input_shape("latent", tuple(lat.shape))
+    if "limiter_ceiling" in runner.in_dtype:
+        # Engines built with the ceiling promoted to an input. Bind the shipped default so these
+        # engines are drop-in for callers that know nothing about the parameter; pass
+        # limiter_ceiling=LIMITER_BYPASS to disable limiting (the clamp still bounds the output).
+        cv = DEFAULT_LIMITER_CEILING if limiter_ceiling is None else float(limiter_ceiling)
+        if not hasattr(runner, "_ceil_buf") or float(runner._ceil_buf.item()) != cv:
+            runner._ceil_buf = torch.tensor(cv, dtype=torch.float32, device="cuda")
+        ctx.set_input_shape("limiter_ceiling", ())
+        ctx.set_tensor_address("limiter_ceiling", runner._ceil_buf.data_ptr())
+    elif limiter_ceiling is not None:
+        raise ValueError("this decoder engine has the limiter ceiling baked in; rebuild with "
+                         "build_ship_capped.py --ceiling-input to make it settable")
+    if not ctx.set_input_shape("latent", tuple(lat.shape)):
+        # An out-of-profile shape is REFUSED but does not raise: the context keeps whatever shape
+        # it last held, so the decode returns the previous request's length filled with plausible
+        # audio. Measured: asking a 4096-ceiling engine for 5168 latents returned 4,194,304 samples
+        # (the prior 1024-latent shape) at absmax 32767, and asking for L=1 returned 995,328
+        # samples (the prior window). Both look like healthy audio and are wrong, so this has to be
+        # an error rather than a silent truncation.
+        idx = getattr(ctx, "active_optimization_profile", 0) or 0
+        lo, _, hi = runner.engine.get_tensor_profile_shape("latent", idx)
+        raise ValueError(
+            f"decoder: latent length {lat.shape[-1]} is outside the engine profile "
+            f"[{lo[-1]}, {hi[-1]}] (profile {idx}). Above the ceiling, decode in windows with "
+            f"decode_chunked(); below the floor, rebuild the engine with a lower profile minimum "
+            f"(build_capped.py --min-l 1) -- padding up to the floor is out-of-distribution and "
+            f"measures 0.82-0.97 against a native short decode.")
     out_shape = tuple(ctx.get_tensor_shape(out_name))
     out = torch.empty(out_shape, dtype=out_dt, device="cuda")
     ctx.set_tensor_address("latent", lat.data_ptr())
@@ -1082,14 +1670,14 @@ def prompt_user_if_missing(args):
         suggested = DIT_CHOICES[args.dit]["default_decoder"]
         args.decoder = _arrow_pick("Choose audio decoder:", list(DECODER_PATHS.keys()), default=suggested)
         print(f"  → {args.decoder}")
-    # Resolve DiT precision default per model: fp16-mixed everywhere. bf16 is
-    # medium-only and selectable (sm-music / sm-sfx use standard attention and
-    # already fuse in fp16mixed).
+    # Resolve DiT precision: default fp16 for every model. Retired tokens
+    # (fp16mixed, bf16) alias to fp16 with a one-line note.
     if getattr(args, "precision", None) is None:
         args.precision = default_precision(args.dit)
-    if args.precision == "bf16" and args.dit != "medium":
-        sys.exit("error: --precision bf16 is only available for --dit medium "
-                 "(sm-music / sm-sfx already fuse in fp16mixed).")
+    elif args.precision in _PRECISION_ALIAS:
+        _canon = _PRECISION_ALIAS[args.precision]
+        print(f"  note: --precision {args.precision} is retired → using {_canon}", file=sys.stderr)
+        args.precision = _canon
     if args.seed is None:
         args.seed = random.randint(0, 2**31 - 1)
     return args
@@ -1137,20 +1725,22 @@ def main():
     ap.add_argument("--decoder", choices=list(DECODER_PATHS.keys()), default=None,
                     help="Audio decoder. 'same-s' pairs with sm-* (110 MB engine). "
                          "'same-l' pairs with medium (1.2 GB engine). Interactive picker if omitted.")
-    ap.add_argument("--precision", choices=list(PRECISIONS), default=None,
-                    help="DiT engine precision (default is 'fp16mixed' for every model). "
-                         "'fp16mixed' = FP16 trunk + FP32 RMSNorm/RoPE islands with an FMHA-fused "
+    ap.add_argument("--dec-precision", choices=list(DECODER_TIERS), default="canonical",
+                    help="Decoder/encoder quantization tier (orthogonal to --precision, the DiT): "
+                         "canonical (bf16) | fp8 (~1.14x, near-transparent) | fp8_fast (SAME-S only, "
+                         "~1.22x). Auto-downloads from HF. (For max-fidelity decode use --precision fp32.)")
+    ap.add_argument("--precision", choices=list(PRECISIONS) + list(_PRECISION_ALIAS), default=None,
+                    help="DiT engine precision (default 'fp16' for every model). "
+                         "'fp16' = FP16 trunk + FP32 RMSNorm/RoPE islands with an FMHA-fused "
                          "FP16 attention core (canonical; fp32-accurate at every length). "
                          "'fp8' = fp8 E4M3 linears (attention + RoPE kept higher precision). On MEDIUM "
                          "it's a max-speed clean tier (bf16 fused FMHA + baked fp32 RoPE, ~1.3× faster, "
                          "clean at long sequence, capped at L<=4096). On sm-music/sm-sfx it's a clean "
                          "weight-halving tier (479 vs 936 MB engine, velocity-cos ~0.99 vs eager) that is "
                          "only marginally faster (~1.1×; their small forward is overhead-bound at batch 1). "
-                         "'bf16' (MEDIUM ONLY) = ~3%% faster still, but it evaluates RoPE's angle "
-                         "in bf16 and drifts at long sequence (clips 2-3%% of samples on a 6-min "
-                         "render); fine for short clips, not seed-reproducible vs fp16mixed. "
                          "'fp32' = pure FP32, matches PyTorch eager bit-for-bit but ~2× slower "
-                         "and ~2× the VRAM. Engines auto-download from HF if missing.")
+                         "and ~2× the VRAM. ('fp16mixed' and the retired medium-only 'bf16' are accepted "
+                         "as deprecated aliases for 'fp16'.) Engines auto-download from HF if missing.")
     ap.add_argument("--models-dir", default=str(MODELS_DIR),
                     help=f"Directory containing the TRT engines. Default: {MODELS_DIR}")
     # ── Sampling ──
@@ -1207,7 +1797,7 @@ def main():
     if args.models_dir != str(MODELS_DIR):
         new_root = Path(args.models_dir).resolve()
         new_arch_dir = new_root / ARCH
-        T5GEMMA_PATH = new_arch_dir / "t5gemma" / "t5gemma_fp16mixed.trt"
+        T5GEMMA_PATH = new_arch_dir / "t5gemma" / "t5gemma_fp16.trt"
         for kk in DIT_CHOICES:
             DIT_CHOICES[kk]["engine"] = new_arch_dir / DIT_CHOICES[kk]["engine"].relative_to(ARCH_DIR)
         for kk in DECODER_PATHS:
@@ -1309,7 +1899,7 @@ def main():
 
     # ── Lazy-download any missing engine files for the chosen (dit, decoder) combo ──
     needed = get_engine_files(args.dit, args.decoder, args.precision,
-                                with_encoder=bool(args.init_audio))
+                                with_encoder=bool(args.init_audio), dec_tier=args.dec_precision)
     _ensure_files(needed)
 
     # ── Heavy imports (torch + tensorrt + plugin) ──
@@ -1337,10 +1927,10 @@ def main():
     engine_specs = {
         "t5":  T5GEMMA_PATH,
         "dit": get_dit_engine_path(args.dit, args.precision),
-        "dec": get_decoder_engine_path(args.decoder, args.precision),
+        "dec": resolve_decoder_engine(args.decoder, args.precision, args.dec_precision),
     }
     if args.init_audio:
-        engine_specs["enc"] = ENCODER_PATHS[args.decoder]
+        engine_specs["enc"] = resolve_encoder_engine(args.decoder, args.dec_precision)
     t0 = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(engine_specs)) as ex:
         futs = {name: ex.submit(TRTRunner, path) for name, path in engine_specs.items()}
@@ -1388,11 +1978,11 @@ def main():
     for _ in range(WARMUP_PASSES):
         _ = t5gemma_encode(runners["t5"], tokenizer, " ")
         _ = dit.step(_w_x, _w_t, _w_h, _w_m, 30.0, _w_l)
-        dec_out = decoder_decode(runners["dec"], _w_lat)
+        dec_out = decode_auto(runners["dec"], _w_lat)
         # Also warm the Stage-5 narrow+DtoH path — first inference used to
         # spend ~10 ms here on cold-launch overhead. Mirror the production
         # path exactly.
-        if dec_out.dtype == torch.int32:
+        if dec_out.dtype in (torch.int32, torch.int16):   # pcm-baked; see decode_chunked
             pcm_w = dec_out[0].to(torch.int16)
             if _pinned_pcm is not None:
                 _pinned_pcm.copy_(pcm_w, non_blocking=True)
@@ -1401,7 +1991,8 @@ def main():
         else:
             _ = dec_out.cpu().numpy()
         if _w_audio is not None:
-            _ = encoder_encode(runners["enc"], _w_audio)
+            _ = encode_chunked(runners["enc"], _w_audio, warmup_passes=0,
+                               balance=True)
 
     # One full sampling-loop pass: primes sample_flow_pingpong's per-step body
     # (t_curr.unsqueeze, the in-loop torch.randn(generator=g) variant, the
@@ -1587,11 +2178,11 @@ def main():
 
     # ── 4. Decoder ──
     t0 = time.time()
-    audio = decoder_decode(runners["dec"], latents)
+    audio = decode_auto(runners["dec"], latents)
     if args.free_models:
         runners["dec"].free(); del runners["dec"]
     decode_ms = (time.time() - t0) * 1000
-    _pcm_baked = audio.dtype == torch.int32
+    _pcm_baked = audio.dtype in (torch.int32, torch.int16)   # see decode_chunked
     stage("[4/5]", f"Decoder ({args.decoder})", decode_ms)
     sub(f"audio {tuple(audio.shape)} {audio.dtype}"
         f"{'  (pcm baked-in)' if _pcm_baked else ''}")

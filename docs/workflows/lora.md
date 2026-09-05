@@ -309,9 +309,9 @@ The `set_lora_strength()` function adjusts the LoRA contribution at runtime with
 ```python
 from stable_audio_3.models.lora import set_lora_strength
 
-set_lora_strength(model, 0.5)   # Half-strength on all LoRAs
-set_lora_strength(model, 0.0)   # Effectively disable all LoRAs
-set_lora_strength(model, 2.0)   # Double-strength on all LoRAs
+set_lora_strength(model, 0.5)  # Half-strength on all LoRAs
+set_lora_strength(model, 0.0)  # Effectively disable all LoRAs
+set_lora_strength(model, 2.0)  # Double-strength on all LoRAs
 
 # With multiple LoRAs, target a specific one by index:
 set_lora_strength(model, 1.0, lora_index=0)  # Full strength on first LoRA
@@ -328,16 +328,8 @@ You can merge multiple LoRA checkpoints with different weights into a single bas
 from stable_audio_3.models.lora.utils import merge_loras_into_base_model
 
 lora_configurations = [
-    {
-        'name': 'style_a',
-        'state_dict': lora_sd_a,
-        'application_weight': 0.7
-    },
-    {
-        'name': 'style_b',
-        'state_dict': lora_sd_b,
-        'application_weight': 0.3
-    }
+    {"name": "style_a", "state_dict": lora_sd_a, "application_weight": 0.7},
+    {"name": "style_b", "state_dict": lora_sd_b, "application_weight": 0.3},
 ]
 
 merge_loras_into_base_model(model, lora_configurations)
@@ -352,8 +344,8 @@ For models where the input embedding and output projection share weights, LoRA s
 ```python
 from stable_audio_3.models.lora.utils import tie_weights, untie_weights
 
-tie_weights(linear_layer, embedding_layer)   # Share LoRA params
-untie_weights(linear_layer, embedding_layer) # Create independent copies
+tie_weights(linear_layer, embedding_layer)  # Share LoRA params
+untie_weights(linear_layer, embedding_layer)  # Create independent copies
 ```
 
 This is only supported for standard LoRA (not DoRA, BoRA, or -XS variants).

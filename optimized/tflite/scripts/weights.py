@@ -26,23 +26,25 @@ SCRIPT_DIR = Path(__file__).resolve().parent.parent
 # Bundles the install script offers to the user. Each maps to a list of
 # model files (local relative path on the left, HF repo path on the right).
 # T5Gemma is in SHARED because every bundle needs it. The two small DiTs
-# share the SAME-S codec; medium uses the SAME-L codec.
+# share the SAME-S codec; medium uses the SAME-L codec. Each ships at its
+# runtime default precision — DiT fp32, SAME codec w8a8 (quality-free and
+# ~5x smaller); either's other tier lazy-downloads on demand.
 
 DIT_BUNDLES: dict[str, list[tuple[str, str]]] = {
     "sm-music": [
         ("models/tflite/sa3-sm-music/dit_fp32.tflite", "tflite/sa3-sm-music/dit_fp32.tflite"),
-        ("models/tflite/same-s/enc_fp32.tflite",       "tflite/same-s/enc_fp32.tflite"),
-        ("models/tflite/same-s/dec_fp32.tflite",       "tflite/same-s/dec_fp32.tflite"),
+        ("models/tflite/same-s/enc_w8a8.tflite",       "tflite/same-s/enc_w8a8.tflite"),
+        ("models/tflite/same-s/dec_w8a8.tflite",       "tflite/same-s/dec_w8a8.tflite"),
     ],
     "sm-sfx": [
         ("models/tflite/sa3-sm-sfx/dit_fp32.tflite",   "tflite/sa3-sm-sfx/dit_fp32.tflite"),
-        ("models/tflite/same-s/enc_fp32.tflite",       "tflite/same-s/enc_fp32.tflite"),
-        ("models/tflite/same-s/dec_fp32.tflite",       "tflite/same-s/dec_fp32.tflite"),
+        ("models/tflite/same-s/enc_w8a8.tflite",       "tflite/same-s/enc_w8a8.tflite"),
+        ("models/tflite/same-s/dec_w8a8.tflite",       "tflite/same-s/dec_w8a8.tflite"),
     ],
     "medium": [
         ("models/tflite/sa3-m/dit_fp32.tflite",        "tflite/sa3-m/dit_fp32.tflite"),
-        ("models/tflite/same-l/enc_fp32.tflite",       "tflite/same-l/enc_fp32.tflite"),
-        ("models/tflite/same-l/dec_fp32.tflite",       "tflite/same-l/dec_fp32.tflite"),
+        ("models/tflite/same-l/enc_w8a8.tflite",       "tflite/same-l/enc_w8a8.tflite"),
+        ("models/tflite/same-l/dec_w8a8.tflite",       "tflite/same-l/dec_w8a8.tflite"),
     ],
 }
 
@@ -52,18 +54,23 @@ SHARED: list[tuple[str, str]] = [
 
 # Human-friendly bundle sizes (for the install prompt). Exact, from HF metadata.
 BUNDLE_SIZES = {
-    "sm-music": "2.3 GB  (small music DiT + SAME-S codec, all fp32)",
-    "sm-sfx":   "2.3 GB  (small sfx DiT + SAME-S codec, all fp32)",
-    "medium":   "9.5 GB  (medium DiT + SAME-L codec, all fp32)",
+    "sm-music": "2.0 GB  (small music DiT fp32 + SAME-S codec w8a8)",
+    "sm-sfx":   "2.0 GB  (small sfx DiT fp32 + SAME-S codec w8a8)",
+    "medium":   "6.8 GB  (medium DiT fp32 + SAME-L codec w8a8)",
 }
 # T5Gemma (shared, fp16) adds ~0.6 GB the first time any bundle is fetched.
 
-# Quantized DiT + decoder variants (selected via sa3_tflite.py --precision; wXaY =
-# weight/activation bit-widths, "16" = fp16). Not part of the install bundles — they
-# lazy-download on first use. w16a32 = fp16 weights (half size, ≈lossless, slower on
-# CPU); w8a32 / w8a8-dyn = GPTQ-calibrated int8 weights.
-QUANT_PRECISIONS = ("w16a32", "w8a32", "w8a8-dyn")
-PRECISIONS = ("fp32",) + QUANT_PRECISIONS   # everything --precision accepts
+# The DiT keeps its full precision ladder (int8 fails on the DiT — the 8-step sampler is chaotically
+# sensitive, so int8 becomes a different sample; wXaY = weight/activation bits, "16" = fp16). These
+# lazy-download on first use. w16a32 = fp16 weights; w8a32 / w8a8-dyn = GPTQ-calibrated int8 weights.
+DIT_QUANT_PRECISIONS = ("w16a32", "w8a32", "w8a8-dyn")
+DIT_PRECISIONS = ("fp32",) + DIT_QUANT_PRECISIONS
+# The SAME autoencoder ships as static RUNG models (need litert >= 2.2.0) with just TWO tiers:
+# fp32 and w8a8. The codec runs once on a fixed latent, so int8 is quality-free on the round-trip —
+# w16a32 / w8a32 add no audible quality and are bigger/slower, so they're retired to
+# tflite/same-*/legacy/ (with the pre-rung varlen models). w8a8 is the recommended codec default.
+CODEC_PRECISIONS = ("fp32", "w8a8")
+PRECISIONS = DIT_PRECISIONS   # what --precision accepts (a global; the codec maps it via _codec_of)
 DIT_SUBDIR = {"sm-music": "sa3-sm-music", "sm-sfx": "sa3-sm-sfx", "medium": "sa3-m"}
 
 
@@ -72,15 +79,15 @@ def dit_rel(dit: str, precision: str = "fp32") -> str:
     return f"models/tflite/{DIT_SUBDIR[dit]}/dit_{precision}.tflite"
 
 
-def dec_rel(dec: str, precision: str = "fp32") -> str:
-    """Local rel path of a SAME codec decoder file for (codec, precision)."""
+def dec_rel(dec: str, precision: str = "w8a8") -> str:
+    """Local rel path of a SAME codec DECODER rung file for (codec, precision∈CODEC_PRECISIONS).
+    These are static multi-signature rung models (litert>=2.2.0); driven by rung_decoder.RungDecoder."""
     return f"models/tflite/{dec}/dec_{precision}.tflite"
 
 
-def enc_rel(dec: str, precision: str = "fp32") -> str:
-    """Local rel path of a SAME codec encoder file for (codec, precision).
-    Encoder int8 is GPTQ-calibrated on real audio (torch-free, in-place on the
-    tflite graph) — w8a32 measures 36/46 dB latent PSNR (same-s/same-l)."""
+def enc_rel(dec: str, precision: str = "w8a8") -> str:
+    """Local rel path of a SAME codec ENCODER rung file for (codec, precision∈CODEC_PRECISIONS).
+    Static multi-signature rung model (litert>=2.2.0); driven by rung_encoder.RungEncoder."""
     return f"models/tflite/{dec}/enc_{precision}.tflite"
 
 # Flat (local_rel_path → hf_path) lookup — used by sa3_tflite.py for lazy
@@ -91,10 +98,11 @@ for _items in DIT_BUNDLES.values():
         FLAT_MANIFEST[_rel] = _hf
 for _rel, _hf in SHARED:
     FLAT_MANIFEST[_rel] = _hf
-for _prec in QUANT_PRECISIONS:
+for _prec in DIT_QUANT_PRECISIONS:                 # DiT quant variants
     for _fam in DIT_SUBDIR:
         _rel = dit_rel(_fam, _prec)
         FLAT_MANIFEST[_rel] = _rel.replace("models/tflite/", "tflite/", 1)
+for _prec in CODEC_PRECISIONS:                     # SAME-AE rung tiers (fp32 + w8a8) for both codecs
     for _dec in ("same-s", "same-l"):
         for _rel in (dec_rel(_dec, _prec), enc_rel(_dec, _prec)):
             FLAT_MANIFEST[_rel] = _rel.replace("models/tflite/", "tflite/", 1)

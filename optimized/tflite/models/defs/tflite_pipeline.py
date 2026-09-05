@@ -8,8 +8,8 @@ The baked-I/O DiT bakes the conditioner (seconds embedder + prompt padding) and
 patch/unpatch into the graph, so this module only needs: the tokenizer, the T5Gemma
 front-end, the pingpong schedule, the noise maker, the host-side sampler, and a WAV
 writer. The research-only backends (MLX DiT A/B, per-precision model dicts, the numpy
-Conditioner / unpatch, encode_prompt / decode_with helpers) live in the speed-metal
-repo's tflite_pipeline.py and are intentionally dropped here.
+Conditioner / unpatch, encode_prompt / decode_with helpers) live in the full
+research pipeline and are intentionally dropped here.
 """
 from __future__ import annotations
 import wave
@@ -32,7 +32,7 @@ COND_TOKENS = 256                  # T5Gemma seq len
 # ───────────────────────── WAV ─────────────────────────
 def save_wav(path, audio):  # audio: (2, T) float32 in [-1,1]
     audio = np.clip(np.asarray(audio, np.float32), -1, 1)
-    pcm = (audio * 32767.0).astype(np.int16).T  # (T, 2) interleaved
+    pcm = np.rint(audio * 32767.0).astype(np.int16).T  # (T, 2) interleaved; round-to-nearest (matches TRT; truncation is a biased quantiser)
     with wave.open(str(path), "wb") as w:
         w.setnchannels(audio.shape[0]); w.setsampwidth(2); w.setframerate(SAMPLE_RATE)
         w.writeframes(pcm.tobytes())

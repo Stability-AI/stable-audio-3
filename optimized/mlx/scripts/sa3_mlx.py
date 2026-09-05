@@ -399,7 +399,7 @@ def main():
                          "options: strength=S (default --lora-strength) and steps=RANGE, a "
                          "1-based inclusive sampling-step range: 2-8, 2- (2..last), -4 (1..4) "
                          "or 3 (just step 3; default: all steps). Example: "
-                         "--lora plini.safetensors strength=0.8 steps=2- . Adapters covering "
+                         "--lora myband.safetensors strength=0.8 steps=2- . Adapters covering "
                          "every step are merged at load; step-gated ones are re-merged in "
                          "place at the (few) step boundaries — ~80 ms each on medium, no "
                          "extra memory, every step runs at full speed. The adapter is a "

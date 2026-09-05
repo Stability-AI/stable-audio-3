@@ -26,7 +26,7 @@ Usage:
     python build_from_onnx.py same-l-encoder
     python build_from_onnx.py same-l-decoder
     # SA3 DiT engines use a different builder (FP16-mixed recipe):
-    python build_dit_fp16mixed.py --input <onnx> --engine <out.trt>
+    python build_dit_fp16.py --input <onnx> --engine <out.trt>
     python build_from_onnx.py all          # build everything for this arch
 """
 import os
@@ -39,7 +39,16 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 # diff_attn_nocast_plugin + triton_swa_v2 (for SAME-L plugin) live in ../scripts/
 sys.path.insert(0, str(SCRIPTS_DIR.parent / "scripts"))
 
-from _arch import detect_arch, arch_dir  # noqa: E402
+# ⚠ There are TWO _arch.py — this directory's (detect_arch + repo_root + arch_dir +
+# onnx_dir) and scripts/ (detect_arch only). The scripts/ insert above lands at index 0,
+# so a plain `from _arch import ...` picked the wrong one and this script died on import
+# with "cannot import name 'arch_dir'". Load it by explicit path so the order cannot
+# matter again.
+import importlib.util as _ilu  # noqa: E402
+_spec = _ilu.spec_from_file_location("_build_arch", SCRIPTS_DIR / "_arch.py")
+_build_arch = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_build_arch)
+detect_arch, arch_dir = _build_arch.detect_arch, _build_arch.arch_dir
 
 
 HF_REPO = "stabilityai/stable-audio-3-optimized"
@@ -73,60 +82,20 @@ TARGETS = {
         "onnx_hf":     ["t5gemma/encoder.onnx"],
         # tokenizer.json ships bundled with the repo at scripts/tokenizer.json
         # (arch-agnostic), so we don't fetch it here anymore.
-        "trt_local":    "t5gemma/t5gemma_fp16mixed.trt",
+        "trt_local":    "t5gemma/t5gemma_fp16.trt",
         "flags":        set(),  # STRONGLY_TYPED carries the FP16/FP32 dtype hints
         "network":      "STRONGLY_TYPED",
         "workspace_gb": 8,
         "profile":      None,  # static shapes
         "plugin":       False,
     },
-    "same-s-encoder": {
-        "onnx_hf":      ["same-s/enc_dynamic_bf16.onnx"],
-        "trt_local":    "same-s/enc_dynamic_bf16.trt",
-        "flags":        {"BF16"},
-        "network":      "EXPLICIT_BATCH",
-        "workspace_gb": 16,
-        "profile":      {"audio": [(1, 2, 32 * SAMPLES_PER_LATENT),
-                                    (1, 2, 1292 * SAMPLES_PER_LATENT),
-                                    (1, 2, 4096 * SAMPLES_PER_LATENT)]},
-        "plugin":       False,
-    },
-    "same-s-decoder": {
-        "onnx_hf":      ["same-s/dec_dynamic_bf16.onnx"],
-        "trt_local":    "same-s/dec_dynamic_bf16.trt",
-        "flags":        {"BF16"},
-        "network":      "EXPLICIT_BATCH",
-        "workspace_gb": 16,
-        "profile":      {"latent": [(1, 256, 32), (1, 256, 1292), (1, 256, 4096)]},
-        "plugin":       False,
-    },
-    "same-l-encoder": {
-        "onnx_hf":      ["same-l/enc_dynamic_triton_swa.onnx"],
-        "trt_local":    "same-l/enc_dynamic_triton_swa.trt",
-        "flags":        set(),  # STRONGLY_TYPED carries dtype hints
-        "network":      "STRONGLY_TYPED",
-        "workspace_gb": 16,
-        "profile":      {"audio": [(1, 2, 32 * SAMPLES_PER_LATENT),
-                                    (1, 2, 1292 * SAMPLES_PER_LATENT),
-                                    (1, 2, 4096 * SAMPLES_PER_LATENT)]},
-        "plugin":       True,
-    },
-    "same-l-decoder": {
-        "onnx_hf":      ["same-l/dec_dynamic_triton_swa.onnx"],
-        "trt_local":    "same-l/dec_dynamic_triton_swa.trt",
-        "flags":        set(),
-        "network":      "STRONGLY_TYPED",
-        "workspace_gb": 16,
-        "profile":      {"latent": [(1, 256, 32), (1, 256, 1292), (1, 256, 4096)]},
-        "plugin":       True,
-    },
     # SA3 DiT engines: build from the pre-processed FP16-mixed ONNX hosted on
-    # HF. The producer (build_dit_fp16mixed.py) does the FP32-island surgery
+    # HF. The producer (build_dit_fp16.py) does the FP32-island surgery
     # once and uploads the result; consumers just compile with STRONGLY_TYPED
     # (no onnx-graphsurgeon dependency).
     "sa3-sm-music": {
-        "onnx_hf":      ["sa3-sm-music/dit_fp16mixed.onnx"],
-        "trt_local":    "sa3-sm-music/dit_fp16mixed.trt",
+        "onnx_hf":      ["sa3-sm-music/dit_fp16.onnx"],
+        "trt_local":    "sa3-sm-music/dit_fp16.trt",
         "flags":        set(),         # STRONGLY_TYPED + ONNX dtypes carry precision
         "network":      "STRONGLY_TYPED",
         "workspace_gb": 16,
@@ -134,25 +103,25 @@ TARGETS = {
         "plugin":       False,
     },
     "sa3-sm-sfx": {
-        "onnx_hf":      ["sa3-sm-sfx/dit_fp16mixed.onnx"],
-        "trt_local":    "sa3-sm-sfx/dit_fp16mixed.trt",
+        "onnx_hf":      ["sa3-sm-sfx/dit_fp16.onnx"],
+        "trt_local":    "sa3-sm-sfx/dit_fp16.trt",
         "flags":        set(),
         "network":      "STRONGLY_TYPED",
         "workspace_gb": 16,
         "profile":      _DIT_PROFILE,
         "plugin":       False,
     },
-    # SA3 small DiTs in fp8 — SELECTABLE (default stays fp16mixed). fp8 E4M3 on the
+    # SA3 small DiTs in fp8 — SELECTABLE (default stays fp16). fp8 E4M3 on the
     # 186 linear GEMMs, attention left fp16-fused and the fp32 RMSNorm/RoPE islands
-    # intact — an fp8-QDQ graft onto the fp16mixed graph (build/make_dit_fp8_smalldit.py),
+    # intact — an fp8-QDQ graft onto the fp16 graph (build/make_dit_fp8_smalldit.py),
     # NOT the medium's baked-RoPE recipe (these DiTs never had the bf16 long-angle
     # problem). Built STRONGLY_TYPED: the QDQ nodes carry fp8; TRT fires fp8 tensor-core
     # GEMMs on the linears while the fp16 FMHA fuser still runs the attention. Same
     # _DIT_PROFILE (batch=1, dynamic L∈[1,4096]) → identical CLI/feature surface.
     # This is a CLEAN WEIGHT-HALVING tier (479 vs 936 MB, velocity-cos ~0.99 vs eager,
-    # clip% at/below fp16mixed), only marginally faster (~1.1×): the small DiTs' ~5 ms
+    # clip% at/below fp16), only marginally faster (~1.1×): the small DiTs' ~5 ms
     # forward is overhead-bound at batch 1, so fp8's GEMM savings barely show. sm-* fp8
-    # is NOT seed-reproducible vs fp16mixed.
+    # is NOT seed-reproducible vs fp16.
     "sa3-sm-music-fp8": {
         "onnx_hf":      ["sa3-sm-music/dit_fp8.onnx", "sa3-sm-music/dit_fp8.onnx.data"],
         "trt_local":    "sa3-sm-music/dit_fp8.trt",
@@ -173,8 +142,8 @@ TARGETS = {
     },
     "sa3-m": {
         # 2.9 GB external-data sidecar travels alongside.
-        "onnx_hf":      ["sa3-m/dit_fp16mixed.onnx", "sa3-m/dit_fp16mixed.onnx.data"],
-        "trt_local":    "sa3-m/dit_fp16mixed.trt",
+        "onnx_hf":      ["sa3-m/dit_fp16.onnx", "sa3-m/dit_fp16.onnx.data"],
+        "trt_local":    "sa3-m/dit_fp16.trt",
         "flags":        set(),
         "network":      "STRONGLY_TYPED",
         "workspace_gb": 16,
@@ -190,7 +159,7 @@ TARGETS = {
     #
     # The ~1.76×@L=256 / 4.70×@L=4096 speedup this engine was shipped for was
     # measured against an fp16-mixed engine whose attention core was stuck in
-    # FP32; with that fixed (build_dit_fp16mixed.py's bound_attention_core) bf16
+    # FP32; with that fixed (build_dit_fp16.py's bound_attention_core) bf16
     # is only ~3% ahead, and it loses on accuracy: weakly-typed BF16 also lets
     # TRT evaluate RoPE's rotation angle in bf16, and that angle reaches ~4155
     # rad at L=4092 where bf16's spacing is 32 rad (> 2π), so position info for
@@ -258,13 +227,13 @@ TARGETS = {
     # 0.52/0.57/0.64 to 0.92/0.94/0.92 on adversarial seeds; sampling steps 1-7 match
     # the fully-calibrated #47 reference within ~0.001. It is still a SPEED tier over the
     # fp16-mixed default rather than a fidelity upgrade over it (single-step velocity cos
-    # ~0.92-0.94 < fp16mixed's ~1.0), but it no longer collapses at the highest-noise
+    # ~0.92-0.94 < fp16's ~1.0), but it no longer collapses at the highest-noise
     # first step the way the uncalibrated engine did. #47's fp16-attention variant buys
     # the last ~0.03 of step-0 fidelity for +2 ms/fwd; this tier keeps bf16 attention for
     # the speed. Identity of the shipped engine: 176 fp8 GEMMs + 96 bf16 fused MHA +
     # baked fp32 RoPE constant — check with scripts/verify_fp8_rope.py. Same _DIT_PROFILE
     # (batch=1, L in [1,4096]) → identical CLI/feature surface. medium-only, not
-    # seed-reproducible vs fp16mixed.
+    # seed-reproducible vs fp16.
     #
     # Producer: the fp8-linear ONNX (fp8 QDQ inserted; inv_freq inline) is RoPE-baked by
     # build_dit_bf16.py, the SAME baker as the bf16 tier (it handles inline OR external
@@ -571,6 +540,31 @@ def build_one(name: str) -> str:
     return str(target)
 
 
+# The autoencoders are NOT built here. build_autoencoders.py owns them: the shipping
+# engines carry two optimization profiles (a 256-latent low band for chunked decode and a
+# wide single-shot band) and, for the decoders, a baked limiter — none of which this
+# single-profile recipe table can express. Building them here produced
+# dec_dynamic_triton_swa.trt / dec_dynamic_bf16.trt and friends, retired names the runtime
+# registry never asks for, so the output was silently unusable.
+AUTOENCODER_TARGETS = {
+    "same-s-encoder": ("same-s", "enc"), "same-s-decoder": ("same-s", "dec"),
+    "same-l-encoder": ("same-l", "enc"), "same-l-decoder": ("same-l", "dec"),
+}
+
+
+def build_autoencoder(name: str) -> None:
+    """Delegate to build_autoencoders.py so there is exactly one AE build path."""
+    import subprocess
+    model, kind = AUTOENCODER_TARGETS[name]
+    script = Path(__file__).resolve().parent / "build_autoencoders.py"
+    cmd = [sys.executable, str(script), "--model", model, "--kind", kind]
+    print(f"\n━━━ {name} → build_autoencoders.py ━━━")
+    print(f"  $ {' '.join(cmd[1:])}", flush=True)
+    rc = subprocess.call(cmd)
+    if rc != 0:
+        raise SystemExit(f"build_autoencoders.py exited {rc}")
+
+
 def main():
     canonical = [k for k in TARGETS if not k.endswith("-fp32")]
     fp32      = [k for k in TARGETS if k.endswith("-fp32")]
@@ -579,6 +573,10 @@ def main():
         print(__doc__)
         print("\nCanonical (FP16-mixed) targets:")
         for k in canonical:
+            print(f"  {k}")
+        print("\nAutoencoders (delegated to build_autoencoders.py — two profiles + "
+              "baked limiter):")
+        for k in AUTOENCODER_TARGETS:
             print(f"  {k}")
         print("\nFP32 variants (~2x slower, ~2x engine size, opt-in):")
         for k in fp32:
@@ -590,20 +588,23 @@ def main():
         sys.exit(1)
 
     target = sys.argv[1]
+    def _build(name):
+        (build_autoencoder if name in AUTOENCODER_TARGETS else build_one)(name)
     if target == "all":
-        for name in canonical:
-            build_one(name)
+        for name in canonical + list(AUTOENCODER_TARGETS):
+            _build(name)
     elif target == "all-fp32":
         for name in fp32:
             build_one(name)
     elif target == "all-both":
-        for name in canonical + fp32:
-            build_one(name)
-    elif target in TARGETS:
-        build_one(target)
+        for name in canonical + list(AUTOENCODER_TARGETS) + fp32:
+            _build(name)
+    elif target in TARGETS or target in AUTOENCODER_TARGETS:
+        _build(target)
     else:
         print(f"unknown target: {target}")
-        print(f"valid: {list(TARGETS)} + 'all' / 'all-fp32' / 'all-both'")
+        print(f"valid: {list(TARGETS) + list(AUTOENCODER_TARGETS)} "
+              f"+ 'all' / 'all-fp32' / 'all-both'")
         sys.exit(1)
 
 

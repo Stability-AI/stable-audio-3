@@ -8,7 +8,10 @@ An overview of the different inference modes. The python interface is shown, but
 
 ```python
 from stable_audio_3 import StableAudioModel
-model = StableAudioModel.from_pretrained("medium", device="cuda")  # device is optional, defaults to cuda → mps → cpu
+
+model = StableAudioModel.from_pretrained(
+    "medium", device="cuda"
+)  # device is optional, defaults to cuda → mps → cpu
 ```
 
 The first argument selects the model to load. Available models:
@@ -34,10 +37,10 @@ audio = model.generate(
     prompt="An anthemic Pop Rock instrumental that fills your head with nostalgic thoughtfulness",
     negative_prompt="poor quality",
     duration=30,
-    steps=8, # default
-    cfg_scale=1, # default
-    seed=-1, # default
-    batch_size=1 # default
+    steps=8,  # default
+    cfg_scale=1,  # default
+    seed=-1,  # default
+    batch_size=1,  # default
 )
 ```
 
@@ -117,7 +120,7 @@ import torchaudio
 from stable_audio_3 import StableAudioModel
 
 model = StableAudioModel.from_pretrained("medium")
-inpaint_audio = torchaudio.load("/path/to/some/audio.wav") # Assume this is 10s long
+inpaint_audio = torchaudio.load("/path/to/some/audio.wav")  # Assume this is 10s long
 audio = model.generate(
     inpaint_audio=inpaint_audio,
     inpaint_mask_start_seconds=10.0,
@@ -211,9 +214,9 @@ model.load_lora(["style_a.safetensors", "style_b.safetensors"])
 Control how strongly the LoRA influences the output at runtime:
 
 ```python
-model.set_lora_strength(0.5)              # Half-strength on all LoRAs
-model.set_lora_strength(1.5)              # Amplify the effect
-model.set_lora_strength(0.0)              # Disable without unloading
+model.set_lora_strength(0.5)  # Half-strength on all LoRAs
+model.set_lora_strength(1.5)  # Amplify the effect
+model.set_lora_strength(0.0)  # Disable without unloading
 
 # With multiple LoRAs, target by index:
 model.set_lora_strength(1.0, lora_index=0)

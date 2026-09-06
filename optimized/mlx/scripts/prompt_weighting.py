@@ -52,3 +52,45 @@ def parse_weighted_prompt(raw: str) -> tuple[str, list[tuple[int, int, float]]]:
         pos = m.end()
     clean_parts.append(raw[pos:])
     return "".join(clean_parts), spans
+
+
+def compute_token_spans(
+    clean_text: str,
+    char_spans: list[tuple[int, int, float]],
+    tokenizer,
+    max_len: int = 256,
+) -> list[tuple[int, int, float]]:
+    """Turn character-offset spans (from parse_weighted_prompt) into
+    token-offset spans, by construction rather than by search.
+
+    For each span, tokenizing the clean text's *prefix* up to each of
+    its two boundaries and taking the resulting token counts gives the
+    span's exact [start:end) slice in the full tokenization — this
+    relies on SentencePiece prefix tokenization being a stable
+    extension (verified against this project's own tokenizer: longer
+    prefixes of the same text never retroactively change an earlier
+    prefix's tokens).
+
+    `tokenizer` needs only `.Encode(str) -> list[int]` — a bare
+    sentencepiece.SentencePieceProcessor, or T5Gemma's own `.tokenizer`
+    attribute at the real call site.
+
+    Spans that fall entirely past `max_len` (already truncated away by
+    T5Gemma.tokenize's own max_len truncation) are dropped — nothing
+    new to handle, since untruncated positions are exactly what the
+    rest of the pipeline already ignores past max_len.
+    """
+    token_spans = []
+    for start_char, end_char, weight in char_spans:
+        # If there's a space before the phrase, tokenize up to (but not including)
+        # the space so the space merges with the phrase tokens in the full tokenization.
+        prefix_end = start_char
+        if start_char > 0 and clean_text[start_char - 1] == " ":
+            prefix_end = start_char - 1
+
+        n_before = min(len(tokenizer.Encode(clean_text[:prefix_end])), max_len)
+        n_through = min(len(tokenizer.Encode(clean_text[:end_char])), max_len)
+        if n_before >= max_len:
+            continue
+        token_spans.append((n_before, n_through, weight))
+    return token_spans

@@ -7,9 +7,12 @@ Run either way:
 import os
 import sys
 
+import numpy as np
+import sentencepiece as spm
+
 REPO = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO)
-from prompt_weighting import parse_weighted_prompt
+from prompt_weighting import parse_weighted_prompt, compute_token_spans
 
 
 def test_no_weighted_spans():
@@ -62,6 +65,68 @@ def test_malformed_syntax_passes_through_untouched():
     clean, spans = parse_weighted_prompt(raw)
     assert clean == raw
     assert spans == []
+
+
+def _load_tokenizer():
+    """Load just the bundled SentencePiece tokenizer, no model weights —
+    matches how T5Gemma.from_npz stores it (models/defs/t5gemma_mlx.py),
+    without paying for the full transformer load in every test run."""
+    npz_path = os.path.join(REPO, "..", "models", "mlx", "t5gemma_f16.npz")
+    arrs = np.load(npz_path)
+    tok = spm.SentencePieceProcessor()
+    tok.LoadFromSerializedProto(arrs["TOKENIZER_MODEL"].tobytes())
+    return tok
+
+
+def test_boundaries_match_real_phrase_tokens():
+    tok = _load_tokenizer()
+    raw = "rigid mechanical grid pulse, (driving rhythmic pulse:2), cold synthetic timbre"
+    clean, char_spans = parse_weighted_prompt(raw)
+    token_spans = compute_token_spans(clean, char_spans, tok, max_len=256)
+    assert len(token_spans) == 1
+    start, end, weight = token_spans[0]
+    assert weight == 2.0
+    full_ids = tok.Encode(clean)
+    phrase = clean[char_spans[0][0]:char_spans[0][1]]
+    # the phrase appears mid-sentence, so it's preceded by a space in the
+    # full tokenization — re-tokenizing it WITH a leading space must give
+    # exactly the token IDs the computed boundaries slice out.
+    assert full_ids[start:end] == tok.Encode(" " + phrase)
+
+
+def test_boundaries_at_prompt_start_need_no_leading_space():
+    tok = _load_tokenizer()
+    raw = "(cold synthetic timbre:1.7), sparse texture"
+    clean, char_spans = parse_weighted_prompt(raw)
+    token_spans = compute_token_spans(clean, char_spans, tok, max_len=256)
+    start, end, weight = token_spans[0]
+    full_ids = tok.Encode(clean)
+    phrase = clean[char_spans[0][0]:char_spans[0][1]]
+    assert full_ids[start:end] == tok.Encode(phrase)
+
+
+def test_multiple_spans_all_resolve_correctly():
+    tok = _load_tokenizer()
+    raw = "(rhythm:2) and (silence:0.3) together"
+    clean, char_spans = parse_weighted_prompt(raw)
+    token_spans = compute_token_spans(clean, char_spans, tok, max_len=256)
+    assert len(token_spans) == 2
+    full_ids = tok.Encode(clean)
+    expected_phrases = ["rhythm", "silence"]
+    expected_leading_space = [False, True]  # "rhythm" is at position 0
+    for (start, end, weight), phrase, needs_space in zip(
+        token_spans, expected_phrases, expected_leading_space
+    ):
+        want = tok.Encode((" " if needs_space else "") + phrase)
+        assert full_ids[start:end] == want
+
+
+def test_span_beyond_max_len_is_dropped():
+    tok = _load_tokenizer()
+    raw = ("pulse " * 400) + "(rhythm:2) tail"
+    clean, char_spans = parse_weighted_prompt(raw)
+    token_spans = compute_token_spans(clean, char_spans, tok, max_len=256)
+    assert token_spans == []
 
 
 def _main():

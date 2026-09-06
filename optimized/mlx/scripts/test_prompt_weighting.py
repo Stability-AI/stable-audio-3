@@ -129,6 +129,36 @@ def test_span_beyond_max_len_is_dropped():
     assert token_spans == []
 
 
+def test_phrase_with_trailing_space_does_not_include_stray_whitespace_token():
+    tok = _load_tokenizer()
+    raw = "a (rhythm :2) and silence"
+    clean, char_spans = parse_weighted_prompt(raw)
+    # parse_weighted_prompt captures "rhythm " (with trailing space)
+    assert clean == "a rhythm  and silence"
+    assert len(char_spans) == 1
+    start_char, end_char, weight = char_spans[0]
+    assert clean[start_char:end_char] == "rhythm "
+
+    token_spans = compute_token_spans(clean, char_spans, tok, max_len=256)
+    assert len(token_spans) == 1
+    start, end, weight = token_spans[0]
+    assert weight == 2.0
+
+    full_ids = tok.Encode(clean)
+    span_tokens = full_ids[start:end]
+
+    # The phrase appears after "a ", so it gets a leading space in tokenization.
+    # The trailing space in the captured phrase text must NOT appear as a
+    # stray whitespace-only token in the span. Re-tokenize the phrase with
+    # a leading space (since it's mid-sentence) — this should match.
+    phrase_text = clean[start_char:end_char].rstrip()  # "rhythm" without trailing space
+    expected_tokens = tok.Encode(" " + phrase_text)
+    assert span_tokens == expected_tokens, (
+        f"span tokens {span_tokens} should equal {expected_tokens} "
+        f"(phrase with leading space, no trailing space)"
+    )
+
+
 def _main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = []

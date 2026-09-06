@@ -88,8 +88,14 @@ def compute_token_spans(
         if start_char > 0 and clean_text[start_char - 1] == " ":
             prefix_end = start_char - 1
 
+        # Similarly, if the phrase itself ends in a space, back up so the trailing
+        # space merges with the preceding phrase tokens, not as a stray whitespace token.
+        suffix_end = end_char
+        if end_char > 0 and clean_text[end_char - 1] == " ":
+            suffix_end = end_char - 1
+
         n_before = min(len(tokenizer.Encode(clean_text[:prefix_end])), max_len)
-        n_through = min(len(tokenizer.Encode(clean_text[:end_char])), max_len)
+        n_through = min(len(tokenizer.Encode(clean_text[:suffix_end])), max_len)
         if n_before >= max_len:
             continue
         token_spans.append((n_before, n_through, weight))

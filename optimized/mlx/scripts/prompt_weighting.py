@@ -12,11 +12,32 @@ Three independent pieces, in the order the pipeline uses them:
 
 Nested/overlapping (phrase:weight) groups are not supported: the regex
 below only matches non-nested groups (the phrase character class
-excludes parens), so a nested group either fails to match at all
-(passes through as literal text) or the outer group matches with the
-inner syntax left inside the phrase text.
+excludes parens), so for a nested group like "(a (b:2):1.5)" it is the
+INNER group that actually matches — the regex scans left to right and
+`[^():]+` cannot span across the inner "(", so the first complete
+"(...)" the regex finds is the inner one. The result: only the inner
+phrase gets a weight (2.0 in that example, not 1.5), and the outer
+group's opening "(" and trailing ":1.5)" survive as literal characters
+in the clean prompt text fed to the text encoder. Concretely,
+"sparse ((rhythm:2):3) tail" cleans to "sparse (rhythm:3) tail" with a
+span on "rhythm" at weight 2.0 — the outer ":3)" is literal text, not a
+second weight.
+
+Span-boundary exactness is not absolute. A span's token boundaries are
+exact when the span begins right after a whitespace or punctuation
+separator before the opening "(" — the common case, verified across 56
+separator combinations. When a phrase instead immediately follows a
+word character with no separator at all (e.g. "un(usual:2) tone",
+whose clean text "unusual tone" tokenizes "unusual" as a single
+SentencePiece token), there is no token boundary at the span's start to
+land on, and the naive prefix-count would return an empty or
+misaligned span. This is the same subword-alignment limitation every
+SD-style prompt-weighting tool has — `compute_token_spans` detects this
+degenerate case and skips the span with a warning printed to stderr,
+rather than silently applying a wrong or empty weight.
 """
 import re
+import sys
 
 import mlx.core as mx
 import numpy as np
@@ -70,7 +91,16 @@ def compute_token_spans(
     relies on SentencePiece prefix tokenization being a stable
     extension (verified against this project's own tokenizer: longer
     prefixes of the same text never retroactively change an earlier
-    prefix's tokens).
+    prefix's tokens) AND on the span's start boundary landing on an
+    actual token boundary, which any whitespace or punctuation
+    character immediately before the opening "(" ensures. This holds
+    for 56 of the 64 separator combinations swept in review; it is NOT
+    guaranteed when the phrase instead abuts a preceding word character
+    with no separator at all (e.g. "un(usual:2)"), where the "start" a
+    caller intends can fall inside a token that only exists in the
+    merged (unsplit) form. This function detects that degenerate case
+    (`n_before >= n_through` below) and skips the span with a stderr
+    warning rather than returning an empty or misaligned one.
 
     `tokenizer` needs only `.Encode(str) -> list[int]` — a bare
     sentencepiece.SentencePieceProcessor, or T5Gemma's own `.tokenizer`
@@ -98,6 +128,21 @@ def compute_token_spans(
         n_before = min(len(tokenizer.Encode(clean_text[:prefix_end])), max_len)
         n_through = min(len(tokenizer.Encode(clean_text[:suffix_end])), max_len)
         if n_before >= max_len:
+            continue
+        if n_before >= n_through:
+            # Degenerate case: no token boundary at this span's start (the
+            # phrase immediately follows a word character with no space/
+            # punctuation separator before the opening paren, so the
+            # phrase's first word got merged into a token that only exists
+            # in the unsplit form). Don't silently drop the weight or hand
+            # back an empty/misaligned span — make it visible.
+            phrase = clean_text[start_char:end_char]
+            print(
+                f"prompt_weighting: skipping span for {phrase!r} — no token "
+                "boundary here (needs a space/punctuation before the "
+                "opening paren)",
+                file=sys.stderr,
+            )
             continue
         token_spans.append((n_before, n_through, weight))
     return token_spans

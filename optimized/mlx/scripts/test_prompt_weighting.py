@@ -4,6 +4,8 @@ Run either way:
     python scripts/test_prompt_weighting.py
     pytest scripts/test_prompt_weighting.py
 """
+import contextlib
+import io
 import os
 import sys
 
@@ -158,6 +160,28 @@ def test_phrase_with_trailing_space_does_not_include_stray_whitespace_token():
         f"span tokens {span_tokens} should equal {expected_tokens} "
         f"(phrase with leading space, no trailing space)"
     )
+
+
+def test_degenerate_no_separator_before_paren_is_skipped_with_warning():
+    """No whitespace/punctuation separates a word from the opening paren
+    (e.g. "un(usual:2)" -> clean "unusual tone", a single SentencePiece
+    token) — there's no token boundary at the span's start to land on.
+    compute_token_spans must not silently drop or misalign the weight;
+    it should skip the span and print a visible warning to stderr."""
+    tok = _load_tokenizer()
+    raw = "un(usual:2) tone"
+    clean, char_spans = parse_weighted_prompt(raw)
+    assert clean == "unusual tone"
+    assert len(char_spans) == 1
+
+    stderr_capture = io.StringIO()
+    with contextlib.redirect_stderr(stderr_capture):
+        token_spans = compute_token_spans(clean, char_spans, tok, max_len=256)
+
+    assert token_spans == []
+    warning = stderr_capture.getvalue()
+    assert "skipping span" in warning
+    assert "usual" in warning
 
 
 def test_weight_one_is_a_bit_exact_noop():

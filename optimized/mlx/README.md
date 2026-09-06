@@ -33,6 +33,7 @@ Already cloned the repo? Run from inside `optimized/mlx/`:
 | audio-to-audio   | `--prompt P --init-audio IN.wav --init-noise-level σ` | variation of an existing clip |
 | inpainting       | `--prompt P --init-audio IN.wav --inpaint-range "S,E"` | regenerate one section, keep rest |
 | CFG + negative   | `--cfg 3.0 --negative-prompt P_NEG`           | steer toward / away from prompts |
+| prompt weighting | `--prompt "a (driving pulse:1.8) under quiet air"` | emphasize/de-emphasize part of a prompt |
 
 ```
 prompt ─▶ T5Gemma encoder ─▶ DiT pingpong sampler ─▶ SAME-S/L decoder ─▶ WAV
@@ -269,6 +270,7 @@ are interchangeable in either direction.
 |-----------------------|----------|-----------------------------------------------------------------------|
 | `--prompt`            | (asks)   | Text prompt; empty string = unconditional                              |
 | `--negative-prompt`   | —        | CFG uncond branch; only used when `--cfg ≠ 1.0`                       |
+| `(phrase:weight)`     | —        | Inline in `--prompt`/`--negative-prompt`; weight<1 de-emphasizes, weight>1 emphasizes, weight=1 is a no-op |
 | `--dit`               | (asks)   | `sm-music`, `sm-sfx`, or `medium`                                     |
 | `--decoder`           | (asks)   | `same-s` (pairs with sm-*) or `same-l` (pairs with medium)            |
 | `--seconds`           | 30       | Output length                                                         |

@@ -18,6 +18,7 @@ inner syntax left inside the phrase text.
 """
 import re
 
+import mlx.core as mx
 import numpy as np
 
 _WEIGHT_RE = re.compile(r"\(([^():]+):([+-]?\d+(?:\.\d+)?)\)")
@@ -100,3 +101,52 @@ def compute_token_spans(
             continue
         token_spans.append((n_before, n_through, weight))
     return token_spans
+
+
+def apply_prompt_weights(
+    embeds,
+    token_spans: list[tuple[int, int, float]],
+    padding_embedding,
+):
+    """Reweight spans of T5Gemma output toward/away from SA3's own
+    learned "empty" embedding — the same interpolation ComfyUI/compel
+    use for SD-style prompt weighting, anchored on this model's own
+    padding_embedding instead of an invented reference point.
+
+    embeds            : (B, S, 768) mx.array — T5Gemma last_hidden_state.
+    token_spans       : (start, end, weight) triples, as returned by
+                         compute_token_spans. weight=1.0 spans are
+                         skipped entirely so a prompt with no non-1.0
+                         weights returns `embeds` unchanged (bit-exact,
+                         not just numerically close).
+    padding_embedding : (768,) mx.array — SA3's learned unconditional
+                         embedding, the same tensor apply_prompt_padding
+                         uses.
+
+    Returns a new array; does not mutate `embeds` in place, matching
+    apply_prompt_padding's functional style.
+    """
+    S = embeds.shape[1]
+    weights = np.ones((S,), dtype=np.float32)
+    changed = False
+    for start, end, weight in token_spans:
+        if weight == 1.0 or start >= end:
+            continue
+        weights[start:end] = weight
+        changed = True
+    if not changed:
+        return embeds
+
+    # Build a mask of which positions have non-1.0 weights
+    # Only interpolate positions where weight != 1.0 to preserve bit-exact
+    # equality for unchanged positions
+    mask = (weights != 1.0).astype(np.float32)
+
+    pe = padding_embedding.astype(embeds.dtype).reshape(1, 1, -1)
+    w = mx.array(weights.reshape(1, S, 1), dtype=embeds.dtype)
+    m = mx.array(mask.reshape(1, S, 1), dtype=embeds.dtype)
+
+    # Only apply interpolation where mask is 1 (weight != 1.0)
+    # For mask=0 positions, just use embeds unchanged
+    weighted = pe + w * (embeds - pe)
+    return m * weighted + (1 - m) * embeds

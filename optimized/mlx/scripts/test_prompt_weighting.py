@@ -7,12 +7,13 @@ Run either way:
 import os
 import sys
 
+import mlx.core as mx
 import numpy as np
 import sentencepiece as spm
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO)
-from prompt_weighting import parse_weighted_prompt, compute_token_spans
+from prompt_weighting import parse_weighted_prompt, compute_token_spans, apply_prompt_weights
 
 
 def test_no_weighted_spans():
@@ -157,6 +158,57 @@ def test_phrase_with_trailing_space_does_not_include_stray_whitespace_token():
         f"span tokens {span_tokens} should equal {expected_tokens} "
         f"(phrase with leading space, no trailing space)"
     )
+
+
+def test_weight_one_is_a_bit_exact_noop():
+    embeds = mx.array(np.random.default_rng(0).standard_normal((1, 6, 4)).astype(np.float32))
+    pe = mx.array(np.random.default_rng(1).standard_normal((4,)).astype(np.float32))
+    out = apply_prompt_weights(embeds, [(1, 3, 1.0)], pe)
+    assert np.array_equal(np.asarray(out), np.asarray(embeds))
+
+
+def test_empty_spans_is_a_bit_exact_noop():
+    embeds = mx.array(np.random.default_rng(0).standard_normal((1, 6, 4)).astype(np.float32))
+    pe = mx.array(np.random.default_rng(1).standard_normal((4,)).astype(np.float32))
+    out = apply_prompt_weights(embeds, [], pe)
+    assert np.array_equal(np.asarray(out), np.asarray(embeds))
+
+
+def test_weight_zero_collapses_span_to_padding_embedding():
+    embeds = mx.array(np.random.default_rng(0).standard_normal((1, 6, 4)).astype(np.float32))
+    pe = mx.array(np.random.default_rng(1).standard_normal((4,)).astype(np.float32))
+    out = np.asarray(apply_prompt_weights(embeds, [(2, 4, 0.0)], pe))
+    pe_np = np.asarray(pe)
+    for t in (2, 3):
+        assert np.allclose(out[0, t], pe_np, atol=1e-5)
+    # untouched positions are unchanged
+    embeds_np = np.asarray(embeds)
+    for t in (0, 1, 4, 5):
+        assert np.array_equal(out[0, t], embeds_np[0, t])
+
+
+def test_weight_extrapolates_linearly_past_plain_embedding():
+    embeds = mx.array(np.random.default_rng(0).standard_normal((1, 6, 4)).astype(np.float32))
+    pe = mx.array(np.random.default_rng(1).standard_normal((4,)).astype(np.float32))
+    out = np.asarray(apply_prompt_weights(embeds, [(0, 2, 2.0)], pe))
+    embeds_np = np.asarray(embeds)
+    pe_np = np.asarray(pe)
+    expected = pe_np + 2.0 * (embeds_np[0, 0] - pe_np)
+    assert np.allclose(out[0, 0], expected, atol=1e-5)
+
+
+def test_multiple_spans_do_not_interfere():
+    embeds = mx.array(np.random.default_rng(0).standard_normal((1, 6, 4)).astype(np.float32))
+    pe = mx.array(np.random.default_rng(1).standard_normal((4,)).astype(np.float32))
+    out = np.asarray(apply_prompt_weights(embeds, [(0, 1, 0.0), (4, 6, 3.0)], pe))
+    embeds_np = np.asarray(embeds)
+    pe_np = np.asarray(pe)
+    assert np.allclose(out[0, 0], pe_np, atol=1e-5)
+    for t in (1, 2, 3):
+        assert np.array_equal(out[0, t], embeds_np[0, t])
+    for t in (4, 5):
+        expected = pe_np + 3.0 * (embeds_np[0, t] - pe_np)
+        assert np.allclose(out[0, t], expected, atol=1e-5)
 
 
 def _main():

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Shortcut for the cpu-amx gradio web UI (scripts/sa3_gradio.py). Args pass through.
+#
+#   ./sa3-gradio                 # same-l default, public share link
+#   ./sa3-gradio --decoder same-s
+#   ./sa3-gradio --no-share      # local-only (http://127.0.0.1:7860)
+#
+# Interpreter: $SA3_PYTHON, else .venv/bin/python, else python3.
+# The UI needs a few extra packages (gradio, pillow, soundfile) — see requirements-gradio.txt.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+pick_python() {
+    if [[ -n "${SA3_PYTHON:-}" ]]; then echo "$SA3_PYTHON"; return; fi
+    if [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then echo "$SCRIPT_DIR/.venv/bin/python"; return; fi
+    command -v python3 || command -v python
+}
+PY="$(pick_python)"
+
+if [[ -z "$PY" ]] || ! "$PY" -c "import gradio, PIL, numpy" >/dev/null 2>&1; then
+    echo "The gradio UI needs extra packages (gradio, pillow, soundfile, numpy)." >&2
+    echo "Install them into your interpreter:  $PY -m pip install -r requirements-gradio.txt" >&2
+    exit 1
+fi
+
+cd "$SCRIPT_DIR"
+exec "$PY" scripts/sa3_gradio.py "$@"

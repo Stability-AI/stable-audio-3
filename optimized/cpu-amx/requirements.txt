@@ -1,0 +1,6 @@
+numpy>=1.24
+sentencepiece>=0.2
+# Non-WAV / non-44.1k init audio for --init-audio is decoded via ffmpeg if present.
+soundfile>=0.12
+# No torch. Text-to-audio, CFG, audio-to-audio and inpainting all run on the C++ AMX
+# engines + numpy; the a2a/inpaint init-encoder is the C++ SAME-S/SAME-L encoder.

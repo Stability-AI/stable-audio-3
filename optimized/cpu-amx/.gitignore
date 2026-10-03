@@ -1,0 +1,12 @@
+output/
+.venv/
+
+# The repo-root .gitignore has a blanket `build/` rule for generated output. Ours holds the
+# ENGINE SOURCES (C++ + weight dumpers), so re-include them explicitly...
+!build/
+!build/**
+
+# ...but never track bytecode. These rules come AFTER the re-include so they still win.
+__pycache__/
+**/__pycache__/
+*.pyc

@@ -193,12 +193,12 @@ def provenance(args, onnx_path, n_targets, build_s):
     }
 
 
-def check_maps(paths):
+def check_maps(map_paths):
     """--check: every map's engine pointer resolves, and its layer table matches the
     engine it names. Exit non-zero on any failure so CI can gate on it."""
     import mmap
     bad = 0
-    for mp in paths:
+    for mp in map_paths:
         mp = Path(mp)
         if not mp.exists():
             print(f"  MISSING MAP  {mp}"); bad += 1; continue
@@ -211,8 +211,8 @@ def check_maps(paths):
         hit = next((c for c in cand if c.exists()), None)
         if hit is None:
             print(f"  NOT BUILT    {mp.name}: {n} layers, no engine at {paths.BRANCH_ENGINE}")
-            print(f"               build one:  python scripts/lora/build_branch.py "
-                  f"--model sa3-m --download")
+            print("               build one:  python scripts/lora/build_branch.py "
+                  "--model sa3-m --download")
             continue
         prov = "prov" if "provenance" in d else "NO-PROV"
         try:

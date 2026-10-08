@@ -58,10 +58,16 @@ different model's SVD bases lands in a rotated basis and nothing raises.
 
 | | default | override |
 |---|---|---|
-| engine + map | `engines/`, `lora/branch_map_medium_lora.json` | `$SA3_ENGINE_DIR`, `$SA3_BRANCH_MAP` |
+| engine | `models/<arch>/sa3-m/dit_fp16_lora.trt` | `$SA3_ENGINE_DIR`, `$SA3_MODELS_DIR` |
+| branch map | next to these scripts | `$SA3_BRANCH_MAP` |
 | ONNX source | `onnx/sa3-m/dit_fp16.onnx` | `$SA3_ONNX_DIR` |
 | base checkpoint | `models/sa3-medium/` | `$SA3_CKPT_DIR` |
 | frozen SVD bases | `$SA3_CKPT_DIR/svd_bases.pt` | `$SA3_SVD_BASES` |
+
+The engine goes where every other engine in this install goes — `models/<arch>/<model>/`,
+since TensorRT bakes the GPU architecture into the plan and one install can hold several
+side by side. The builder and the runtime read the **same** constant from `paths.py`, so
+they cannot drift apart.
 
 Only `bake_dora.py` and the `verify_*` harnesses need the checkpoint. The SVD bases are
 needed **only** by `-xs` adapters. Normal adapter loading touches neither.

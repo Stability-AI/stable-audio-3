@@ -29,6 +29,7 @@ from pathlib import Path
 import tensorrt as trt
 
 ROOT = Path(__file__).resolve().parent.parent
+import paths
 from branch_runtime import ADAPTER_PFX
 from targets import (classify, TARGETS, LOCAL_TARGETS,
                      SECONDS_TARGET, EXTRA_TARGETS, CONV_TARGETS)
@@ -51,8 +52,9 @@ PRESETS = {
         # island, fp16 runs the attention core in fp16. We build from the current one.
         onnx_legacy="sa3-m/dit_fp16mixed.onnx",
         hf_files=("onnx/sa3-m/dit_fp16.onnx", "onnx/sa3-m/dit_fp16.onnx.data"),
-        engine="engines/sa3-m/dit_fp16_lora.trt",
-        map="lora/branch_map_medium_lora.json",
+        engine=None,        # -> paths.BRANCH_ENGINE (models/<arch>/sa3-m/)
+        map=None,           # -> paths.BRANCH_MAP
+
         targets="all", rank_max=512, rank_opt=32,
         expect_targets=229, expect_layers=24,
         blurb="SA3-medium (24 layers) -- the shipping LoRA engine, 229 targets",
@@ -303,10 +305,13 @@ intend to serve from. Everything the preset decides can be overridden with the f
     for k, dflt in (("targets", "core"), ("rank_max", 128), ("rank_opt", 32)):
         if getattr(args, k) is None:
             setattr(args, k, spec.get(k, dflt))
+    # Where the engine lands is paths.py's call, not a string in the preset: the runtime
+    # reads the same constant, so the two cannot drift. TensorRT bakes the GPU architecture
+    # into the plan, hence models/<arch>/<model>/.
     if args.engine is None:
-        args.engine = str(ROOT / spec["engine"])
+        args.engine = str(spec["engine"] and ROOT / spec["engine"] or paths.BRANCH_ENGINE)
     if args.map is None:
-        args.map = str(ROOT / spec["map"])
+        args.map = str(spec["map"] and ROOT / spec["map"] or paths.BRANCH_MAP)
 
     onnx_path, how = resolve_onnx(spec, args.onnx, allow_download=args.download) \
         if spec else (Path(args.onnx), "explicit path")

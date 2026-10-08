@@ -14,7 +14,8 @@ import os
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+# optimized/tensorRT/ -- this file sits at scripts/lora/paths.py
+ROOT = Path(__file__).resolve().parents[2]
 
 # The LoRA merge math (all 8 adapter variants) already ships in this repo for the TFLite
 # path. It is the product's ground truth for what an adapter means, so it is imported, not
@@ -23,17 +24,32 @@ _LORA_CORE = Path(__file__).resolve().parents[3] / "tflite" / "scripts"
 if str(_LORA_CORE) not in sys.path:
     sys.path.insert(0, str(_LORA_CORE))
 
-# Built locally by lora/build_branch.py.
-ENGINE_DIR = Path(os.environ.get("SA3_ENGINE_DIR", ROOT / "engines"))
+# Built locally by build_branch.py, and placed where every other engine in this install
+# lives: models/<arch>/<model>/. TensorRT bakes the GPU architecture into the plan, so the
+# arch is part of the path -- one install can hold several side by side.
+def _arch() -> str:
+    """sm_<major><minor> of the current device, matching sa3_trt_core.ARCH."""
+    try:
+        import torch
+        major, minor = torch.cuda.get_device_capability()
+        return f"sm_{major}{minor}"
+    except Exception:
+        return os.environ.get("SA3_ARCH", "sm_90")
+
+
+ARCH = _arch()
+MODELS_DIR = Path(os.environ.get("SA3_MODELS_DIR", ROOT / "models"))
+ENGINE_DIR = Path(os.environ.get("SA3_ENGINE_DIR", MODELS_DIR / ARCH / "sa3-m"))
 BRANCH_ENGINE = ENGINE_DIR / "dit_fp16_lora.trt"
-BRANCH_MAP = Path(os.environ.get("SA3_BRANCH_MAP", ROOT / "lora" / "branch_map_medium_lora.json"))
+BRANCH_MAP = Path(os.environ.get(
+    "SA3_BRANCH_MAP", Path(__file__).resolve().parent / "branch_map_medium_lora.json"))
 
 # Downloaded: stabilityai/stable-audio-3-optimized, onnx/sa3-m/dit_fp16.onnx (+ .data).
 ONNX_DIR = Path(os.environ.get("SA3_ONNX_DIR", ROOT / "onnx" / "sa3-m"))
 ONNX = ONNX_DIR / "dit_fp16.onnx"
 
 # Only the verify_* harnesses need these; normal adapter loading never touches them.
-CKPT_DIR = Path(os.environ.get("SA3_CKPT_DIR", ROOT / "models" / "sa3-medium"))
+CKPT_DIR = Path(os.environ.get("SA3_CKPT_DIR", MODELS_DIR / "sa3-medium"))
 SVD_BASES = Path(os.environ.get("SA3_SVD_BASES", CKPT_DIR / "svd_bases.pt"))
 
 # SA3-medium is ONE model everywhere: an adapter trained on any variant applies to the

@@ -28,7 +28,10 @@ import argparse, json, os, sys, time
 from pathlib import Path
 import tensorrt as trt
 
-ROOT = Path(__file__).resolve().parent.parent
+# optimized/tensorRT/ -- the SAME anchor paths.py uses, so the ONNX the builder downloads
+# and the engine the runtime opens cannot end up in different trees.
+ROOT = Path(__file__).resolve().parents[2]
+HERE = Path(__file__).resolve().parent
 import paths
 from branch_runtime import ADAPTER_PFX
 from targets import (classify, TARGETS, LOCAL_TARGETS,
@@ -176,7 +179,7 @@ def provenance(args, onnx_path, n_targets, build_s):
     return {
         "built_utc": datetime.datetime.now(datetime.timezone.utc)
                              .replace(microsecond=0).isoformat(),
-        "built_by": "lora/build_branch.py",
+        "built_by": "scripts/lora/build_branch.py",
         "build_seconds": round(build_s, 1),
         "onnx": str(onnx_path),
         "onnx_bytes": onnx_path.stat().st_size,
@@ -252,10 +255,10 @@ def main():
 typical use
 -----------
   # build the shipping SA3-medium LoRA engine for THIS GPU (downloads the ONNX if needed)
-  python lora/build_branch.py --model sa3-m --download
+  python scripts/lora/build_branch.py --model sa3-m --download
 
   # check that every branch map still points at an engine that exists and matches
-  python lora/build_branch.py --check
+  python scripts/lora/build_branch.py --check
 
 The engine is specific to the GPU architecture it is built on -- run this on the GPU you
 intend to serve from. Everything the preset decides can be overridden with the flags below.
@@ -290,7 +293,7 @@ intend to serve from. Everything the preset decides can be overridden with the f
 
     # ---- --check: validate maps and exit -----------------------------------------
     if args.check is not None:
-        maps = args.check or sorted(str(q) for q in (ROOT / "lora").glob("branch_map*.json"))
+        maps = args.check or sorted(str(q) for q in HERE.glob("branch_map*.json"))
         print(f"checking {len(maps)} branch map(s)\n")
         sys.exit(check_maps(maps))
 
@@ -298,7 +301,7 @@ intend to serve from. Everything the preset decides can be overridden with the f
     spec = PRESETS.get(args.model, {})
     if not args.model and not (args.onnx and args.engine and args.map):
         die("say which model to build",
-            "python lora/build_branch.py --model sa3-m --download\n"
+            "python scripts/lora/build_branch.py --model sa3-m --download\n"
             "    (or pass --onnx/--engine/--map explicitly)")
     if args.model:
         say("model", spec["blurb"])
@@ -522,8 +525,8 @@ intend to serve from. Everything the preset decides can be overridden with the f
     say("done", f"{len(added)} adapted layers, stack rank up to {args.rank_max}")
     say("done", f"map {mp}")
     print()
-    print("  verify it:   python lora/build_branch.py --check")
-    print("  use it:      python gradio/sa3_trt.py --dit medium --lora <adapter.safetensors>")
+    print("  verify it:   python scripts/lora/build_branch.py --check")
+    print("  use it:      python scripts/sa3_trt.py --dit medium --lora <adapter.safetensors>")
 
 
 if __name__ == "__main__":

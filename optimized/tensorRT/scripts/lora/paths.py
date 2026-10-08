@@ -41,8 +41,15 @@ ARCH = _arch()
 MODELS_DIR = Path(os.environ.get("SA3_MODELS_DIR", ROOT / "models"))
 ENGINE_DIR = Path(os.environ.get("SA3_ENGINE_DIR", MODELS_DIR / ARCH / "sa3-m"))
 BRANCH_ENGINE = ENGINE_DIR / "dit_fp16_lora.trt"
+# Two maps, and the distinction matters. SHIPPED_MAP is tracked: it is the 229-target
+# definition, a property of the ONNX graph, the same on every machine. BUILT_MAP is written
+# beside the engine by build_branch and carries build provenance -- absolute ONNX path, GPU,
+# hostname. models/ is gitignored, so that stays out of the repo; writing it over the tracked
+# file would dirty every builder's tree and invite them to commit their own paths.
+SHIPPED_MAP = Path(__file__).resolve().parent / "branch_map_medium_lora.json"
+BUILT_MAP = ENGINE_DIR / "branch_map_medium_lora.json"
 BRANCH_MAP = Path(os.environ.get(
-    "SA3_BRANCH_MAP", Path(__file__).resolve().parent / "branch_map_medium_lora.json"))
+    "SA3_BRANCH_MAP", BUILT_MAP if BUILT_MAP.exists() else SHIPPED_MAP))
 
 # Downloaded: stabilityai/stable-audio-3-optimized, onnx/sa3-m/dit_fp16.onnx (+ .data).
 ONNX_DIR = Path(os.environ.get("SA3_ONNX_DIR", ROOT / "onnx" / "sa3-m"))

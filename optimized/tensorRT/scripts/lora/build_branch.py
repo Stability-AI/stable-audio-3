@@ -299,7 +299,8 @@ intend to serve from. Everything the preset decides can be overridden with the f
 
     # ---- --check: validate maps and exit -----------------------------------------
     if args.check is not None:
-        maps = args.check or sorted(str(q) for q in HERE.glob("branch_map*.json"))
+        maps = args.check or sorted({str(q) for q in HERE.glob("branch_map*.json")}
+                                    | ({str(paths.BUILT_MAP)} if paths.BUILT_MAP.exists() else set()))
         print(f"checking {len(maps)} branch map(s)\n")
         sys.exit(check_maps(maps))
 
@@ -320,7 +321,7 @@ intend to serve from. Everything the preset decides can be overridden with the f
     if args.engine is None:
         args.engine = str(spec["engine"] and ROOT / spec["engine"] or paths.BRANCH_ENGINE)
     if args.map is None:
-        args.map = str(spec["map"] and ROOT / spec["map"] or paths.BRANCH_MAP)
+        args.map = str(spec["map"] and ROOT / spec["map"] or paths.BUILT_MAP)
 
     onnx_path, how = resolve_onnx(spec, args.onnx, allow_download=args.download) \
         if spec else (Path(args.onnx), "explicit path")

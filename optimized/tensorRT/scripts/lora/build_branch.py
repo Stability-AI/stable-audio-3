@@ -204,10 +204,16 @@ def check_maps(paths):
             print(f"  MISSING MAP  {mp}"); bad += 1; continue
         d = json.loads(mp.read_text())
         eng, n = d.get("engine"), len(d.get("layers", {}))
-        cand = [mp.parent / eng, ROOT / eng, Path(eng)] if eng else []
+        # The map ships with the repo; the engine is built locally, per GPU architecture.
+        # So "no engine here yet" is a fresh clone, not a defect -- this gate checks that a
+        # map and an engine AGREE, and there is nothing to disagree with until one exists.
+        cand = ([mp.parent / eng, ROOT / eng, Path(eng)] if eng else []) + [paths.BRANCH_ENGINE]
         hit = next((c for c in cand if c.exists()), None)
         if hit is None:
-            print(f"  STALE        {mp.name}: engine {eng!r} does not resolve"); bad += 1; continue
+            print(f"  NOT BUILT    {mp.name}: {n} layers, no engine at {paths.BRANCH_ENGINE}")
+            print(f"               build one:  python scripts/lora/build_branch.py "
+                  f"--model sa3-m --download")
+            continue
         prov = "prov" if "provenance" in d else "NO-PROV"
         try:
             logger = trt.Logger(trt.Logger.ERROR)

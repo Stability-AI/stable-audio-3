@@ -1,5 +1,5 @@
 {
- "engine": "engines/dit_fp16_lora.trt",
+ "engine": null,
  "rank_max": 512,
  "layers": {
   "lora::seconds_embed": {
@@ -2072,6 +2072,6 @@
   "n_targets": 229,
   "rank_max": 512,
   "rank_opt": 32,
-  "note": "the layer map is a property of the ONNX graph; the engine itself is built locally because TensorRT bakes in the GPU architecture"
+  "note": "the layer map is a property of the ONNX graph and ships with the repo; the engine is built locally because TensorRT bakes in the GPU architecture, and its location comes from paths.BRANCH_ENGINE"
  }
 }

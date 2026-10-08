@@ -29,6 +29,19 @@ PATTERNS=(
   'nosoul'
   'plini'
   'kid.wav'
+  'underfit'             # internal project names
+  'hyperlora'
+  'dillinger'            # training corpora
+  'this box'             # machine-specific phrasing
+  "this venv's"
+)
+# Terms that are usually innocent English but sometimes name the other model. Too noisy to
+# fail on, too dangerous to ignore: printed for a human to read, exit code unaffected.
+REVIEW=(
+  'large'                # "a large strength" is fine; "measured on large" is not
+  '182'                  # the other DiT's adapted-layer count
+  '26 layers'
+  '2048d'
 )
 # Lines that legitimately contain a pattern (reviewed, kept deliberately). One regex per line.
 ALLOW='^$'
@@ -45,6 +58,16 @@ for p in "${PATTERNS[@]}"; do
     fail=1
   fi
 done
+# Advisory: print ambiguous hits so someone eyeballs them, without failing the build.
+for p in "${REVIEW[@]}"; do
+  hits=$(grep -rIin --exclude-dir=.git --exclude='grep_gate.sh' -F -- "$p" "$DIR" 2>/dev/null \
+         | grep -Eiv "larger|largest|largely|a large (strength|fold|weight|float)" || true)
+  if [ -n "$hits" ]; then
+    echo "REVIEW  '$p'  (not a failure -- read these)"
+    echo "$hits" | sed 's/^/        /' | head -8
+  fi
+done
+
 # filenames too
 fn=$(find "$DIR" -name '*large*' -o -name '*refit*' -o -name '*cjmathcore*' 2>/dev/null || true)
 if [ -n "$fn" ]; then echo "LEAK  filename"; echo "$fn" | sed 's/^/        /'; fail=1; fi

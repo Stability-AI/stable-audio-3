@@ -1,4 +1,4 @@
-"""Ground-truth gate for the SA3-medium branch engine against a REAL underfit adapter.
+"""Ground-truth gate for the SA3-medium branch engine against a real trained adapter.
 
 Compares three things on identical inputs:
   ref169  canonical load_and_apply_loras() -- all 169 adapted layers, incl. the one

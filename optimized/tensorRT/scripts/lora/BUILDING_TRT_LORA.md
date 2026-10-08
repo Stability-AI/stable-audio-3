@@ -1,7 +1,7 @@
 # Building a TensorRT DiT with live LoRA/DoRA support
 
-Everything learned building runtime-swappable LoRA into the SA3 TensorRT DiTs
-(medium = 229 targets, large = 182). Written so the next person does not re-pay for any of it.
+Everything learned building runtime-swappable LoRA into the SA3-medium TensorRT DiT
+(229 targets). Written so the next person does not re-pay for any of it.
 
 > Scope note: this covers the **branch** approach — adapters as network *inputs*, swappable at
 > runtime with no rebuild. The alternative (merge weights + `refit`) costs 0% forward but needs
@@ -441,7 +441,7 @@ Pin adapter checkpoints in a manifest. `ls | sort | tail -1` puts `step=9000` af
 `refit` (merge into weights) costs **0%** forward and is bit-exact for every family including
 `bora`/`dora-cols`, but needs a refit per adapter (~seconds) and cannot do per-step strength.
 Branches cost ~+35% at musical lengths and buy µs-class swaps and a free strength knob.
-Crossover measured on large at ~36 generations per adapter. Ship both if you can; the branch is
+Crossover measured at ~36 generations per adapter. Ship both if you can; the branch is
 the interactive path.
 
 ---

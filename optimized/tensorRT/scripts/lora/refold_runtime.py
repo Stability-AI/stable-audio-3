@@ -60,7 +60,7 @@ class RefoldLora(BR.BranchLora):
                 base = a["type"][:-3] if a["type"].endswith("-xs") else a["type"]
                 if base != "dora-rows":
                     per.append(None); continue      # lora/-xs are already exact under srow
-                W0 = base_weights[nm].to(self.dev, torch.float32)   # GPU: 182 GEMMs at load
+                W0 = base_weights[nm].to(self.dev, torch.float32)   # GPU: one GEMM per layer, at load
                 k = a["scaling"] / max(a["strength"], 1e-12)     # scaling = k * strength
                 A_eff, B_eff = _effective_factors(W0.cpu().numpy(), p, a["type"], k)
                 A = torch.as_tensor(A_eff, dtype=torch.float32, device=self.dev)   # [r,in]
@@ -128,7 +128,7 @@ class RefoldLora(BR.BranchLora):
 
 # ── GPU fold ──────────────────────────────────────────────────────────────────────────────
 # branch_runtime.set_stack folds on the HOST: for any DoRA adapter it pulls every W0 to the
-# CPU (10.5 GB of fp32 across the 182 layers) and materialises B@A as a full [out,in] delta
+# CPU (10.5 GB of fp32 across every adapted layer) and materialises B@A as a full [out,in] delta
 # (another 10.5 GB) purely to take a row norm. Measured at 32.1 s for one swap, against 23 ms
 # for the TFLite lora_fast equivalent.
 #

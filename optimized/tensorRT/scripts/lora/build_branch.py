@@ -1,4 +1,4 @@
-"""Build the per-step-controllable LoRA engine: a runtime low-rank branch on the 182 linears.
+"""Build the per-step-controllable LoRA engine: a runtime low-rank branch on 229 linears.
 
     y = W0.x * (1 + pout)  +  Bp . ( srow * ( A . x ) )
 
@@ -384,9 +384,9 @@ intend to serve from. Everything the preset decides can be overridden with the f
                 got.add(slug)
 
         # Derived, not hardcoded, so a graph change surfaces as a count mismatch here
-        # = 182, medium is 24 x 7 = 168. Asserting the large count is what stopped this
-        # building for any other model. What must hold is that every layer contributes
-        # the full set of per-layer targets -- a partial layer means the name match drifted.
+        # rather than silently adapting fewer linears. What must hold is that every layer
+        # contributes the full set of per-layer targets -- a partial layer means the ONNX
+        # name match drifted and some weights quietly have no adapter attached.
         n_t = len(per_layer)
         assert n_block and n_block % n_t == 0, (
             f"found {n_block} block linears, not a multiple of the {n_t} per-layer targets "

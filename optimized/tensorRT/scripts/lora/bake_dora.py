@@ -8,11 +8,11 @@ double-precision copy. Baking the norms into the adapter removes it entirely.
 
 Differences from the TFLite bake_norms.py this is compatible with:
 
-  * SVD IS NEVER COMPUTED. -xs bases are sliced from the frozen svd_bases.pt built by
-    underfit/utils/compute_svd.py. bake_norms recomputes them through numpy, which on this
-    venv's numpy 1.23.5/OpenBLAS takes 80-90 s per layer WHEN IT WORKS and hangs or raises
+  * SVD IS NEVER COMPUTED. -xs bases are sliced from the frozen svd_bases.pt the adapter was
+    trained against. Recomputing them through numpy takes 80-90 s per layer on some
+    BLAS builds WHEN IT WORKS, and on others hangs or raises
     "SVD did not converge" on (4096,2048), (2048,8192), (10240,2048), (16384,2048) — most of
-    the DiT. torch does all 182 in ~43 s, and the frozen file needs 0.
+    the DiT. torch does them all in well under a minute, and the frozen file needs none.
   * The self-check handles -xs. bake_norms' KeyErrors on `lora_B` for dora-*-xs adapters,
     which store M_xs instead.
   * Base vs arc is chosen from the adapter's own metadata, overridable, and NOT sha-enforced

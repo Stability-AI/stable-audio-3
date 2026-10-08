@@ -25,9 +25,9 @@ import lora_core as lc          # reference merge math, all 8 adapter variants
 def _install_torch_svd():
     """Route the -xs SVD through torch.
 
-    ⚠ This venv's numpy (1.23.5 / OpenBLAS) cannot SVD the DiT's large weight matrices: it raises
+    ⚠ Some numpy/OpenBLAS builds cannot SVD the DiT's widest weight matrices: they raise
     "DLASCL parameter number 4 had an illegal value" / "SVD did not converge" on e.g. (16384,2048).
-    Same broken-OpenBLAS root cause as the known large-float64-matmul bug on this box. torch's
+    Same OpenBLAS root cause as its mis-computed float64 matmuls at this size. torch's
     LAPACK handles it, on GPU when available. Sign canonicalisation is kept identical to
     lora_core._canonicalize_svd_signs so the -xs bases match the reference exactly.
     """
@@ -211,7 +211,7 @@ def is_target(layer_key):
 
 
 # ── GPU merge ────────────────────────────────────────────────────────────────
-# The reference path is numpy on CPU, which costs ~26 s for the 182 layers (a [out,r]@[r,in]
+# The reference path is numpy on CPU, which costs tens of seconds across the adapted layers (a [out,r]@[r,in]
 # product per layer on a bad BLAS). The same math in torch on device is ~100x faster and the
 # weights are already there. Mirrors lora_core.merged_weight exactly, variant for variant.
 

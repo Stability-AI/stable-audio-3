@@ -34,7 +34,7 @@ def profile_for(batch):
 def build_engine(onnx_path, engine_path, workspace_gb=48, detailed=True, batches=(1,),
                  on_network=None, extra_flags=(), profile_hook=None):
     """on_network(network) runs after parse, before build -- used by the LoRA path to mark
-    the 182 block-linear weights refittable. extra_flags are BuilderFlag names to set."""
+    weights refittable. extra_flags are BuilderFlag names to set."""
     import tensorrt as trt
     logger = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)

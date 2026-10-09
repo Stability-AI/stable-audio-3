@@ -33,6 +33,28 @@ def rel(ref, got):
     return float((ref.float() - got.float()).norm() / ref.float().norm())
 
 
+# The published T5Gemma lives in a SUBFOLDER of the model repo, not as a standalone repo:
+#   stabilityai/stable-audio-3-medium : t5gemma-b-b-ul2/{config,tokenizer,model.safetensors}
+T5_REPO, T5_SUBFOLDER = "stabilityai/stable-audio-3-medium", "t5gemma-b-b-ul2"
+
+
+def _point_t5_at_published_weights(cfg):
+    """The config names `stabilityai/t5gemma-b-b-ul2`, which is not a repo -- transformers
+    404s on the bare name before a single weight loads.
+
+    T5GemmaConditioner already resolves `load_from = model_path or repo_id or model_name`
+    and forwards `subfolder` to from_pretrained, so point it at the real location and leave
+    model_name alone: that string is only the allowlist key and the 768-dim lookup.
+
+    This harness feeds `t5_hidden` straight in, so the text encoder is never RUN -- but it is
+    still constructed, so it still has to resolve.
+    """
+    for c in cfg.get("model", {}).get("conditioning", {}).get("configs", []):
+        if c.get("type") == "t5gemma":
+            c.setdefault("config", {}).update(repo_id=T5_REPO, subfolder=T5_SUBFOLDER)
+    return cfg
+
+
 def _register_t5_alias():
     """medium's config names stabilityai/t5gemma-b-b-ul2; SAT's allowlist has google/... .
 
@@ -48,7 +70,12 @@ def _register_t5_alias():
 
 def load_medium(variant="base"):
     """The cond-baked DiT wrapper. Same wrapper => same graph the engine was traced from."""
-    DL.CKPT, DL.CONFIG = str(paths.checkpoint(variant)), str(paths.config(variant))
+    import tempfile
+    DL.CKPT = str(paths.checkpoint(variant))
+    cfg = _point_t5_at_published_weights(json.loads(paths.config(variant).read_text()))
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    json.dump(cfg, tmp); tmp.close()
+    DL.CONFIG = tmp.name
     DL.patch_for_onnx()
     _register_t5_alias()
     return DL.load_model(dtype=torch.float32), variant

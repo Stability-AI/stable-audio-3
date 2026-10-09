@@ -65,6 +65,13 @@ $PY_EXPORT "$M" "same-s_dec_fixed_"    "_w8a8" "same-s/dec_w8a8.tflite"  "$SS"
 $PY_EXPORT "$M" "same-s_enc_fixed_"    ""      "same-s/enc_fp32.tflite"  "$SS"
 $PY_EXPORT "$M" "same-s_enc_fixed_"    "_w8a8" "same-s/enc_w8a8.tflite"  "$SS"
 
+echo "== 4b. build the medium DiT rungs -> sa3-m/dit_{fp32,w8a8}.tflite (set BUILD_DIT=0 to skip) =="
+if [ "${BUILD_DIT:-1}" = 1 ]; then
+  "$HERE/build_dit.sh"           # exports 10 DiT rungs from stable_audio_3.models.dit + ARC ckpt, quant, merge
+else
+  echo "   skipped (BUILD_DIT=0)"
+fi
+
 echo "== 5. verify (runtime env): discovered ladders + tiny-L exact + round-trip vs GT =="
 $PY_RUNTIME "$HERE/verify_final.py"
-echo "== DONE: 8 canonical rung tflites under $WORK/same-{l,s}/ =="
+echo "== DONE: SAME rungs under $WORK/same-{l,s}/  +  DiT rungs under $WORK/sa3-m/ =="

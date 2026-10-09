@@ -63,10 +63,14 @@ prompt ─▶ T5Gemma encoder ─▶ DiT pingpong sampler ─▶ SAME-S/L decode
 
 Precision is split between the **DiT** and the **SAME codec** — they react to quantization oppositely:
 
-- **DiT** (`--dit-precision`, or the global `--precision`): `fp32` (default) · `w16a32` · `w8a32` · `w8a8-dyn`
-  (wXaY = weight/activation bits; "16" = fp16). int8 *fails* on the DiT — its 8-step sampler is chaotically
-  sensitive, so per-step error becomes a *different* (still plausible) sample, not a noisier fp32. Judge by ear;
-  **fp32 is the pick**, and on CPU it's also the fast one.
+- **DiT** (`--dit-precision`, or the global `--precision`):
+  - **medium**: `fp32` (default) · `w8a8` — a from-repo **rung ladder** (12 fixed lengths; see *Medium DiT — the
+    N=12 rung ladder* below). `w8a8` is **cache-safe int8**: ~equal quality to the old `w8a8-dyn` (cos 0.996 per
+    forward) but with **flat RAM (~2–4 GB vs the old 3–40 GB)**, faster at the rung sizes, and a single file.
+    int8 on the DiT is still a *different* (not worse) sample — the 8-step sampler is chaotically sensitive — so
+    `fp32` stays the default/reference and you judge `w8a8` by ear.
+  - **sm-music / sm-sfx**: `fp32` · `w16a32` · `w8a32` · `w8a8-dyn` — still the dynamic-shape varlen graphs
+    (wXaY = weight/activation bits; "16" = fp16), until they are rung-built too.
 - **Codec** (`--decoder-precision` / `--encoder-precision`): `fp32` · **`w8a8` (default)**. The SAME enc/dec ship as
   static **rung** models — see [docs/RUNGS.md](docs/RUNGS.md). They run once on a fixed latent, so int8 is
   quality-free: a real-music round-trip is identical to fp32. `w8a8` is ~3× faster and ~half the RAM on an
@@ -79,7 +83,8 @@ odd/even L, batched/sequential CFG) and lazy-download from HuggingFace on first 
 
 | component | precisions | size | notes |
 |---|---|---|---|
-| **DiT** | `fp32` / `w16a32` / `w8a32` / `w8a8-dyn` | sm 1.8 / 0.9 / 0.45 / 0.45 GB · medium 5.8 / 2.9 / 1.5 / 1.5 GB | int8 → a *different* sample; fp32 is the pick |
+| **DiT — medium** (rung) | `fp32` / `w8a8` | 5.8 / 1.6 GB | N=12 rung ladder; `w8a8` = cache-safe int8, **flat ~2–4 GB RAM**, ≈ old `w8a8-dyn` quality; old `w16a32/w8a32/w8a8-dyn` → `legacy/`; needs litert ≥ 2.2.0 |
+| **DiT — small** | `fp32` / `w16a32` / `w8a32` / `w8a8-dyn` | sm 1.8 / 0.9 / 0.45 / 0.45 GB | varlen (not yet rung); int8 → a *different* sample |
 | **codec** (rung) | `fp32` / `w8a8` | SAME-S enc/dec 0.22 / 0.25 → w8a8 0.06 / 0.09 GB · SAME-L 1.7 / 1.8 → w8a8 0.47 / 0.52 GB | w8a8 quality-free, ~3× faster + half RAM; needs litert ≥ 2.2.0 |
 | T5Gemma | fp16 | 0.6 GB | single-precision |
 
@@ -87,9 +92,35 @@ odd/even L, batched/sequential CFG) and lazy-download from HuggingFace on first 
 faster-than-fp32 on the DiT. Codec rungs use dynamic int8 too, but there the extra activation-quant error is far
 below the AE's own loss. DiT speed factors measured on an Apple M4 Pro, XNNPACK, 8 threads.)*
 
-One CFG note (DiT-only): batched vs sequential CFG is bit-identical at `fp32`/`w8a32`, ~80 dB apart at `w16a32`, but
-under `w8a8-dyn` the batch=2 invoke shares activation scales across the cond/uncond rows → a *different plausible
-sample*. Pass `--no-cfg-batched` with `w8a8-dyn` when you need run-to-run reproducibility.
+One CFG note (small DiTs, varlen): batched vs sequential CFG is bit-identical at `fp32`/`w8a32`, ~80 dB apart at
+`w16a32`, but under `w8a8-dyn` the batch=2 invoke shares activation scales across the cond/uncond rows → a
+*different plausible sample*. Pass `--no-cfg-batched` with `w8a8-dyn` when you need run-to-run reproducibility.
+(The medium rung DiT runs batch=1 / sequential CFG, so this doesn't apply to it.)
+
+### Medium DiT — the N=12 rung ladder (replaces the old varlen tiers)
+
+The medium DiT now ships as a **static rung ladder**, built from the repo's own PyTorch model (see [build/](build/README.md)),
+not a dynamic-shape varlen graph. A render of length *L* runs on the **smallest of 12 fixed rungs ≥ L** in one forward,
+with the extra positions masked out of self-attention — so the result is **exact, not tiled**. Both `fp32` and the
+cache-safe int8 `w8a8` are single self-contained files (`dit_{fp32,w8a8}.tflite`; the per-step global-cond preamble
+rides inside as a `gcond` signature, so there is no extra file to ship).
+
+**Why it matters — RAM.** The old varlen graph materialized the full `[heads, S, S]` attention, so peak RAM grew with
+length and hit **~40 GB at the 380 s maximum** — unusable on a normal machine. The rung ladder's static shapes let
+XNNPACK plan a tight activation arena (reused across layers) and share one weight copy through the cache, so **peak RAM
+is flat at ~2–4 GB across the entire length range** — up to **10× less** at long lengths — while being *faster* at the
+rung sizes and ≈ equal quality to the old `w8a8-dyn` (cos 0.996 per forward).
+
+![Medium DiT peak RAM — rung ladder vs varlen](docs/img/dit-ram-rung-vs-varlen.png)
+
+**The 12 rungs** (in latents; audio ≈ L / 10.8 s, 4096 = 380 s max):
+`8, 48, 96, 192, 416, 704, 1056, 1496, 2040, 2824, 3536, 4096`.
+The short rungs — **8 (≈0.7 s) · 48 (≈4.5 s) · 96 (≈8.9 s) · 192 (≈18 s)** — keep tiny clips fast (a 1 s clip no longer
+pays for an 18 s render). A length *between* rungs pads up to the next one. The ladder is configurable via `DIT_LADDER`
+in [`build/build_dit.sh`](build/build_dit.sh).
+
+The old medium tiers (`w16a32`, `w8a32`, `w8a8-dyn`, and the previous varlen `fp32`) are retired to
+**`tflite/sa3-m/legacy/`** on HuggingFace.
 
 ```bash
 # default: fp32 DiT + w8a8 codec (fastest codec, quality-free)

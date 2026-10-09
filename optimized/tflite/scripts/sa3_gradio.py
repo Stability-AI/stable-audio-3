@@ -51,7 +51,7 @@ sys.path.insert(0, str(REPO))          # so `from models.defs.* import` resolves
 sys.path.insert(0, str(SCRIPTS_DIR))   # so `from weights / lora_* / spec import` resolves
 
 from sa3_tflite import (  # noqa: E402
-    BakedDiT, RungEncoder, RungDecoder, read_wav,
+    BakedDiT, make_dit_backend, RungEncoder, RungDecoder, read_wav,
     valid_T_lat, DEFAULT_DECODER, DIT_REL, DEC_REL, T5_REL,
     COND_TOKENS, COND_DIM, SAMPLE_RATE, SAMPLES_PER_LATENT,
     RUNG_TRIM, MIN_SIGMA,
@@ -172,7 +172,7 @@ def _save_wav(pcm_int16, out_path):
 # batch (cfg) or length changes. Codec enc/dec are cached by (name, precision).
 _t5 = None
 _tok = None
-_dit_cache: dict[str, BakedDiT] = {}
+_dit_cache: dict[str, object] = {}   # BakedDiT (varlen small DiTs) or RungDiT (medium rung ladder)
 _dit_lru: list[str] = []
 _DIT_CACHE_MAX = 1          # one big DiT resident at a time (medium fp32 = 5.8 GB)
 _dec_cache: dict[tuple, RungDecoder] = {}
@@ -215,9 +215,9 @@ def get_dit(dit_path, T_lat, t5_hidden, t5_mask, seconds, cfg, apg,
         _dit_cache.pop(old, None)
         gc.collect()
     t0 = time.time()
-    model = BakedDiT(dit_path, T_lat, t5_hidden, t5_mask, seconds, _THREADS,
-                     cfg=cfg, apg=apg, null_hidden=null_h, null_mask=null_m,
-                     local_add_cond=local_add_cond, batched=batched)
+    model = make_dit_backend(dit_path, T_lat, t5_hidden, t5_mask, seconds, _THREADS,
+                             cfg=cfg, apg=apg, null_hidden=null_h, null_mask=null_m,
+                             local_add_cond=local_add_cond, batched=batched)
     load_ms = (time.time() - t0) * 1000
     _dit_cache[key] = model
     _dit_lru.append(key)

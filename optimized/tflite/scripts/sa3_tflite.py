@@ -368,6 +368,31 @@ class BakedDiT:
         return _apply_cfg(x, t, v_cond, v_uncond, self.cfg, self.apg)
 
 
+def _is_rung_dit(path) -> bool:
+    """True if the .tflite exposes s<N> rung signatures (the merged DiT rung ladder — medium, and any
+    lora-merged clone of it) vs a single serving_default varlen graph (the small DiTs). Cheap: reads the
+    signature list from a metadata-only Interpreter, no tensor allocation."""
+    from ai_edge_litert.interpreter import Interpreter
+    keys = Interpreter(model_path=str(path)).get_signature_list().keys()
+    return any(k.startswith("s") and k[1:].isdigit() for k in keys)
+
+
+def make_dit_backend(path, L, t5_hidden, t5_mask, seconds, threads, *, cfg, apg,
+                     null_hidden, null_mask, local_add_cond, batched):
+    """Pick the DiT backend by MODEL TYPE, not family: RungDiT (static rung ladder + XNNPACK weight
+    cache, needs litert>=2.2.0) for the merged rungs; BakedDiT (varlen) otherwise. Both expose the same
+    model_fn(x,t,cross,gcond)->v that P.sample drives. Rungs are batch=1, so CFG there is sequential
+    (the `batched` flag is a no-op); _apply_cfg (passed as cfg_fn) does the guidance in both."""
+    if _is_rung_dit(path):
+        from rung_dit import RungDiT
+        return RungDiT(path, L, t5_hidden, t5_mask, seconds, threads=threads, cfg=cfg, apg=apg,
+                       null_hidden=null_hidden, null_mask=null_mask, local_add_cond=local_add_cond,
+                       cfg_fn=_apply_cfg)
+    return BakedDiT(path, L, t5_hidden, t5_mask, seconds, threads=threads, cfg=cfg, apg=apg,
+                    null_hidden=null_hidden, null_mask=null_mask, local_add_cond=local_add_cond,
+                    batched=batched)
+
+
 # The SAME audio encoder/decoder run as static rungs — see rung_encoder.RungEncoder /
 # rung_decoder.RungDecoder, driven from the Encode/Decode stages in main(). The old dense-varlen
 # BakedEncoder/BakedDecoder (+ manual chunking) they replace are gone.
@@ -717,9 +742,7 @@ def main():
     # ── DiT load + pingpong sample ──
     stage(TAG["dit"], f"DiT — load + sample ({args.steps} steps, σmax={sigma_max:.2f})")
     t0 = time.perf_counter()
-    cfg_note = (("CFG batched (1× batch=2 invoke/step)" if args.cfg_batched
-                 else "CFG sequential (2× batch=1 invokes/step)") if args.cfg != 1.0 else "")
-    print(f"        {dim('loading baked DiT ' + args.dit + ' ...')}", flush=True)
+    print(f"        {dim('loading DiT ' + args.dit + ' ...')}", flush=True)
     dit_path = ensure_local(dit_rel(args.dit, args.dit_precision))
     if args.lora_specs:
         from lora_patch import get_patched_dit
@@ -729,11 +752,15 @@ def main():
                                        precision=args.dit_precision, log=sub)
         except LoraError as e:
             sys.exit(f"error: {e}")
-    backend = BakedDiT(dit_path, T_lat, t5_hidden, mask.astype(np.float32),
-                       args.seconds, args.threads, cfg=args.cfg, apg=args.apg,
-                       null_hidden=null_h, null_mask=null_m, local_add_cond=local_add_cond,
-                       batched=args.cfg_batched)
+    backend = make_dit_backend(dit_path, T_lat, t5_hidden, mask.astype(np.float32),
+                               args.seconds, args.threads, cfg=args.cfg, apg=args.apg,
+                               null_hidden=null_h, null_mask=null_m, local_add_cond=local_add_cond,
+                               batched=args.cfg_batched)
     load_ms = (time.perf_counter() - t0) * 1000
+    # rung DiT is batch=1 → CFG is always sequential (the --cfg-batched flag is a no-op there)
+    cfg_note = ("" if args.cfg == 1.0 else
+                ("CFG batched (1× batch=2 invoke/step)" if getattr(backend, "batched", False)
+                 else "CFG sequential (2× batch=1 invokes/step)"))
     sub(f"load {load_ms/1000:.1f}s" + (f"   {cfg_note}" if cfg_note else ""))
 
     sig = P.build_pingpong_schedule(args.steps, sigma_max)

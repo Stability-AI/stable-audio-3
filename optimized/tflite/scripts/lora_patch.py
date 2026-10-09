@@ -53,7 +53,7 @@ import lora_core as lc  # noqa: E402
 # Bump when the merge math or mapping changes so stale cache entries are missed.
 _MERGE_VERSION = "1"
 
-_QUANTIZED_PRECISIONS = ("w8a32", "w8a8-dyn", "w4a32")
+_QUANTIZED_PRECISIONS = ("w8a8", "w8a32", "w8a8-dyn", "w4a32")  # w8a8 = the canonical int8 token (rung DiT)
 
 
 # ── FlatBuffer FC-weight discovery ─────────────────────────────────────────────

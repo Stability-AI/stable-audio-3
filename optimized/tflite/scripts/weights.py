@@ -60,23 +60,39 @@ BUNDLE_SIZES = {
 }
 # T5Gemma (shared, fp16) adds ~0.6 GB the first time any bundle is fetched.
 
-# The DiT keeps its full precision ladder (int8 fails on the DiT — the 8-step sampler is chaotically
-# sensitive, so int8 becomes a different sample; wXaY = weight/activation bits, "16" = fp16). These
-# lazy-download on first use. w16a32 = fp16 weights; w8a32 / w8a8-dyn = GPTQ-calibrated int8 weights.
-DIT_QUANT_PRECISIONS = ("w16a32", "w8a32", "w8a8-dyn")
-DIT_PRECISIONS = ("fp32",) + DIT_QUANT_PRECISIONS
+# DiT precision tiers are PER-FAMILY. The medium DiT now ships as the static RUNG ladder — exactly two
+# files, dit_fp32.tflite + dit_w8a8.tflite, built from stable_audio_3.models.dit by build/build_dit.sh and
+# merged into one weight-shared multi-signature .tflite (needs litert >= 2.2.0, like the SAME rungs), so
+# RAM stays flat across length. The medium's old varlen tiers (w16a32/w8a32/w8a8-dyn) are retired to
+# tflite/sa3-m/legacy/. The small DiTs are still the varlen graphs (fp32 + fp16/int8 tiers) until they're
+# rung-built too. NB: int8 on the DiT is NOT bit-identical (the distilled few-step sampler is chaotically
+# sensitive, so w8a8 is a different — not necessarily worse — sample); it is the SPEED tier that supersedes
+# the old published w8a8-dyn. fp32 stays the medium default until the w8a8 rung is ear-checked (then flip
+# the bundle below). wXaY = weight/activation bits ("16" = fp16).
+DIT_PRECISIONS_BY_FAMILY = {
+    "medium":   ("fp32", "w8a8"),
+    "sm-music": ("fp32", "w16a32", "w8a32", "w8a8-dyn"),
+    "sm-sfx":   ("fp32", "w16a32", "w8a32", "w8a8-dyn"),
+}
+DIT_SUBDIR = {"sm-music": "sa3-sm-music", "sm-sfx": "sa3-sm-sfx", "medium": "sa3-m"}
+# Union across families — what --precision / --dit-precision may name (validated per-family at load).
+DIT_PRECISIONS = tuple(dict.fromkeys(p for ps in DIT_PRECISIONS_BY_FAMILY.values() for p in ps))
 # The SAME autoencoder ships as static RUNG models (need litert >= 2.2.0) with just TWO tiers:
 # fp32 and w8a8. The codec runs once on a fixed latent, so int8 is quality-free on the round-trip —
 # w16a32 / w8a32 add no audible quality and are bigger/slower, so they're retired to
 # tflite/same-*/legacy/ (with the pre-rung varlen models). w8a8 is the recommended codec default.
 CODEC_PRECISIONS = ("fp32", "w8a8")
 PRECISIONS = DIT_PRECISIONS   # what --precision accepts (a global; the codec maps it via _codec_of)
-DIT_SUBDIR = {"sm-music": "sa3-sm-music", "sm-sfx": "sa3-sm-sfx", "medium": "sa3-m"}
 
 
 def dit_rel(dit: str, precision: str = "fp32") -> str:
     """Local rel path of a DiT model file for (family, precision)."""
     return f"models/tflite/{DIT_SUBDIR[dit]}/dit_{precision}.tflite"
+
+
+def dit_precisions(dit: str) -> tuple[str, ...]:
+    """Precision tiers available for a DiT family (medium = rung fp32/w8a8; small = varlen tiers)."""
+    return DIT_PRECISIONS_BY_FAMILY[dit]
 
 
 def dec_rel(dec: str, precision: str = "w8a8") -> str:
@@ -98,10 +114,10 @@ for _items in DIT_BUNDLES.values():
         FLAT_MANIFEST[_rel] = _hf
 for _rel, _hf in SHARED:
     FLAT_MANIFEST[_rel] = _hf
-for _prec in DIT_QUANT_PRECISIONS:                 # DiT quant variants
-    for _fam in DIT_SUBDIR:
+for _fam, _precs in DIT_PRECISIONS_BY_FAMILY.items():   # every DiT tier (medium rung w8a8 + small varlen)
+    for _prec in _precs:
         _rel = dit_rel(_fam, _prec)
-        FLAT_MANIFEST[_rel] = _rel.replace("models/tflite/", "tflite/", 1)
+        FLAT_MANIFEST.setdefault(_rel, _rel.replace("models/tflite/", "tflite/", 1))  # keep bundle fp32 entry
 for _prec in CODEC_PRECISIONS:                     # SAME-AE rung tiers (fp32 + w8a8) for both codecs
     for _dec in ("same-s", "same-l"):
         for _rel in (dec_rel(_dec, _prec), enc_rel(_dec, _prec)):

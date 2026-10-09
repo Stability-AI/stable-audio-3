@@ -31,5 +31,24 @@ for size in ("same-l", "same-s"):
                     y = m.decode(np.zeros((1, 256, L), np.float32)); good = y.shape[2] == L * 4096
                 ok &= good
             print(f"  {size}/{kind}_{prec:4s}  rungs={m.sizes}  shapes OK={good}")
+
+# medium DiT rungs: load each merged ladder, check it dispatches + returns the right shape at an exact
+# rung and a pad-up length. Absent files are skipped (a SAME-only build sets BUILD_DIT=0); present-but-
+# broken fails. Numerical tflite==torch is checked at export time (export_dit.py self-verify).
+for prec in ("fp32", "w8a8"):
+    p = WORK / "sa3-m" / f"dit_{prec}.tflite"
+    if not p.exists():
+        print(f"  sa3-m/dit_{prec:4s}  absent — skipped"); continue
+    from rung_dit import RungDiT
+    z3 = np.zeros((1, 256, 768), np.float32); m1 = np.ones((1, 256), np.float32)
+    d = RungDiT(str(p), L=100, t5_hidden=z3, t5_mask=m1, seconds=120.0, threads=8)
+    good = True
+    for L in (d.sizes[0], 100):                     # exact smallest rung + a pad-up length
+        d.set_conditioning(L, z3, m1, 120.0)
+        v = d(np.zeros((1, 256, L), np.float32), 0.5)
+        good &= (v.shape == (1, 256, L))
+    ok &= good
+    print(f"  sa3-m/dit_{prec:4s}  rungs={d.sizes}  shapes OK={good}")
+
 print("VERIFY OK" if ok else "VERIFY FAILED")
 sys.exit(0 if ok else 1)

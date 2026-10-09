@@ -73,8 +73,10 @@ def main():
                 # Squeeze for the merge, restore the kernel axis for the copy back.
                 wt = mod.weight.detach()
                 conv = wt.ndim == 3 and wt.shape[-1] == 1
-                W0 = (wt[..., 0] if conv else wt).float().cpu().numpy()
-                W = M.merge_layer_additive(W0, stack, key)
+                # Stay on the device. The numpy twin needs a host round trip per layer and
+                # does the DoRA row norms on CPU -- together ~5 s on the widest weights.
+                W0 = (wt[..., 0] if conv else wt).float()
+                W = M.merge_layer_additive_torch(W0, stack, key)
                 if W is None:
                     continue
                 if conv:
@@ -82,8 +84,7 @@ def main():
                 # snapshot on the HOST: keeping 168 fp32 clones on device is a second copy
                 # of the DiT and OOMs a shared GPU.
                 saved[key] = mod.weight.detach().to("cpu", copy=True)
-                mod.weight.copy_(torch.as_tensor(W, dtype=mod.weight.dtype,
-                                                 device=mod.weight.device))
+                mod.weight.copy_(W.to(mod.weight.dtype))
             v = wrapper_with(dit, sd, w0, b0)(*args6).clone()
             for key, Wsv in saved.items():
                 mod = _mod(key)

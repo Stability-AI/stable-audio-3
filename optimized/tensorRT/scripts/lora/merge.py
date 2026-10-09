@@ -247,6 +247,28 @@ def merged_weight_torch(W0, p, atype, scaling):
     raise ValueError(f"unknown adapter_type {atype!r}")
 
 
+def merge_layer_additive_torch(W0, stack, layer_key):
+    """merge_layer_additive on the device. W0: (out,in) float32 cuda tensor, or None.
+
+    Same semantics as the numpy twin -- every delta taken against the SAME W0 and summed,
+    with strength as an application_weight on the finished delta -- so a harness can compare
+    the branch engine against what it actually computes.
+
+    Exists because the numpy path is not viable as a gate: it costs ~5 s per layer on the
+    widest weights (the DoRA row norms over [7680,1536] on CPU), and a caller holding the
+    weights on the GPU pays a device->host->device round trip per layer on top. Measured on a
+    168-layer reference build: 7.7 min -> seconds.
+    """
+    acc = None
+    for a in stack:
+        p = a["layers"].get(layer_key)
+        if p is None or a["strength"] == 0.0:
+            continue
+        d = a["strength"] * (merged_weight_torch(W0, p, a["type"], a["scaling"]) - W0)
+        acc = d if acc is None else acc + d
+    return None if acc is None else W0 + acc
+
+
 def merge_layer_torch(W0, stack, layer_key):
     """Device-resident sequential merge. W0: (out,in) float32 cuda tensor."""
     W = None

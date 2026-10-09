@@ -256,8 +256,13 @@ where the old one measured 18.3.
 
 ### LoRA / DoRA adapters
 
-A separate DiT engine carries a runtime low-rank branch on each of 229 linears, so any
-adapter loads in milliseconds and stacks without a rebuild:
+A TensorRT plan has its weights baked in, so an adapter cannot simply be merged the way the
+mlx and tflite runtimes do it. A separate DiT engine instead carries the adapter as **network
+inputs**: a low-rank branch on each of 229 linears, computing
+`y = W₀·x·(1+P) + Btᵀ·(srow ⊙ (A·x))` where `A`, `Bt` and `P` are fed in like activations and
+the rank `R` is a dynamic dimension (1..512). Swapping an adapter is therefore a buffer write
+rather than a rebuild, stacking is concatenation along `R`, and `srow` gives each adapter in a
+stack its own strength:
 
 ```bash
 python scripts/lora/build_branch.py --model sa3-m --download   # ~7.4 min on an H200, once per GPU arch

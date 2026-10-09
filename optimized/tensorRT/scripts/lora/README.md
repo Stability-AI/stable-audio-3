@@ -163,19 +163,67 @@ changing only strength or weights does not.
 
 ## How it works
 
-A low-rank branch on each adapted linear:
+**The problem.** A TensorRT engine is a compiled plan: the weights are baked in when you
+build it. Normally, changing a weight means rebuilding (minutes of kernel search) or
+refitting (seconds, but it rewrites 2.6 GB of weights and cannot vary per sampler step).
+Neither is a thing you can do while someone moves a slider.
+
+**The trick is to stop treating the adapter as a weight.** A LoRA delta is low rank —
+`ΔW = (α/r)·B·A` with `B` being `[out, r]` and `A` being `[r, in]` — so it does not have to
+live in the plan at all. It can arrive as *activation data*. The build adds, to each of the
+229 adapted linears, three extra **network inputs**:
 
 ```
-y = W₀·x·(1 + pout)  +  Bp·(srow ⊙ (A·x))
+A  [1, R, in ]     the down-projection
+Bt [1, R, out]     the up-projection, stored rank-major
+P  [1, 1, out]     a per-output-row rescale of the base path
 ```
 
-`A`, `Bt` and `P` are **network inputs**, not weights — so swapping an adapter is a buffer
-write, not a rebuild, and `srow` gives each adapter in a stack its own strength for the cost
-of an R-element write.
+plus one `srow [1, 1, R]` shared by the whole network. The adapted linear then computes
 
-The graph never learns what "stacking" means. Any composition of the form
-`ρ ⊙ W₀ + Σ γₖ ⊙ δₖ` fits it, with ρ folding into `P` and γₖ into that block's `Bt` rows —
-verified to 3.3e-16 against an exact chained merge. The semantics live entirely in Python.
+```
+y = W₀·x·(1 + P)  +  Btᵀ·( srow ⊙ (A·x) )
+    └── base ───┘     └──── low-rank branch ────┘
+```
+
+`R` is a **dynamic** dimension, 1..512, so one engine serves any rank.
+
+**That is the whole mechanism, and everything else follows from it:**
+
+- **Swapping an adapter is a buffer write.** No rebuild, no refit — microseconds of host
+  work plus the fold. The plan never changes, so a captured CUDA graph stays valid as long
+  as the buffer *addresses* hold.
+- **Stacking is concatenation along `R`.** Two rank-16 adapters become one rank-32 operand
+  pair. Because `srow` is indexed per rank-slot, scaling slots 0–15 scales the first adapter
+  and 16–31 the second — per-adapter strength for the cost of a 32-element write.
+- **`P` is what DoRA needs.** A DoRA is not just a delta: it renormalises each weight row and
+  reimposes a learned magnitude, `c = magnitude / ‖W₀ + δ‖_row`. That is a rescale of the
+  *base* path, which no amount of low-rank branch can express — hence `P = c − 1`. Without
+  it the engine silently computes plain LoRA for a DoRA checkpoint, missing 32% of the
+  adapter's effect at 1% magnitude drift and 86% at 5%.
+- **The graph does not know what "stacking" means.** It evaluates the formula above and
+  nothing else. Any composition of the form `ρ ⊙ W₀ + Σₖ γₖ ⊙ δₖ` fits it — `ρ` folds into
+  `P`, `γₖ` folds into that adapter's rows of `Bt` — so the *semantics* of combining
+  adapters live entirely in Python and can change without touching the engine. Verified by
+  writing an exact chained composition into the same operands and reproducing a dense
+  chained merge to 3.3e-16.
+
+**What it costs, and why.** The branch is two small GEMMs per adapted linear — `[S,in]×[in,R]`
+then `[S,R]×[R,out]`. At low rank that is memory- and launch-bound rather than arithmetic-
+bound, which is why the overhead is a flat ~4–6 ms per step rather than a percentage, and why
+stacked rank is free up to about 32 before the GEMMs start to matter.
+
+The flip side of operands-as-inputs: **TensorRT refuses to enqueue with any input unbound**,
+so a branch engine must be handed at least a zero stack before it will run at all — and a
+zero stack still pays the full forward cost. That is why `dit_fp16.trt` remains the default
+and the LoRA engine is only selected when an adapter is actually wanted.
+
+**Why not refit instead?** Refitting the real weights gives a 0% forward overhead and
+supports every adapter variant including the ones this branch cannot express
+(`dora-cols`, `bora`, which need a per-*input* rescale). It costs a multi-second weight
+rewrite per change and cannot do per-step strength at all. The crossover is around 36
+generations per adapter: below that the branch wins, above it the refit does. The branch is
+the interactive path.
 
 ---
 

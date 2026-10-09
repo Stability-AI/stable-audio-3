@@ -83,7 +83,10 @@ DIT_REL = {d: dit_rel(d) for d in ("sm-music", "sm-sfx", "medium")}   # fp32 (pi
 DEC_REL = {d: dec_rel(d) for d in ("same-s", "same-l")}
 ENC_REL = {d: enc_rel(d) for d in ("same-s", "same-l")}
 T5_REL = "models/tflite/t5gemma/encoder_fp16.tflite"
-DEFAULT_DECODER = {"sm-music": "same-s", "sm-sfx": "same-s", "medium": "same-l"}
+DEFAULT_DECODER = {"sm-music": "same-s", "sm-sfx": "same-s", "medium": "same-s"}
+# Default DiT precision per family. medium ships the rung w8a8 (cache-safe int8, ~equal quality to the
+# retired w8a8-dyn, flat RAM) as its default; the small DiTs have no rung w8a8, so they stay fp32.
+DEFAULT_DIT_PRECISION = {"medium": "w8a8", "sm-music": "fp32", "sm-sfx": "fp32"}
 
 # The SAME codec runs as static RUNG models: RungEncoder/RungDecoder auto-dispatch the optimal rung
 # per length (no chunk-size knob), holding RAM flat while the old dense-varlen graphs blew up
@@ -474,16 +477,19 @@ def main():
                     help="DiT model (names match sa3_mlx / sa3_trt). If omitted, prompts "
                          "interactively with an arrow-key picker.")
     ap.add_argument("--decoder", choices=["same-s", "same-l"], default=None,
-                    help="Audio decoder. Default: same-s for sm-music/sm-sfx, same-l for medium. "
+                    help="Audio decoder. Default: same-s for every model (medium's latents decode "
+                         "fine on SAME-S, ~7x faster); same-l is the bigger max-fidelity option. "
                          "If omitted, prompts interactively with an arrow-key picker.")
     ap.add_argument("--precision", choices=list(PRECISIONS), default=None,
                     help="Global precision default: sets the DiT directly and maps to the SAME codec "
-                         "(fp32->fp32, any int8 -> the codec's w8a8). wXaY = weight/activation bits: "
-                         "'fp32' | 'w16a32' | 'w8a32' | 'w8a8-dyn'. Defaults when omitted: DiT fp32, "
+                         "(fp32->fp32, any int8 -> the codec's w8a8). wXaY = weight/activation bits. "
+                         "Tiers are per-family: medium 'w8a8'/'fp32'; small 'fp32'/'w16a32'/'w8a32'/"
+                         "'w8a8-dyn'. Defaults when omitted: DiT per-family (medium w8a8, small fp32), "
                          "codec w8a8. Per-component overrides below; T5Gemma is single-precision.")
     ap.add_argument("--dit-precision", choices=list(PRECISIONS), default=None,
-                    help="Override the DiT precision (fp32 | w16a32 | w8a32 | w8a8-dyn). int8 diverges "
-                         "on the DiT's 8-step sampler, so fp32 is the pick.")
+                    help="Override the DiT precision (medium: w8a8 | fp32; small: fp32 | w16a32 | "
+                         "w8a32 | w8a8-dyn). int8 gives a *different* (not worse) draw on the 8-step "
+                         "sampler; medium defaults to the cache-safe w8a8 rung, fp32 is the bit-exact reference.")
     ap.add_argument("--decoder-precision", choices=list(CODEC_PRECISIONS), default=None,
                     help="SAME decoder rung tier: 'w8a8' (default — faster, ~half RAM, quality-free) "
                          "or 'fp32' (bit-exact / for CPUs without int8 acceleration).")
@@ -547,11 +553,11 @@ def main():
     args = ap.parse_args()
     if args.steps < 1:
         ap.error(f"--steps must be ≥ 1 (got {args.steps})")
-    # Resolve precisions: DiT defaults fp32; codec defaults w8a8. --precision is a global that
+    # Resolve codec precisions here (default w8a8). The DiT precision is per-family, so it's resolved
+    # below once --dit is known (medium -> w8a8, the small DiTs -> fp32). --precision is a global that
     # sets the DiT directly and maps to the codec (fp32->fp32, any int8 -> the codec's w8a8).
     def _codec_of(p):
         return None if p is None else ("fp32" if p == "fp32" else "w8a8")
-    args.dit_precision = args.dit_precision or args.precision or "fp32"
     args.decoder_precision = args.decoder_precision or _codec_of(args.precision) or "w8a8"
     args.encoder_precision = args.encoder_precision or _codec_of(args.precision) or "w8a8"
 
@@ -571,6 +577,17 @@ def main():
     if args.seed is None:
         args.seed = random.randint(0, 2**31 - 1)
 
+    # DiT precision is per-family, resolved now that --dit is known: medium -> w8a8, small -> fp32.
+    if args.dit_precision or args.precision:
+        args.dit_precision = args.dit_precision or args.precision
+    else:
+        args.dit_precision = DEFAULT_DIT_PRECISION.get(args.dit, "fp32")
+        # A LoRA run needs a mergeable (un-quantized) DiT. If the user pinned no precision and the
+        # family default is int8 (e.g. medium's w8a8), fall back to fp32 so --lora works out of the box.
+        if args.lora_specs and args.dit_precision not in ("fp32", "w16a32"):
+            print(f"  (note: --lora needs an un-quantized DiT — using fp32 instead of the "
+                  f"{args.dit} default '{args.dit_precision}')")
+            args.dit_precision = "fp32"
     dec = args.decoder or DEFAULT_DECODER[args.dit]
     T_lat = valid_T_lat(args.seconds)
     target_dur = T_lat * SAMPLES_PER_LATENT / SAMPLE_RATE

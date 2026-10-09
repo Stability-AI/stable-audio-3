@@ -64,11 +64,11 @@ prompt ─▶ T5Gemma encoder ─▶ DiT pingpong sampler ─▶ SAME-S/L decode
 Precision is split between the **DiT** and the **SAME codec** — they react to quantization oppositely:
 
 - **DiT** (`--dit-precision`, or the global `--precision`):
-  - **medium**: `fp32` (default) · `w8a8` — a from-repo **rung ladder** (12 fixed lengths; see *Medium DiT — the
+  - **medium**: **`w8a8` (default)** · `fp32` — a from-repo **rung ladder** (12 fixed lengths; see *Medium DiT — the
     N=12 rung ladder* below). `w8a8` is **cache-safe int8**: ~equal quality to the old `w8a8-dyn` (cos 0.996 per
     forward) but with **flat RAM (~2–4 GB vs the old 3–40 GB)**, faster at the rung sizes, and a single file.
     int8 on the DiT is still a *different* (not worse) sample — the 8-step sampler is chaotically sensitive — so
-    `fp32` stays the default/reference and you judge `w8a8` by ear.
+    `w8a8` is the shipped default and `fp32` is the bit-exact reference (and the pick for LoRA merges or an A/B).
   - **sm-music / sm-sfx**: `fp32` · `w16a32` · `w8a32` · `w8a8-dyn` — still the dynamic-shape varlen graphs
     (wXaY = weight/activation bits; "16" = fp16), until they are rung-built too.
 - **Codec** (`--decoder-precision` / `--encoder-precision`): `fp32` · **`w8a8` (default)**. The SAME enc/dec ship as
@@ -78,12 +78,13 @@ Precision is split between the **DiT** and the **SAME codec** — they react to 
   codec variants added no audible quality and are retired to `tflite/same-*/legacy/`.)
 
 `--precision` is a global default that sets the DiT directly and maps to the codec (`fp32`→`fp32`, any int8→`w8a8`).
-When omitted, the defaults are **DiT fp32, codec w8a8**. All variants keep the full feature set (any `--seconds`,
+When omitted, the DiT precision is **per-family — medium `w8a8`, the small DiTs `fp32`** (they have no rung `w8a8`
+yet) — and the **codec is `w8a8`**. All variants keep the full feature set (any `--seconds`,
 odd/even L, batched/sequential CFG) and lazy-download from HuggingFace on first use.
 
 | component | precisions | size | notes |
 |---|---|---|---|
-| **DiT — medium** (rung) | `fp32` / `w8a8` | 5.8 / 1.6 GB | N=12 rung ladder; `w8a8` = cache-safe int8, **flat ~2–4 GB RAM**, ≈ old `w8a8-dyn` quality; old `w16a32/w8a32/w8a8-dyn` → `legacy/`; needs litert ≥ 2.2.0 |
+| **DiT — medium** (rung) | **`w8a8`** (default) / `fp32` | 1.6 / 5.8 GB | N=12 rung ladder; `w8a8` = cache-safe int8, **flat ~2–4 GB RAM**, ≈ old `w8a8-dyn` quality; old `w16a32/w8a32/w8a8-dyn` → `legacy/`; needs litert ≥ 2.2.0 |
 | **DiT — small** | `fp32` / `w16a32` / `w8a32` / `w8a8-dyn` | sm 1.8 / 0.9 / 0.45 / 0.45 GB | varlen (not yet rung); int8 → a *different* sample |
 | **codec** (rung) | `fp32` / `w8a8` | SAME-S enc/dec 0.22 / 0.25 → w8a8 0.06 / 0.09 GB · SAME-L 1.7 / 1.8 → w8a8 0.47 / 0.52 GB | w8a8 quality-free, ~3× faster + half RAM; needs litert ≥ 2.2.0 |
 | T5Gemma | fp16 | 0.6 GB | single-precision |
@@ -123,11 +124,14 @@ The old medium tiers (`w16a32`, `w8a32`, `w8a8-dyn`, and the previous varlen `fp
 **`tflite/sa3-m/legacy/`** on HuggingFace.
 
 ```bash
-# default: fp32 DiT + w8a8 codec (fastest codec, quality-free)
-./sa3 --prompt "lofi house loop" --dit sm-music --decoder same-s
+# medium DiT — defaults: w8a8 rung DiT + w8a8 SAME-S codec (the `--decoder` now defaults to same-s)
+./sa3 --prompt "lofi house loop" --dit medium
+
+# small music DiT — defaults: fp32 DiT + w8a8 SAME-S codec
+./sa3 --prompt "lofi house loop" --dit sm-music
 
 # bit-exact codec (e.g. a CPU without int8 acceleration)
-./sa3 --prompt "lofi house loop" --dit sm-music --decoder same-s --decoder-precision fp32
+./sa3 --prompt "lofi house loop" --dit sm-music --decoder-precision fp32
 
 # cap codec RAM on a tiny-memory device (slower)
 ./sa3 --prompt "lofi house loop" --dit medium --max-rung 64
@@ -300,7 +304,7 @@ For sub-realtime latency on a supported device, prefer the GPU siblings:
 | `--prompt`            | (asks)   | Text prompt; empty string = unconditional                              |
 | `--negative-prompt`   | —        | CFG uncond branch; only used when `--cfg ≠ 1.0`                       |
 | `--dit`               | (asks)   | `sm-music`, `sm-sfx`, or `medium`                                     |
-| `--decoder`           | (asks)   | `same-s` (pairs with sm-*) or `same-l` (pairs with medium)            |
+| `--decoder`           | `same-s` | `same-s` (default for every DiT — medium's latents decode fine on it, ~7× faster) or `same-l` (bigger, for max fidelity on medium) |
 | `--seconds`           | 30       | Output length (use ≥ ~20 s)                                          |
 | `--steps`             | 8        | Pingpong sampler steps; 1 = single forward (fastest), 8 = sweet spot  |
 | `--seed`              | random   | Set for reproducibility; the chosen seed is printed at the end        |
@@ -317,10 +321,12 @@ For sub-realtime latency on a supported device, prefer the GPU siblings:
 | `--out` / `-o`        | (auto)   | Relative → `output/<file>`; absolute → as-is. 16-bit PCM stereo @ 44.1 kHz, trimmed to exactly `--seconds` |
 | `--play`              | off      | After writing, play the WAV: `afplay` (macOS) / `winsound` (Windows) / `aplay` (Linux); Ctrl-C stops both |
 
-All `.tflite` models are **fp32** except T5Gemma, which is **fp16** (numerically
-lossless there). There is no dtype knob: on CPU, int8/fp16 weights buy size, not
-speed (XNNPACK dequantizes to fp32 to matmul), and int8 costs quality on the DiT
-— so this release ships the fp32 graphs directly. (See "Notes on the design".)
+Precision is **per-family** (see [Precision variants](#precision-variants---precision)):
+the **medium DiT defaults to `w8a8`** — cache-safe rung int8, ~equal quality to fp32 per
+forward (cos 0.996) but far smaller and flat-RAM — the **small DiTs default to `fp32`** (no
+rung `w8a8` yet), the **SAME codec defaults to `w8a8`** (quality-free on the round-trip),
+and **T5Gemma is `fp16`**. Every component also offers an `fp32` tier (bit-exact; the pick
+for CPUs without int8 acceleration, and required for LoRA merges). (See "Notes on the design".)
 
 ## LoRA
 
@@ -345,7 +351,11 @@ must match `--dit`. The merge is written into a cached copy of the DiT under
 on repeat runs, so the ~5–15 s patch cost is paid once. A medium fp32 cache entry
 is ~5.4 GB — delete `lora_cache/` to reclaim.
 
-Requires `--dit-precision fp32` (default) or `w16a32`. **LoRA on the quantized
+Requires an un-quantized DiT: `fp32` (any family) or `w16a32` (small DiTs only).
+Medium now defaults to `w8a8`, but when you pass `--lora` without pinning a
+precision the CLI **auto-selects `fp32`** for you (it prints a one-line note); you
+only hit the error below if you *explicitly* pin an int8 precision alongside
+`--lora`. **LoRA on the quantized
 DiTs (`w8a32` / `w8a8-dyn` / `w4a32`) isn't figured out yet** — those store
 weights as GPTQ-calibrated int8, so merging would mean dequantize → add the LoRA
 delta → re-quantize, and a naive re-quant throws away the GPTQ error-feedback
@@ -376,11 +386,12 @@ sa3_tflite/
     ├── tokenizer.model            ← SentencePiece model, BUNDLED (~4 MB; T5Gemma tflite is encoder-only)
     ├── defs/
     │   └── tflite_pipeline.py     ← Tokenizer + T5Gemma front-end + pingpong schedule + sampler + WAV
-    └── tflite/                    ← .tflite models (auto-downloaded; ~2.3 GB small, ~9.5 GB medium)
+    └── tflite/                    ← .tflite models (lazy-downloaded; default bundle ~2.4 GB per DiT; ~9.5 GB if you fetch every tier)
         ├── t5gemma/encoder_fp16.tflite        564 MB   text encoder (fp16)
         ├── sa3-sm-music/dit_fp32.tflite       1.8 GB   small music DiT (conditioner baked in)
         ├── sa3-sm-sfx/dit_fp32.tflite         1.8 GB   small sfx DiT (conditioner baked in)
-        ├── sa3-m/dit_fp32.tflite              5.8 GB   medium DiT (conditioner baked in)
+        ├── sa3-m/dit_w8a8.tflite              1.6 GB   medium DiT — DEFAULT (cache-safe rung int8)
+        ├── sa3-m/dit_fp32.tflite              5.8 GB   medium DiT (fp32 reference; LoRA / A-B)
         ├── same-s/{enc,dec}_{fp32,w8a8}.tflite   rung codec (fp32 ~0.22 GB · w8a8 ~0.07 GB); legacy/ = pre-rung
         └── same-l/{enc,dec}_{fp32,w8a8}.tflite   rung codec (fp32 ~1.75 GB · w8a8 ~0.5 GB);  legacy/ = pre-rung
 ```
@@ -407,13 +418,17 @@ is the one weight that IS committed, since the `.tflite` T5Gemma is encoder-only
   length — so one file serves any `--seconds`. The DiT is a 6-input graph
   (`x, t, t5_hidden, t5_mask, seconds, local_add_cond`); feed raw T5 outputs and
   the in-graph conditioner handles prompt-padding + seconds-embedding.
-- **fp32 everywhere (except fp16 T5Gemma).** On CPU, quantizing buys size, not
-  speed — XNNPACK dequantizes int8/fp16 weights to fp32 to matmul, so fp16 is
-  actually *slower* and int8 gives no speedup. And the DiT will not go int8 at
-  quality: per-step error compounds over the 8 chaotic sampling steps into a
-  *different* (still plausible) sample, not a degraded one. So this release ships
-  the fp32 graphs directly. T5Gemma fp16 is the sole exception — it's numerically
-  lossless there and halves that file.
+- **Per-family precision (no longer fp32-only).** The medium DiT now ships the
+  cache-safe **rung `w8a8`** as its default: int8 weights with per-token dynamic
+  activation quant, so on an int8-capable CPU (VNNI/AMX) the int8×int8 matmuls run
+  faster than fp32, the file is ~¼ the size, and rung-shared weights keep RAM flat.
+  int8 on the DiT is a *different* (not worse) sample — per-step error compounds over
+  the 8 chaotic sampling steps into another plausible draw, not a degraded one — so the
+  bit-exact `fp32` tier ships alongside it (for CPUs without int8 acceleration, LoRA
+  merges, and A/B reference). fp16 (`w16a32`) is *slower* on CPU — XNNPACK dequantizes it
+  to fp32 to matmul — so it's offered only as a half-size near-lossless tier, not a speed
+  one. The small DiTs stay fp32 until they're rung-built. T5Gemma is fp16 (numerically
+  lossless there, and it halves that file).
 - **Monotonic audio-to-audio schedule.** The pingpong schedule applies the LogSNR
   shift to the normalized `[1→0]` grid, then scales by σmax, so audio-to-audio
   (σmax < 1) stays monotonically decreasing while keeping all N distilled steps.

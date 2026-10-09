@@ -44,8 +44,11 @@ python .../sa3_trt.py --dit medium --lora a.safetensors:0.8 --lora b.safetensors
 ```
 
 `--lora` is repeatable and takes an optional `:STRENGTH`. Passing it selects the LoRA engine
-automatically. The gradio app exposes the same thing as `lora_load`, `lora_unload` and
-`lora_strength` API endpoints.
+automatically.
+
+The runtime side is already in place for a UI — `SA3Inference.set_lora()` and
+`set_lora_strength()` take a stack and per-adapter strengths, and a same-rank swap keeps every
+cached CUDA graph valid — but the gradio app does not expose it yet.
 
 ---
 

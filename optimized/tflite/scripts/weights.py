@@ -25,10 +25,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent.parent
 
 # Bundles the install script offers to the user. Each maps to a list of
 # model files (local relative path on the left, HF repo path on the right).
-# T5Gemma is in SHARED because every bundle needs it. The two small DiTs
-# share the SAME-S codec; medium uses the SAME-L codec. Each ships at its
-# runtime default precision — DiT fp32, SAME codec w8a8 (quality-free and
-# ~5x smaller); either's other tier lazy-downloads on demand.
+# T5Gemma is in SHARED because every bundle needs it. All three families ship
+# the SAME-S codec by default (medium's latents decode fine on SAME-S — ~7x
+# faster and ~5x smaller than SAME-L, which lazy-downloads if asked). Each ships
+# at its runtime default precision — medium DiT w8a8 (the cache-safe rung int8),
+# the small DiTs fp32 (no rung w8a8 yet); SAME codec w8a8 (quality-free and ~5x
+# smaller). Any other tier lazy-downloads on demand.
 
 DIT_BUNDLES: dict[str, list[tuple[str, str]]] = {
     "sm-music": [
@@ -42,9 +44,9 @@ DIT_BUNDLES: dict[str, list[tuple[str, str]]] = {
         ("models/tflite/same-s/dec_w8a8.tflite",       "tflite/same-s/dec_w8a8.tflite"),
     ],
     "medium": [
-        ("models/tflite/sa3-m/dit_fp32.tflite",        "tflite/sa3-m/dit_fp32.tflite"),
-        ("models/tflite/same-l/enc_w8a8.tflite",       "tflite/same-l/enc_w8a8.tflite"),
-        ("models/tflite/same-l/dec_w8a8.tflite",       "tflite/same-l/dec_w8a8.tflite"),
+        ("models/tflite/sa3-m/dit_w8a8.tflite",        "tflite/sa3-m/dit_w8a8.tflite"),
+        ("models/tflite/same-s/enc_w8a8.tflite",       "tflite/same-s/enc_w8a8.tflite"),
+        ("models/tflite/same-s/dec_w8a8.tflite",       "tflite/same-s/dec_w8a8.tflite"),
     ],
 }
 
@@ -56,7 +58,7 @@ SHARED: list[tuple[str, str]] = [
 BUNDLE_SIZES = {
     "sm-music": "2.0 GB  (small music DiT fp32 + SAME-S codec w8a8)",
     "sm-sfx":   "2.0 GB  (small sfx DiT fp32 + SAME-S codec w8a8)",
-    "medium":   "6.8 GB  (medium DiT fp32 + SAME-L codec w8a8)",
+    "medium":   "1.8 GB  (medium DiT w8a8 + SAME-S codec w8a8)",
 }
 # T5Gemma (shared, fp16) adds ~0.6 GB the first time any bundle is fetched.
 
@@ -67,8 +69,8 @@ BUNDLE_SIZES = {
 # tflite/sa3-m/legacy/. The small DiTs are still the varlen graphs (fp32 + fp16/int8 tiers) until they're
 # rung-built too. NB: int8 on the DiT is NOT bit-identical (the distilled few-step sampler is chaotically
 # sensitive, so w8a8 is a different — not necessarily worse — sample); it is the SPEED tier that supersedes
-# the old published w8a8-dyn. fp32 stays the medium default until the w8a8 rung is ear-checked (then flip
-# the bundle below). wXaY = weight/activation bits ("16" = fp16).
+# the old published w8a8-dyn. w8a8 is now the medium default (CJ's call 2026-10-09); fp32 lazy-downloads
+# for LoRA merges or a bit-exact A/B. wXaY = weight/activation bits ("16" = fp16).
 DIT_PRECISIONS_BY_FAMILY = {
     "medium":   ("fp32", "w8a8"),
     "sm-music": ("fp32", "w16a32", "w8a32", "w8a8-dyn"),
@@ -117,7 +119,7 @@ for _rel, _hf in SHARED:
 for _fam, _precs in DIT_PRECISIONS_BY_FAMILY.items():   # every DiT tier (medium rung w8a8 + small varlen)
     for _prec in _precs:
         _rel = dit_rel(_fam, _prec)
-        FLAT_MANIFEST.setdefault(_rel, _rel.replace("models/tflite/", "tflite/", 1))  # keep bundle fp32 entry
+        FLAT_MANIFEST.setdefault(_rel, _rel.replace("models/tflite/", "tflite/", 1))  # don't clobber the bundle's entry
 for _prec in CODEC_PRECISIONS:                     # SAME-AE rung tiers (fp32 + w8a8) for both codecs
     for _dec in ("same-s", "same-l"):
         for _rel in (dec_rel(_dec, _prec), enc_rel(_dec, _prec)):

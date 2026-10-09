@@ -6,9 +6,11 @@ is wired, plus a precision picker the MLX/TRT UIs don't need:
   - Model picker: sm-music / sm-sfx / medium (hot-swap; the large DiT interpreter
     is cached — first use of a model/precision/length loads + XNNPACK-packs the
     weights, subsequent runs reuse it and only re-bind the conditioning).
-  - Precision picker: fp32 / w16a32 / w8a32 / w8a8-dyn (one knob for DiT + codec +
-    encoder, exactly like the CLI's --precision). fp32 is the CPU fast-and-accurate
-    default; w16a32 is ≈lossless half-size; w8a32/w8a8-dyn are GPTQ int8 (¼ size).
+  - Precision picker (one knob for DiT + codec + encoder, like the CLI's --precision),
+    per DiT family: medium is w8a8 (cache-safe rung int8, default) / fp32; the small
+    DiTs are fp32 (default) / w16a32 (fp16, ≈lossless half-size) / w8a32 / w8a8-dyn
+    (GPTQ int8, ¼ size). Switching model resets the precision + decoder to the new
+    family's default.
   - CFG 0-10 next to seconds/steps (0 = negative prompt takes over, 0.5 = halfway
     between prompts, 1 = off, >1 = extrapolate) + negative prompt/APG under Advanced.
   - Audio-to-audio: guide audio + init_noise_level (whole clip starts from its
@@ -24,8 +26,8 @@ is wired, plus a precision picker the MLX/TRT UIs don't need:
     Hotswap), MP3 (via ffmpeg) or WAV saving.
 
 Launch:
-    ./sa3-gradio                  # share=True by default, sm-music + same-s, fp32
-    ./sa3-gradio --dit medium --precision w8a32
+    ./sa3-gradio                  # share=True by default; sm-music + same-s + fp32
+    ./sa3-gradio --dit medium     # medium + same-s + w8a8 (the family defaults)
     ./sa3-gradio --no-share       # local-only
 """
 from __future__ import annotations
@@ -52,7 +54,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))   # so `from weights / lora_* / spec import
 
 from sa3_tflite import (  # noqa: E402
     BakedDiT, make_dit_backend, RungEncoder, RungDecoder, read_wav,
-    valid_T_lat, DEFAULT_DECODER, DIT_REL, DEC_REL, T5_REL,
+    valid_T_lat, DEFAULT_DECODER, DEFAULT_DIT_PRECISION, DIT_REL, DEC_REL, T5_REL,
     COND_TOKENS, COND_DIM, SAMPLE_RATE, SAMPLES_PER_LATENT,
     RUNG_TRIM, MIN_SIGMA,
 )
@@ -79,6 +81,8 @@ LORA_PRECISIONS = ("fp32", "w16a32")
 # Trained max clip length per model (repo README model table).
 MAX_SECONDS = {"sm-music": 120, "sm-sfx": 120, "medium": 380}
 DEFAULT_DECODERS = dict(DEFAULT_DECODER)
+# Per-family default DiT precision (medium -> cache-safe rung w8a8; small DiTs -> fp32).
+DEFAULT_DIT_PRECISIONS = dict(DEFAULT_DIT_PRECISION)
 # XNNPACK CPU threads (set from --threads in main()).
 _THREADS = 8
 
@@ -749,8 +753,15 @@ def build_ui(initial_dit: str, initial_decoder: str, initial_precision: str, *,
         srow_ups = [gr.update(visible=bool(slots[i][0] or slots[i][1] != _DD_NONE))
                     for i in range(3)]
         row_ups = [gr.update(visible=v) for v in nvis]
+        # Reset precision to the new family's default (its tiers don't overlap across
+        # families — e.g. sm's w8a8-dyn is invalid for medium), and swing the LoRA
+        # editor/note to match (int8 defaults like medium's w8a8 can't be LoRA-merged).
+        new_prec = DEFAULT_DIT_PRECISIONS.get(dit_name, "fp32")
+        lora_ok = new_prec in LORA_PRECISIONS
         return (gr.update(value=DEFAULT_DECODERS.get(dit_name, "same-s")),
                 gr.update(maximum=max_s, value=min(cur_seconds, max_s)),
+                gr.update(value=new_prec),
+                gr.update(visible=not lora_ok), gr.update(visible=lora_ok),
                 *dd_ups, *srow_ups, *row_ups,
                 gr.update(visible=not all(nvis)), nvis, dit_name, mem,
                 slots[0][0], slots[1][0], slots[2][0],
@@ -995,7 +1006,9 @@ def build_ui(initial_dit: str, initial_decoder: str, initial_precision: str, *,
         gr.Markdown(
             "# SA3 TFLite — portable CPU (XNNPACK)\n"
             "Text-to-audio, CFG + negative prompt, audio-to-audio, inpainting, LoRA. "
-            "Pick a precision (fp32 / w16a32 / w8a32 / w8a8-dyn). First use of a "
+            "Precision is per-family — **medium**: w8a8 (cache-safe rung int8, default) / fp32; "
+            "**small**: fp32 (default) / w16a32 / w8a32 / w8a8-dyn. Picking a model resets "
+            "the precision + decoder to that family's default. First use of a "
             "model/precision loads weights; subsequent runs are cached."
         )
         st = gr.State({"current": None, "queued": None, "history": []})
@@ -1119,7 +1132,8 @@ def build_ui(initial_dit: str, initial_decoder: str, initial_precision: str, *,
         dit_dd.change(on_dit_change,
                       inputs=[dit_dd, seconds, prev_dit, lora_mem,
                               lora_vis] + lora_inputs,
-                      outputs=[decoder_dd, seconds] + lora_dds + lora_srows
+                      outputs=[decoder_dd, seconds, precision_dd, lora_note, lora_editor]
+                              + lora_dds + lora_srows
                               + lora_rows
                               + [lora_add_btn, lora_vis, prev_dit, lora_mem]
                               + lora_files
@@ -1268,10 +1282,11 @@ def main():
                     help="Initial DiT bundle (switchable at runtime)")
     ap.add_argument("--decoder", choices=list(DEC_REL.keys()), default=None,
                     help="Initial decoder. Default: pairs with --dit")
-    ap.add_argument("--precision", choices=list(PRECISIONS), default="fp32",
-                    help="Initial precision (switchable at runtime): fp32 (default, "
-                         "CPU fast+accurate) | w16a32 (fp16, ≈lossless, half size) | "
-                         "w8a32 / w8a8-dyn (GPTQ int8, ¼ size)")
+    ap.add_argument("--precision", choices=list(PRECISIONS), default=None,
+                    help="Initial precision (switchable at runtime). Default: the DiT "
+                         "family's own default (medium w8a8, small DiTs fp32). Tiers — "
+                         "medium: w8a8 (cache-safe rung int8) / fp32; small: fp32 / "
+                         "w16a32 (fp16) / w8a32 / w8a8-dyn (GPTQ int8)")
     ap.add_argument("--default-seconds", type=float, default=30.0,
                     help="Length to pre-warm the initial DiT at")
     ap.add_argument("--default-steps", type=int, default=8)
@@ -1284,6 +1299,8 @@ def main():
 
     if args.decoder is None:
         args.decoder = DEFAULT_DECODERS[args.dit]
+    if args.precision is None:
+        args.precision = DEFAULT_DIT_PRECISIONS.get(args.dit, "fp32")
 
     global _THREADS
     _THREADS = args.threads

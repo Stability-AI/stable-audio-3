@@ -48,7 +48,8 @@ PY_EXPORT=/path/to/export-env/bin/python DIT_JOBS=6 bash build_dit.sh
 - **SAME-L** rungs `{1,2,4,8,12,16,32,64,128,256}`, **SAME-S** `{2,4,8,12,16,32,64,128,256}` (SAME-S is
   even-only: its attention tiles in 34-token = 2-latent chunks). Small rungs make tiny-L exact + fastest;
   `{16..256}` tiles longer L (overlap = the SWA receptive field: SAME-L 12, SAME-S 16 latents → bit-exact).
-- **DiT** rungs `{8,192,416,704,1056,1496,2040,2824,3536,4096}` (latents). A render of real length L runs on
+- **DiT** rungs `{8,48,96,192,416,704,1056,1496,2040,2824,3536,4096}` (latents; 48 & 96 ≈ 4.5 s / 8.9 s fill
+  the 0.7→17.8 s gap — audio ≈ L/10.78 s). A render of real length L runs on
   the SMALLEST rung R ≥ L in ONE forward, with the (R−L) pad KEYS masked out of self-attention — so the
   result is EXACT, not tiled. Merged weight-shared, peak RAM is the high-water mark of the largest rung
   used, flat across length (the old varlen graph materialized `[heads,S,S]` and blew up at long L —

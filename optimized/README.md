@@ -7,7 +7,7 @@ minimal-dependency way to run SA3 on a given accelerator. Pick by hardware:
 |---|---|---|---|---|---|
 | **[mlx](mlx)** | Apple Silicon Macs | Metal GPU (MLX) | ✅ | ✅ `./sa3-gradio` | ✅ LoRA (pure-MLX) |
 | **[tflite](tflite)** | macOS / Linux / Windows, x86 & ARM | CPU (LiteRT / XNNPACK) | ✅ | ✅ `./sa3-gradio` | LoRA *inference* only (weight-patching) |
-| **[tensorRT](tensorRT)** | Linux + NVIDIA GPU | CUDA / TensorRT | ✅ | — | — |
+| **[tensorRT](tensorRT)** | Linux + NVIDIA GPU | CUDA / TensorRT | ✅ | — | LoRA *inference* only (runtime low-rank branch) |
 
 All three read the same weights from
 [`stabilityai/stable-audio-3-optimized`](https://huggingface.co/stabilityai/stable-audio-3-optimized)
@@ -39,8 +39,14 @@ curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/op
   checkpoint format, so it doubles as underfit's Apple-Silicon backend. See
   [mlx → LoRA training](mlx/README.md#lora-training). For a full training
   **dashboard** on a Mac, use underfit.
-- **LoRA inference** — every runtime loads `.safetensors` adapters (mlx/tflite
-  merge or patch them into the graph; per-adapter strength + sampling-step
-  gating on mlx).
+- **LoRA inference** — every runtime loads `.safetensors` adapters, by three
+  different mechanisms. **mlx/tflite** merge or patch them into the graph
+  (per-adapter strength + sampling-step gating on mlx). **tensorRT** cannot:
+  its weights are baked into a compiled plan. So it carries the adapter as
+  *network inputs* instead — a low-rank branch on each of 229 linears whose
+  `A`/`B` operands are fed in like activations — which makes a swap a buffer
+  write rather than a rebuild, lets several adapters stack by concatenating
+  along the rank axis, and gives each its own strength. See
+  [tensorRT → LoRA](tensorRT/scripts/lora/README.md).
 
 See each runtime's `README.md` for install, usage, flags, and benchmarks.

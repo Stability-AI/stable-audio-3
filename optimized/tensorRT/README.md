@@ -254,6 +254,31 @@ on clean acoustic material. `enc_fp8_chunkable.trt` is the same weights recalibr
 ([`quantize/recalib_enc_fp8.py`](quantize/recalib_enc_fp8.py)) and measures 30.9 dB of latent SNR
 where the old one measured 18.3.
 
+### LoRA / DoRA adapters
+
+A TensorRT plan has its weights baked in, so an adapter cannot simply be merged the way the
+mlx and tflite runtimes do it. A separate DiT engine instead carries the adapter as **network
+inputs**: a low-rank branch on each of 229 linears, computing
+`y = W₀·x·(1+P) + Btᵀ·(srow ⊙ (A·x))` where `A`, `Bt` and `P` are fed in like activations and
+the rank `R` is a dynamic dimension (1..512). Swapping an adapter is therefore a buffer write
+rather than a rebuild, stacking is concatenation along `R`, and `srow` gives each adapter in a
+stack its own strength:
+
+```bash
+python scripts/lora/build_branch.py --model sa3-m --download   # ~7.4 min on an H200, once per GPU arch
+python scripts/sa3_trt.py --dit medium --lora a.safetensors:0.8 --lora b.safetensors:0.5
+```
+
+`--lora` is repeatable with an optional `:STRENGTH` and selects the LoRA engine
+automatically. Serves `lora`, `lora-xs`, `dora-rows` and `dora-rows-xs`; DoRA adapters need
+`bake_dora.py` run on them once. The branch costs a flat ~4–6 ms per step (**+13% at
+L=4096**, +37% at 1292) and you pay it with a zero stack too, so run the plain engine until
+an adapter is selected. Stacked rank is free to 32.
+
+Full documentation in [`scripts/lora/README.md`](scripts/lora/README.md); the design and the
+traps are in [`scripts/lora/BUILDING_TRT_LORA.md`](scripts/lora/BUILDING_TRT_LORA.md).
+
+
 ## Speed & memory
 
 Measured on **H100 SXM 80 GB** at `--steps 8` (rf-denoiser sweet spot).

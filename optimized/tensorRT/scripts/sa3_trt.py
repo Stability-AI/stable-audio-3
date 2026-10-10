@@ -32,7 +32,7 @@ The canonical CLI invokes one inference per process, so users never see
 the drift in practice.
 """
 from __future__ import annotations
-import argparse, math, os, random, sys, threading, time, wave
+import argparse, json, math, os, random, sys, threading, time, wave
 from pathlib import Path
 import numpy as np
 
@@ -765,11 +765,60 @@ class FullPipelineGraph:
             # Replay the full pipeline.
             self._graph.replay()
         stream.synchronize()
+        # The mega-graph never surfaces the latent -- DiT, decode and the DtoH are one capture
+        # -- so canon.assert_finite_latent() in the samplers cannot see this path. Check the
+        # buffer the decoder read instead. A NaN latent decodes to int16 ZERO, i.e. EXACT
+        # digital silence with every call reporting success.
+        canon.assert_finite_latent(self.decoder_in_buf, "FullPipelineGraph.run")
         # pinned_host_pcm has been written by the DtoH; return a view.
         return self.pinned_host_pcm[:self.requested_samples].numpy()
 
 
 # ─── Reusable inference class (CLI + gradio share this) ─────────────────
+def _is_float(t):
+    try:
+        float(t)
+        return True
+    except ValueError:
+        return False
+
+
+def _detect_map_for(engine):
+    """Branch map whose targets exactly match this engine's lora inputs.
+
+    Matched on names, not filenames: the engines differ only in WHICH linears they branch, so
+    a hand-paired map mis-sizes every operand and nothing raises.
+    """
+    want = {engine.get_tensor_name(i) for i in range(engine.num_io_tensors)
+            if engine.get_tensor_name(i).startswith("loraA::")}
+    d = Path(__file__).resolve().parent.parent / "lora"
+    for f in sorted(d.glob("branch_map*.json")):
+        try:
+            m = json.loads(f.read_text())["layers"]
+        except Exception:
+            continue
+        if {rec["A"] for rec in m.values()} == want:
+            return str(f)
+    raise RuntimeError(f"no branch map in {d} matches this engine's {len(want)} lora inputs")
+
+
+
+
+def _adapter_rank(path):
+    """Rank an adapter will contribute to the stack, read from its tensors (no fold)."""
+    import struct as _struct
+    with open(path, "rb") as f:
+        n = _struct.unpack("<Q", f.read(8))[0]
+        hdr = json.loads(f.read(n))
+    for k, v in hdr.items():
+        if k.endswith(".lora_A"):
+            return int(v["shape"][0])
+        if k.endswith(".M_xs"):          # -xs adapters: M_xs is [r, r]
+            return int(v["shape"][0])
+    raise ValueError(f"cannot determine rank of {path}")
+
+
+
 class SA3Inference:
     """SA3 TRT inference, set up once and reused.
 
@@ -949,6 +998,10 @@ class SA3Inference:
 
         self._share_scratch()
         self.dit = DiTRunner(self.runners["dit"])
+
+        # LoRA branch operands (None until set_lora is called; None for a plain engine).
+        self._lora = None
+        self._lora_specs = []
 
         # 5. Graph cache + lock.
         self._graphs: dict[tuple[int, int], FullPipelineGraph] = {}
@@ -1134,6 +1187,128 @@ class SA3Inference:
             del self._graphs[evict]
         return graph
 
+    # ── LoRA ─────────────────────────────────────────────────────────────
+    def _lora_rank_cap(self):
+        """Max concatenated stack rank, read from the engine's own profile (not hardcoded)."""
+        eng = self.dit.runner.engine
+        _, _, hi = eng.get_tensor_profile_shape("lora_srow", 0)
+        return int(hi[-1])
+
+    def _engine_is_branch(self):
+        eng = self.dit.runner.engine
+        return any(eng.get_tensor_name(i).startswith("lora")
+                   for i in range(eng.num_io_tensors))
+
+    def _detect_branch_map(self):
+        """Find the map whose targets EXACTLY match this engine's lora inputs.
+
+        Matching on names rather than trusting a filename: a map with the wrong target set
+        mis-sizes every operand, and the engines here differ only in which linears they branch
+        (168 / 169 / 228 / 229), so the file names are easy to pair wrongly by hand.
+        """
+        eng = self.dit.runner.engine
+        want = {eng.get_tensor_name(i) for i in range(eng.num_io_tensors)
+                if eng.get_tensor_name(i).startswith("loraA::")}
+        d = Path(__file__).resolve().parent.parent / "lora"
+        for f in sorted(d.glob("branch_map*.json")):
+            try:
+                m = json.loads(f.read_text())["layers"]
+            except Exception:
+                continue
+            if {rec["A"] for rec in m.values()} == want:
+                return str(f)
+        raise RuntimeError(f"no branch map in {d} matches this engine's "
+                           f"{len(want)} lora inputs")
+
+    def lora_targets(self):
+        """How many branch targets this DiT engine has (0 if it is a plain engine)."""
+        return 0 if self._lora is None else len(self._lora.map)
+
+    def _ensure_lora(self, branch_map=None):
+        """Attach a RefoldLora to the ALREADY-loaded DiT engine.
+
+        Never loads a second engine: the branch operands are driven through the same
+        ICudaEngine the pipeline is already running, so this costs operand buffers only
+        (~38-43 MB at rank 16) rather than another 2.9 GB.
+        """
+        if self._lora is None:
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lora"))
+            from refold_runtime import RefoldLora
+            self._lora = RefoldLora(model="sa3-medium", engine=self.dit.runner.engine,
+                                    branch_map=branch_map or self._detect_branch_map())
+            self._lora.zero(1)                 # a branch engine will not enqueue unbound
+            self.dit.attach_lora(self._lora)
+            self._drop_graphs()
+        return self._lora
+
+    def _drop_graphs(self):
+        """Every cached pipeline graph bakes the operand ADDRESSES, so they die together."""
+        self._graphs.clear()
+        self._graph_lru.clear()
+
+    def set_lora(self, specs, branch_map=None):
+        """Install / replace / clear the LoRA stack. specs = [(adapter_path, strength)].
+
+        Same rank -> fold into the EXISTING operand buffers and every cached graph stays
+        valid, because the addresses it baked are unchanged. That is the hot swap.
+        Different rank (or first load) -> the buffers change shape, so the bindings and every
+        cached graph are dropped and the next generate() recaptures.
+        """
+        with self._lock:
+            B = self._ensure_lora(branch_map)
+            # dict(...) NOT B.bufs: set_stack_gpu mutates the SAME dict in place, so holding a
+            # reference means the "copy into the old buffers" below copies each tensor onto
+            # itself and the captured graph is left pointing at freed memory -- which renders
+            # as silence, not as an error.
+            # The engine's optimisation profile caps the rank of the CONCATENATED stack.
+            # Overrunning it makes TRT reject every operand shape; set_input_shape returns
+            # False rather than raising, so the render then proceeds on the PREVIOUS
+            # bindings and returns confident, wrong audio. Refuse it here instead.
+            cap = self._lora_rank_cap()
+            want = sum(_adapter_rank(pth) for pth, _st in specs)
+            if want > cap:
+                raise ValueError(
+                    f"stack rank {want} exceeds this engine's maximum of {cap} "
+                    f"({len(specs)} adapters). Load fewer adapters, use lower-rank ones, or "
+                    f"rebuild the engine with --rank-max >= {want}.")
+            old_rank, old_bufs = B.rank, dict(B.bufs)
+            if not specs:
+                B.zero(1)
+            else:
+                B.set_stack_gpu(list(specs), {})
+            if B.rank == old_rank and old_bufs and self._graphs:
+                for n, v in old_bufs.items():          # keep the captured pointers alive
+                    v.copy_(B.bufs[n])
+                B.bufs = old_bufs
+            else:
+                self.dit.attach_lora(B)
+                self._drop_graphs()
+            # The eager context binds the same operand buffers; a rank change reallocates
+            # them, so it must be re-pointed too or a2a/inpaint/CFG keep the stale addresses.
+            if self._eager_dit is not None:
+                self._eager_dit.attach_lora(B)
+            self._lora_specs = list(specs)
+            return {"rank": B.rank, "targets": len(B.map), "adapters": len(specs)}
+
+    def set_lora_strength(self, per_adapter):
+        """Per-adapter strength, no refold and no recapture (a linear fade)."""
+        with self._lock:
+            if self._lora is None:
+                raise RuntimeError("no LoRA loaded")
+            v = list(per_adapter)
+            # One strength PER ADAPTER. A wrong count otherwise dies inside the runtime as
+            # `mat1 and mat2 shapes cannot be multiplied (1x1 and 3x768)`, which names nothing
+            # useful. A single value broadcasts, since that is what a UI with one slider means.
+            n = len(self._lora_specs) or 1
+            if len(v) == 1 and n > 1:
+                v = v * n
+            if len(v) != n:
+                raise ValueError(f"set_lora_strength expects {n} value(s) for the "
+                                 f"{n}-adapter stack, got {len(v)}")
+            self._lora.set_strengths(v)
+            return {"strengths": v}
+
+
     # ── Eager path: CFG / negative prompt / audio-to-audio / inpaint ──────
     #
     # Same math as sa3_trt_core.main()'s eager branch (sequential dual-pass CFG with
@@ -1146,6 +1321,12 @@ class SA3Inference:
             self._eager = {n: _SecondContext(self.runners[n], self._scratch)
                            for n in ("t5", "dit", "dec")}
             self._eager_dit = DiTRunner(self._eager["dit"])
+            # The eager path runs on its OWN execution context. A branch engine's LoRA inputs
+            # are per-context bindings, so without this the eager context has them unbound:
+            # TRT then cannot resolve the velocity shape and the render dies on
+            # `tensor with negative dimension -1: [1, 256, -1]` -- with or without an adapter.
+            if self._lora is not None:
+                self._eager_dit.attach_lora(self._lora)
             # Var-batch engine? Then CFG's cond+uncond pair goes through as one batch-2 call.
             self._cfg_batched = BatchedDiT.attach(self.runners["dit"], batch=2)
             if not self.quiet:
@@ -1520,6 +1701,13 @@ def main():
                          "passing this flag against them is an error. Rebuild with "
                          "build_samel_chunkable.py --ceiling-input for a settable ceiling, or use "
                          "--dec-precision legacy for the pre-limiter hard-clip behaviour.")
+    # Repeatable. "path" or "path:strength" -- e.g.
+    #   --lora a.safetensors --lora b.safetensors:0.5
+    # Needs a branch DiT engine (dit_fp16_lora.trt); a plain engine has no LoRA inputs.
+    # DoRA adapters must be norm-baked (scripts/lora/bake_dora.py), otherwise the fold would
+    # have to load ~10 GB of base weights.
+    ap.add_argument("--lora", action="append", default=[], metavar="PATH[:STRENGTH]",
+                    help="LoRA/DoRA adapter to apply; repeat to stack. Optional :strength.")
     ap.add_argument("--mega-graph", action=argparse.BooleanOptionalAction, default=True,
                     help="Capture the entire pipeline in one CUDA graph (T5+DiT+decoder+narrow+DtoH). "
                          "On by default. Falls back to eager path for cfg≠1.0, inpaint, or audio-to-audio.")
@@ -1665,6 +1853,25 @@ def main():
     }
     if args.init_audio:
         engine_specs["enc"] = canon.resolve_encoder_engine(args.decoder, args.dec_precision)
+
+    # --lora needs a BRANCH engine: the canonical dit_fp16.trt has no LoRA inputs at all, so
+    # asking for an adapter against it would be a silent no-op. Switch automatically rather
+    # than making the user also know the variant filename.
+    if args.lora:
+        if args.dit != "medium":
+            sys.exit(f"error: --lora is medium-only; no branch engine exists for "
+                     f"--dit {args.dit}")
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "lora"))
+        import paths as lora_paths
+        _be, _cur = Path(lora_paths.BRANCH_ENGINE), engine_specs["dit"]
+        if not _be.exists():
+            sys.exit(f"error: --lora needs the branch DiT engine and none is built:\n"
+                     f"    {_be}\n"
+                     f"    build it with:  python scripts/lora/build_branch.py "
+                     f"--model sa3-m --download")
+        if _be != _cur:
+            engine_specs["dit"] = _be
+            sub(f"{dim('--lora given')} using branch engine {_be.name} (not {_cur.name})")
     t0 = time.time()
     # The decoder/encoder carry two profiles: 0 = low ceiling (chunked, minimum scratch),
     # 1 = wide (single-shot). Selecting it at context creation is what makes the saving real --
@@ -1688,6 +1895,35 @@ def main():
     WARMUP_PASSES = 3
     t0 = time.time()
     dit = DiTRunner(runners["dit"])
+
+    # ── LoRA ────────────────────────────────────────────────────────────────────────────
+    lora = None
+    if args.lora:
+        specs = []
+        for item in args.lora:
+            path, _, st = str(item).rpartition(":")
+            if not path or "/" in st or not _is_float(st):   # no ":strength" suffix given
+                path, st = str(item), "1.0"
+            specs.append((path, float(st)))
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "lora"))
+        from refold_runtime import RefoldLora
+        _t = time.time()
+        lora = RefoldLora(model="sa3-medium", engine=runners["dit"].engine,
+                          branch_map=_detect_map_for(runners["dit"].engine))
+        lora.set_stack_gpu(specs, {})
+        dit.attach_lora(lora)
+        sub(f"{dim('lora')} {len(specs)} adapter(s), rank {lora.rank}, "
+            f"{len(lora.map)} targets  {(time.time()-_t)*1000:.0f} ms")
+    elif any(runners["dit"].engine.get_tensor_name(i).startswith("lora")
+             for i in range(runners["dit"].engine.num_io_tensors)):
+        # A branch engine will not enqueue with its operands unbound, even unused -- so a
+        # branch engine selected without --lora still needs a zero stack.
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "lora"))
+        from refold_runtime import RefoldLora
+        lora = RefoldLora(model="sa3-medium", engine=runners["dit"].engine,
+                          branch_map=_detect_map_for(runners["dit"].engine))
+        lora.zero(1)
+        dit.attach_lora(lora)
 
     if use_mega:
         # ── Mega-graph fast path ──

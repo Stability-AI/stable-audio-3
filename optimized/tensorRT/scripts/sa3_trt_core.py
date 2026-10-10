@@ -1261,6 +1261,7 @@ class DiTRunner:
     def __init__(self, runner: TRTRunner):
         self.runner = runner
         self._L = None
+        self._lora = None       # a BranchLora/RefoldLora, or None
         self._vel_buf = None
         self._t_buf = torch.empty(1, dtype=torch.float32, device="cuda")
         self._sec_buf = torch.empty(1, dtype=torch.float32, device="cuda")
@@ -1274,6 +1275,28 @@ class DiTRunner:
         self._local_add_cond_buf = None
         self._persistent_bound = False
 
+    def attach_lora(self, lora):
+        """Drive this engine's LoRA branch operands from a BranchLora/RefoldLora.
+
+        A branch engine carries three extra inputs per adapted linear -- 688 for the
+        229-target build -- and TensorRT refuses to enqueue with ANY input unbound, so such
+        an engine must be handed at least a zero stack before it will run at all. Pass None
+        to detach.
+
+        A rank change reallocates those operand buffers, which invalidates both the bound
+        addresses and any captured graph, so both are marked stale here. A SAME-rank swap
+        does not need it: copy_ into the existing buffers and the capture stays valid.
+
+        A plain engine never calls this, and `_lora_bufs()` is then an empty dict, so the
+        three loops below add nothing to the no-LoRA path.
+        """
+        self._lora = lora
+        self._L = None                  # force _setup to redeclare shapes
+        self._persistent_bound = False   # captured pointers are stale
+
+    def _lora_bufs(self):
+        return self._lora.bufs if self._lora is not None else {}
+
     def _setup(self, L: int):
         if L == self._L:
             return
@@ -1284,6 +1307,8 @@ class DiTRunner:
         ctx.set_input_shape("t5_mask",        (1, 256))
         ctx.set_input_shape("seconds_total",  (1,))
         ctx.set_input_shape("local_add_cond", (1, 257, L))
+        for _n, _v in self._lora_bufs().items():
+            ctx.set_input_shape(_n, tuple(_v.shape))
         out_shape = tuple(ctx.get_tensor_shape("velocity"))
         self._vel_buf = torch.empty(out_shape,
                                      dtype=self.runner.out_dtype["velocity"], device="cuda")
@@ -1303,6 +1328,8 @@ class DiTRunner:
         ctx.set_tensor_address("t5_mask",        t5_mask.float().contiguous().data_ptr())
         ctx.set_tensor_address("seconds_total",  self._sec_buf.data_ptr())
         ctx.set_tensor_address("local_add_cond", local_add_cond.float().contiguous().data_ptr())
+        for _n, _v in self._lora_bufs().items():
+            ctx.set_tensor_address(_n, _v.data_ptr())
         ctx.set_tensor_address("velocity",       self._vel_buf.data_ptr())
         if not ctx.execute_async_v3(self.runner.stream.cuda_stream):
             raise RuntimeError(
@@ -1346,6 +1373,8 @@ class DiTRunner:
         ctx.set_tensor_address("t5_mask",        self._t5_mask_buf.data_ptr())
         ctx.set_tensor_address("seconds_total",  self._sec_buf.data_ptr())
         ctx.set_tensor_address("local_add_cond", self._local_add_cond_buf.data_ptr())
+        for _n, _v in self._lora_bufs().items():
+            ctx.set_tensor_address(_n, _v.data_ptr())
         ctx.set_tensor_address("velocity",       self._vel_buf.data_ptr())
         self._persistent_bound = True
 
@@ -1375,6 +1404,31 @@ def build_pingpong_schedule(steps, sigma_max=1.0, dist_shift=None, latent_len=No
     return t
 
 
+def assert_finite_latent(x, where="sampler"):
+    """Turn a NaN latent into an error instead of silent digital silence.
+
+    The DiT engine reports success whatever it computes, and a NaN latent decodes to a
+    constant, so an overflow anywhere in the 8 steps reaches the user as a file that plays
+    nothing -- with no traceback, no warning and no clue which knob did it. One isfinite()
+    on the final latent costs a single sync per render and removes that whole failure class.
+
+    Seen for real on 2026-10-07: two DoRA adapters stacked at strength 1.0 both rescaled the
+    seconds embedder (global adaLN conditioning) to c ~ 0.2; the branch SUMS rescales, so
+    1 + sum(c-1) went NEGATIVE, the inverted global gain blew past the fp16 range and every
+    one of 330752 outputs came back NaN. merge.EXCLUDED_LAYERS removes that specific cause;
+    this is the backstop for the next one.
+    """
+    if torch.isfinite(x).all():
+        return x
+    n = int((~torch.isfinite(x)).sum())
+    tot = x.numel()
+    raise RuntimeError(
+        f"{where}: {n}/{tot} latent values are NaN/Inf -- this would have decoded to silence. "
+        f"Most likely an fp16 overflow inside the DiT: lower the adapter strengths, drop the "
+        f"adapter whose DoRA row rescale is furthest from 1, or render without LoRA to confirm "
+        f"the base engine is clean.")
+
+
 def sample_flow_pingpong(model_fn, x, sigmas, seed=None, paste_back=None, on_step=None):
     """Pingpong sampler for rf_denoiser. Matches SAT sample_flow_pingpong."""
     ns = sigmas.shape[0] - 1
@@ -1396,7 +1450,7 @@ def sample_flow_pingpong(model_fn, x, sigmas, seed=None, paste_back=None, on_ste
             x = init_lat.to(x.dtype) * keep_mask + x * (1.0 - keep_mask)
         if on_step:
             on_step(i + 1, ns)
-    return x
+    return assert_finite_latent(x, "sample_flow_pingpong")
 
 
 # ─── CUDA-graph captured pingpong sampler ────────────────────────────────
@@ -1585,7 +1639,7 @@ class GraphPingpongSampler:
         # Sync because the rest of the pipeline runs on the default stream
         # and may read self._out_buf.
         stream.synchronize()
-        return self._out_buf.clone()
+        return assert_finite_latent(self._out_buf.clone(), "GraphPingpongSampler.sample")
 
 
 # ─── WAV I/O ─────────────────────────────────────────────────────────────

@@ -1,0 +1,98 @@
+"""Where this install keeps its model files.
+
+Three things need locating and none of them belong in source: the TensorRT engine and its
+branch map (built locally -- TensorRT bakes the GPU architecture in, so they cannot ship),
+the base checkpoint (only the verification harnesses need it), and the frozen SVD bases
+(only `-xs` adapters need those).
+
+Everything resolves relative to this checkout, overridable by environment variable, and a
+missing file raises where it is asked for rather than resolving to the wrong model. That
+last part is the point: an earlier version let one constant silently resolve to a different
+model's SVD bases, which folds an -xs adapter into a rotated basis with nothing raising.
+"""
+import os
+import sys
+from pathlib import Path
+
+# optimized/tensorRT/ -- this file sits at scripts/lora/paths.py
+ROOT = Path(__file__).resolve().parents[2]
+
+# The LoRA merge math (all 8 adapter variants) already ships in this repo for the TFLite
+# path. It is the product's ground truth for what an adapter means, so it is imported, not
+# forked -- two copies of that file would be two definitions of "merged weight".
+_LORA_CORE = Path(__file__).resolve().parents[3] / "tflite" / "scripts"
+if str(_LORA_CORE) not in sys.path:
+    sys.path.insert(0, str(_LORA_CORE))
+
+# Built locally by build_branch.py, and placed where every other engine in this install
+# lives: models/<arch>/<model>/. TensorRT bakes the GPU architecture into the plan, so the
+# arch is part of the path -- one install can hold several side by side.
+def _arch() -> str:
+    """sm_<major><minor> of the current device, matching sa3_trt_core.ARCH."""
+    try:
+        import torch
+        major, minor = torch.cuda.get_device_capability()
+        return f"sm_{major}{minor}"
+    except Exception:
+        return os.environ.get("SA3_ARCH", "sm_90")
+
+
+ARCH = _arch()
+MODELS_DIR = Path(os.environ.get("SA3_MODELS_DIR", ROOT / "models"))
+ENGINE_DIR = Path(os.environ.get("SA3_ENGINE_DIR", MODELS_DIR / ARCH / "sa3-m"))
+BRANCH_ENGINE = ENGINE_DIR / "dit_fp16_lora.trt"
+# Two maps, and the distinction matters. SHIPPED_MAP is tracked: it is the 229-target
+# definition, a property of the ONNX graph, the same on every machine. BUILT_MAP is written
+# beside the engine by build_branch and carries build provenance -- absolute ONNX path, GPU,
+# hostname. models/ is gitignored, so that stays out of the repo; writing it over the tracked
+# file would dirty every builder's tree and invite them to commit their own paths.
+SHIPPED_MAP = Path(__file__).resolve().parent / "branch_map_medium_lora.json"
+BUILT_MAP = ENGINE_DIR / "branch_map_medium_lora.json"
+BRANCH_MAP = Path(os.environ.get(
+    "SA3_BRANCH_MAP", BUILT_MAP if BUILT_MAP.exists() else SHIPPED_MAP))
+
+# Downloaded: stabilityai/stable-audio-3-optimized, onnx/sa3-m/dit_fp16.onnx (+ .data).
+ONNX_DIR = Path(os.environ.get("SA3_ONNX_DIR", ROOT / "onnx" / "sa3-m"))
+ONNX = ONNX_DIR / "dit_fp16.onnx"
+
+# Only the verify_* harnesses need these; normal adapter loading never touches them.
+CKPT_DIR = Path(os.environ.get("SA3_CKPT_DIR", MODELS_DIR / "sa3-medium"))
+SVD_BASES = Path(os.environ.get("SA3_SVD_BASES", CKPT_DIR / "svd_bases.pt"))
+
+# SA3-medium is ONE model everywhere: an adapter trained on any variant applies to the
+# others, so the variant is a naming detail, not a compatibility gate.
+# The published onnx/sa3-m/dit_fp16.onnx is built from ARC. Folding an adapter's row
+# norms against the other variant reads as a 27% fold error, so this is not a
+# preference: it is a property of the engine.
+ENGINE_VARIANT = "arc"
+VARIANTS = ("arc", "base")
+STEM = {"arc": "stable-audio-3-medium-ARC", "base": "stable-audio-3-medium-RF"}
+
+
+def checkpoint(variant: str = "arc") -> Path:
+    """The base weights. Needed to bake an adapter's row norms and by the verifiers."""
+    if variant not in VARIANTS:
+        raise ValueError(f"variant must be one of {VARIANTS}, got {variant!r}")
+    p = CKPT_DIR / f"{STEM[variant]}.safetensors"
+    if not p.exists():
+        raise FileNotFoundError(
+            f"no {variant} checkpoint at {p}\n"
+            f"    set $SA3_CKPT_DIR to the directory holding {STEM[variant]}.safetensors")
+    return p
+
+
+def config(variant: str = "arc") -> Path:
+    p = CKPT_DIR / f"{STEM[variant]}.json"
+    if not p.exists():
+        raise FileNotFoundError(f"no {variant} config at {p}; set $SA3_CKPT_DIR")
+    return p
+
+
+def svd_bases() -> Path:
+    """Frozen SVD bases -- required ONLY by `-xs` adapters, which are trained against them."""
+    if not SVD_BASES.exists():
+        raise FileNotFoundError(
+            f"no SVD bases at {SVD_BASES}\n"
+            f"    -xs adapters are trained against a FROZEN basis and cannot be folded "
+            f"without it; set $SA3_SVD_BASES. Plain lora / dora-rows adapters do not need it.")
+    return SVD_BASES

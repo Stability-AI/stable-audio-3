@@ -11,21 +11,30 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 import constants as LC
 import paths
-from verify_medium import (rel, load_medium, wrapper_with,
+from verify_medium import (rel, load_dit, wrapper_with,
                            run_engine)
 
-AD = ROOT / "lora" / "adapters" / "medium"
+# Adapters are per-model -- a 24x1536 medium adapter does not apply to a 20x1024 small DiT --
+# so the default directory is keyed by model, not a single shared folder.
+def adapter_dir(model):
+    # ROOT is scripts/, so this is scripts/lora/adapters/<slug> -- the same place the
+    # medium default pointed at, now keyed by model.
+    return ROOT / "lora" / "adapters" / paths.for_model(model).slug
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stack", action="append", required=True,
-                    help="comma-separated adapter files (relative to adapters/medium)")
+                    help="comma-separated adapter files (relative to adapters/<model slug>)")
+    ap.add_argument("--model", choices=sorted(paths.ALIASES), default=paths.DEFAULT_MODEL,
+                    help="which DiT (default sa3-medium)")
     ap.add_argument("--L", type=int, default=1292)
     ap.add_argument("--engine", default=None); ap.add_argument("--branch-map", dest="bmap", default=None)
     ap.add_argument("--json", default=None)
     a = ap.parse_args()
     stacks = [[s.strip() for s in spec.split(",")] for spec in a.stack]
+    mp = paths.for_model(a.model)
+    AD = adapter_dir(a.model)
 
     torch.manual_seed(0); L = a.L
     x = torch.randn(1, LC.IO_CHANNELS, L, device="cuda")
@@ -36,7 +45,7 @@ def main():
     lac = torch.zeros(1, LC.LOCAL_ADD_COND_DIM, L, device="cuda")
     args6 = (x, t, t5, mask, sec, lac)
 
-    (model, cfg, sd), _variant = load_medium(paths.ENGINE_VARIANT)
+    (model, cfg, sd), _variant = load_dit(paths.ENGINE_VARIANT, mp.name)
     cond = model.conditioner.conditioners["seconds_total"].embedder.embedding[1]
     w0, b0 = cond.weight.detach().clone(), cond.bias.detach().clone()
     with torch.no_grad():
@@ -95,7 +104,7 @@ def main():
     for names in stacks:
         adapter_paths = [str(AD / n) for n in names]
         v_add, n_add = additive_ref(adapter_paths, args6)
-        load_and_apply_loras(model, adapter_paths, cfg["model_type"], svd_bases_path=str(paths.SVD_BASES))
+        load_and_apply_loras(model, adapter_paths, cfg["model_type"], svd_bases_path=str(mp.svd_bases))
         w_ad = cond.weight.detach().clone()
         with torch.no_grad():
             # The reference is torch WITHOUT the seconds embedder adapted, because
@@ -123,7 +132,7 @@ def main():
     del model; torch.cuda.empty_cache()
 
     from refold_runtime import RefoldLora
-    B = RefoldLora(model="sa3-medium", engine_path=a.engine, branch_map=a.bmap)
+    B = RefoldLora(model=mp.name, engine_path=a.engine, branch_map=a.bmap)
     B.zero(1); v0 = run_engine(B, args6, L)
     floor = rel(v_base, v0)
     print(f"\n  engine {Path(B.engine_path).name}  ({len(B.map)} targets)   "

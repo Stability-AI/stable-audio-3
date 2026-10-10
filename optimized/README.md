@@ -43,7 +43,8 @@ curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/op
   different mechanisms. **mlx/tflite** merge or patch them into the graph
   (per-adapter strength + sampling-step gating on mlx). **tensorRT** cannot:
   its weights are baked into a compiled plan. So it carries the adapter as
-  *network inputs* instead — a low-rank branch on each of 229 linears whose
+  *network inputs* instead — a low-rank branch on each adapted linear (229 on
+  medium, 193 on each small DiT) whose
   `A`/`B` operands are fed in like activations — which makes a swap a buffer
   write rather than a rebuild, lets several adapters stack by concatenating
   along the rank axis, and gives each its own strength. See

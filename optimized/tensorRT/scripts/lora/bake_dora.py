@@ -38,6 +38,45 @@ PSUF = ".parametrizations.weight.0."
 BAKED = "baked_vnorm_row"
 
 
+class _Weights:
+    """Lazy read-only view of a base checkpoint, .safetensors or .ckpt.
+
+    safetensors is memory-mapped and read tensor by tensor, which is the whole reason this
+    is lazy: a bake touches ~141 of several thousand tensors and the checkpoints are GBs.
+    A lightning .ckpt has no such API, so it is loaded once with mmap=True and the prefix
+    flattening that `dit_loader.load_state_dict` applies -- the published weights are
+    safetensors, but a checkpoint straight out of training is a .ckpt and used to fail here
+    with "header too large", which reads as a corrupt file rather than a wrong format.
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+        if self.path.suffix == ".safetensors" or self.path.name == "model.safetensors":
+            from safetensors import safe_open
+            self._f = safe_open(str(self.path), framework="pt")
+            self._sd = None
+        else:
+            import torch as _t
+            sd = _t.load(self.path, map_location="cpu", mmap=True, weights_only=True)
+            if isinstance(sd, dict) and "state_dict" in sd:
+                sd = sd["state_dict"]
+            out = {}
+            for k, v in sd.items():
+                for pref in ("diffusion_ema.", "diffusion."):
+                    if k.startswith(pref):
+                        out[k[len(pref):]] = v
+                        break
+                else:
+                    out[k] = v
+            self._sd, self._f = out, None
+
+    def keys(self):
+        return set(self._f.keys()) if self._f is not None else set(self._sd)
+
+    def get_tensor(self, k):
+        return self._f.get_tensor(k) if self._f is not None else self._sd[k]
+
+
 def is_baked(path) -> bool:
     from safetensors import safe_open
     with safe_open(str(path), framework="numpy") as f:
@@ -79,7 +118,9 @@ def bake(adapter, variant=None, out=None, force=False, quiet=False, model="sa3-m
         if not quiet: print(f"  already baked: {out.name}  (--force to redo)")
         return out
     variant = variant or ENGINE_VARIANT
-    wpath, bpath = paths.checkpoint(variant), paths.SVD_BASES
+    # Per model: the row norms must be taken against the W0 THIS model's engine carries.
+    mp = paths.for_model(model)
+    wpath, bpath = mp.checkpoint(variant), mp.svd_bases
 
     atype, scaling, layers = lc.parse_adapter(str(adapter))
     stem = atype[:-3] if atype.endswith("-xs") else atype
@@ -96,8 +137,8 @@ def bake(adapter, variant=None, out=None, force=False, quiet=False, model="sa3-m
     with safe_open(str(adapter), framework="numpy") as f:
         tensors = {k: f.get_tensor(k) for k in f.keys()}
         meta = dict(f.metadata() or {})
-    wf = safe_open(str(wpath), framework="pt")
-    wkeys = set(wf.keys())
+    wf = _Weights(wpath)
+    wkeys = wf.keys()
 
     n, worst, nneg = 0, 0.0, 0
     for lid, p in layers.items():
@@ -181,7 +222,7 @@ def ensure_baked(adapter, variant=None, interactive=True, quiet=False, model="sa
             f"{adapter.name} is unbaked. Run:  python bake_dora.py {adapter} --variant {v}")
     if (input(msg).strip().lower() or "y") not in ("y", "yes"):
         raise RuntimeError("declined; adapter cannot be loaded without baked norms")
-    return bake(adapter, v, quiet=quiet)
+    return bake(adapter, v, quiet=quiet, model=model)
 
 
 def main():
@@ -192,7 +233,8 @@ def main():
     # opt-in through a deliberately less-discoverable flag so nobody reaches it by accident.
     ap.add_argument("--norm-source", dest="variant", choices=list(paths.VARIANTS), default=None,
                     help=argparse.SUPPRESS)
-    ap.add_argument("--model", choices=("sa3-medium",), default="sa3-medium")
+    ap.add_argument("--model", choices=sorted(paths.MODELS), default=paths.DEFAULT_MODEL,
+                    help="which DiT's base weights to take the row norms against")
     ap.add_argument("--out", default=None)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--check", action="store_true", help="exit 1 if any adapter is unbaked")

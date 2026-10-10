@@ -783,23 +783,64 @@ def _is_float(t):
         return False
 
 
-def _detect_map_for(engine):
-    """Branch map whose targets exactly match this engine's lora inputs.
+def _lora_dir():
+    """scripts/lora/ -- next to this file, NOT one level up.
 
-    Matched on names, not filenames: the engines differ only in WHICH linears they branch, so
-    a hand-paired map mis-sizes every operand and nothing raises.
+    ⚠ Both map finders below used to glob `<tensorRT>/lora`, which is where this package
+    sat before it moved under scripts/. That directory does not exist in the shipped tree,
+    so every glob came back empty and --lora raised "no branch map matches" before loading
+    anything. One function, so there is one answer.
+    """
+    return Path(__file__).resolve().parent / "lora"
+
+
+def _lora_paths():
+    """The lora package's `paths` module, with scripts/lora on sys.path."""
+    d = str(_lora_dir())
+    if d not in sys.path:
+        sys.path.insert(0, d)
+    import paths as lora_paths
+    return lora_paths
+
+
+def _branch_map_for(engine, model=None):
+    """The branch map whose targets EXACTLY match this engine's lora inputs.
+
+    Matched on names, not filenames: the engines differ only in WHICH linears they branch,
+    so a hand-paired map mis-sizes every operand and nothing raises. `model` only reorders
+    the search; the name match is still what decides.
+
+    sm-music and sm-sfx cannot be told apart this way -- their graphs are the same shape, so
+    their maps' `layers` and `rank_max` are byte-identical and only the provenance differs.
+    That is why passing the wrong one between those two is harmless, and why the `model`
+    hint exists: to land on the one whose provenance actually describes this engine.
     """
     want = {engine.get_tensor_name(i) for i in range(engine.num_io_tensors)
             if engine.get_tensor_name(i).startswith("loraA::")}
-    d = Path(__file__).resolve().parent.parent / "lora"
-    for f in sorted(d.glob("branch_map*.json")):
+    lp = _lora_paths()
+    cands = list(lp.branch_map_candidates())
+    if model is not None:
         try:
-            m = json.loads(f.read_text())["layers"]
+            pref = lp.for_model(model).branch_map
+            cands = [pref] + [c for c in cands if c != pref]
+        except (ValueError, KeyError):
+            pass
+    for f in cands:
+        try:
+            m = json.loads(Path(f).read_text())["layers"]
         except Exception:
             continue
         if {rec["A"] for rec in m.values()} == want:
             return str(f)
-    raise RuntimeError(f"no branch map in {d} matches this engine's {len(want)} lora inputs")
+    raise RuntimeError(
+        f"no branch map matches this engine's {len(want)} lora inputs\n"
+        f"    looked at: {', '.join(str(c) for c in cands) or '(none found)'}\n"
+        f"    build the map with:  python scripts/lora/build_branch.py --model <m>")
+
+
+def _detect_map_for(engine, model=None):
+    """Back-compatible name for _branch_map_for."""
+    return _branch_map_for(engine, model)
 
 
 
@@ -1008,6 +1049,15 @@ class SA3Inference:
         self._graph_lru: list[tuple[int, int]] = []
         self._lock = threading.Lock()
 
+        # A branch engine will NOT enqueue with its 3N+1 operands unbound, even unused: TRT
+        # returns "Address is not set for input tensor lora_srow" and refuses. The warmup
+        # capture below is an enqueue, so an engine selected through dit_engine= used to die
+        # in __init__ before any caller could attach an adapter. The CLI already pre-empted
+        # this; the library path -- which is what the gradio uses -- did not.
+        # Must come AFTER the graph cache above: _ensure_lora drops captured graphs.
+        if self._engine_is_branch():
+            self._ensure_lora()
+
         # 6. Build the initial graph at the default config.
         t0 = time.time()
         self.get_graph(default_T_lat, default_steps, default_seconds)
@@ -1200,25 +1250,12 @@ class SA3Inference:
                    for i in range(eng.num_io_tensors))
 
     def _detect_branch_map(self):
-        """Find the map whose targets EXACTLY match this engine's lora inputs.
+        """The map whose targets EXACTLY match this engine's lora inputs.
 
-        Matching on names rather than trusting a filename: a map with the wrong target set
-        mis-sizes every operand, and the engines here differ only in which linears they branch
-        (168 / 169 / 228 / 229), so the file names are easy to pair wrongly by hand.
+        One implementation, shared with the CLI path: two copies of this search drifted
+        apart once already, and both ended up globbing a directory that does not exist.
         """
-        eng = self.dit.runner.engine
-        want = {eng.get_tensor_name(i) for i in range(eng.num_io_tensors)
-                if eng.get_tensor_name(i).startswith("loraA::")}
-        d = Path(__file__).resolve().parent.parent / "lora"
-        for f in sorted(d.glob("branch_map*.json")):
-            try:
-                m = json.loads(f.read_text())["layers"]
-            except Exception:
-                continue
-            if {rec["A"] for rec in m.values()} == want:
-                return str(f)
-        raise RuntimeError(f"no branch map in {d} matches this engine's "
-                           f"{len(want)} lora inputs")
+        return _branch_map_for(self.dit.runner.engine, getattr(self, "dit_name", None))
 
     def lora_targets(self):
         """How many branch targets this DiT engine has (0 if it is a plain engine)."""
@@ -1232,9 +1269,12 @@ class SA3Inference:
         (~38-43 MB at rank 16) rather than another 2.9 GB.
         """
         if self._lora is None:
-            sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lora"))
+            sys.path.insert(0, str(_lora_dir()))
             from refold_runtime import RefoldLora
-            self._lora = RefoldLora(model="sa3-medium", engine=self.dit.runner.engine,
+            # model= decides which checkpoint a DoRA fold reads its row norms from, so it
+            # must be THIS pipeline's DiT -- medium's weights against a small engine fold
+            # against the wrong W0 and nothing raises.
+            self._lora = RefoldLora(model=self.dit_name, engine=self.dit.runner.engine,
                                     branch_map=branch_map or self._detect_branch_map())
             self._lora.zero(1)                 # a branch engine will not enqueue unbound
             self.dit.attach_lora(self._lora)
@@ -1858,17 +1898,17 @@ def main():
     # asking for an adapter against it would be a silent no-op. Switch automatically rather
     # than making the user also know the variant filename.
     if args.lora:
-        if args.dit != "medium":
-            sys.exit(f"error: --lora is medium-only; no branch engine exists for "
-                     f"--dit {args.dit}")
-        sys.path.insert(0, str(Path(__file__).resolve().parent / "lora"))
-        import paths as lora_paths
-        _be, _cur = Path(lora_paths.BRANCH_ENGINE), engine_specs["dit"]
+        lora_paths = _lora_paths()
+        try:
+            _mp = lora_paths.for_model(args.dit)
+        except ValueError:
+            sys.exit(f"error: --lora is not available for --dit {args.dit}")
+        _be, _cur = Path(_mp.branch_engine), engine_specs["dit"]
         if not _be.exists():
             sys.exit(f"error: --lora needs the branch DiT engine and none is built:\n"
                      f"    {_be}\n"
                      f"    build it with:  python scripts/lora/build_branch.py "
-                     f"--model sa3-m --download")
+                     f"--model {_mp.slug} --download")
         if _be != _cur:
             engine_specs["dit"] = _be
             sub(f"{dim('--lora given')} using branch engine {_be.name} (not {_cur.name})")
@@ -1905,11 +1945,13 @@ def main():
             if not path or "/" in st or not _is_float(st):   # no ":strength" suffix given
                 path, st = str(item), "1.0"
             specs.append((path, float(st)))
-        sys.path.insert(0, str(Path(__file__).resolve().parent / "lora"))
+        sys.path.insert(0, str(_lora_dir()))
         from refold_runtime import RefoldLora
         _t = time.time()
-        lora = RefoldLora(model="sa3-medium", engine=runners["dit"].engine,
-                          branch_map=_detect_map_for(runners["dit"].engine))
+        # model= is THIS pipeline's DiT: it decides which base checkpoint a DoRA fold
+        # reads its row norms from, and the wrong one folds silently against the wrong W0.
+        lora = RefoldLora(model=args.dit, engine=runners["dit"].engine,
+                          branch_map=_detect_map_for(runners["dit"].engine, args.dit))
         lora.set_stack_gpu(specs, {})
         dit.attach_lora(lora)
         sub(f"{dim('lora')} {len(specs)} adapter(s), rank {lora.rank}, "
@@ -1918,10 +1960,10 @@ def main():
              for i in range(runners["dit"].engine.num_io_tensors)):
         # A branch engine will not enqueue with its operands unbound, even unused -- so a
         # branch engine selected without --lora still needs a zero stack.
-        sys.path.insert(0, str(Path(__file__).resolve().parent / "lora"))
+        sys.path.insert(0, str(_lora_dir()))
         from refold_runtime import RefoldLora
-        lora = RefoldLora(model="sa3-medium", engine=runners["dit"].engine,
-                          branch_map=_detect_map_for(runners["dit"].engine))
+        lora = RefoldLora(model=args.dit, engine=runners["dit"].engine,
+                          branch_map=_detect_map_for(runners["dit"].engine, args.dit))
         lora.zero(1)
         dit.attach_lora(lora)
 

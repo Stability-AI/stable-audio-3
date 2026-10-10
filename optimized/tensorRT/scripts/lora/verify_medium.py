@@ -1,4 +1,7 @@
-"""Ground-truth gate for the SA3-medium branch engine against a real trained adapter.
+"""Ground-truth gate for an SA3 branch engine against a real trained adapter.
+
+Serves any model `paths` knows (--model, default sa3-medium). Counts below are medium's;
+the two small DiTs have 20 layers, so their equivalents are 141 / 140.
 
 Compares three things on identical inputs:
   ref169  canonical load_and_apply_loras() -- all 169 adapted layers, incl. the one
@@ -68,17 +71,22 @@ def _register_t5_alias():
             C.T5GEMMA_MODEL_DIMS[name] = 768
 
 
-def load_medium(variant="base"):
+def load_dit(variant="base", model=None):
     """The cond-baked DiT wrapper. Same wrapper => same graph the engine was traced from."""
     import tempfile
-    DL.CKPT = str(paths.checkpoint(variant))
-    cfg = _point_t5_at_published_weights(json.loads(paths.config(variant).read_text()))
+    mp = paths.for_model(model or paths.DEFAULT_MODEL)
+    DL.use_model(mp.name, variant)
+    cfg = _point_t5_at_published_weights(json.loads(Path(DL.CONFIG).read_text()))
     tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
     json.dump(cfg, tmp); tmp.close()
     DL.CONFIG = tmp.name
     DL.patch_for_onnx()
     _register_t5_alias()
     return DL.load_model(dtype=torch.float32), variant
+
+
+# The old name, from when this harness served one model.
+load_medium = load_dit
 
 
 def wrapper_with(dit, sd, seconds_w, seconds_b):
@@ -101,6 +109,8 @@ def main():
     ap.add_argument("--strength", type=float, default=1.0)
     # The engine's own weights, not a guess: the medium branch engine is built from the
     # HF-published onnx/sa3-m/dit_fp16.onnx, which is ARC.
+    ap.add_argument("--model", choices=sorted(paths.ALIASES), default=paths.DEFAULT_MODEL,
+                    help="which DiT (default sa3-medium); picks the engine, map and weights")
     ap.add_argument("--variant", default=paths.ENGINE_VARIANT,
                     help="which weights to compare the engine to")
     ap.add_argument("--engine", default=None)
@@ -113,7 +123,8 @@ def main():
         pairs += [[d["src"], d["baked"]] for d in man.values()]
     assert pairs, "give at least one --pair ADAPTER BAKED"
 
-    map_path = a.branch_map or paths.BRANCH_MAP
+    mp = paths.for_model(a.model)
+    map_path = a.branch_map or mp.branch_map
 
     torch.manual_seed(0)
     L = a.L
@@ -125,7 +136,7 @@ def main():
     lac = torch.zeros(1, LC.LOCAL_ADD_COND_DIM, L, device="cuda")
     args6 = (x, t, t5, mask, sec, lac)
 
-    (model, cfg, sd), _variant = load_medium(a.variant)
+    (model, cfg, sd), _variant = load_dit(a.variant, mp.name)
     cond_lin = model.conditioner.conditioners["seconds_total"].embedder.embedding[1]
     w0, b0 = cond_lin.weight.detach().clone(), cond_lin.bias.detach().clone()
 
@@ -138,7 +149,7 @@ def main():
     rows = []
     for adapter, baked in pairs:
         load_and_apply_loras(model, [adapter], cfg["model_type"],
-                             svd_bases_path=str(paths.SVD_BASES))
+                             svd_bases_path=str(mp.svd_bases))
         if a.strength != 1.0:
             # lora_strength is a registered BUFFER, not a float attribute -- use the repo's
             # own setter rather than assigning through it.
@@ -166,7 +177,7 @@ def main():
 
     # ---- engine phase: one engine load, adapters swapped in place ----------------------
     from refold_runtime import RefoldLora
-    B = RefoldLora(model="sa3-medium", engine_path=a.engine, branch_map=a.branch_map)
+    B = RefoldLora(model=mp.name, engine_path=a.engine, branch_map=a.branch_map)
     B.zero(1)
     v_trt0 = run_engine(B, args6, L)
     nb = float(v_base.float().norm())
@@ -249,11 +260,10 @@ def count_matches(adapter, map_path=None):
     import lora_core as lc
     from branch_runtime import ADAPTER_PFX
     _, _, layers = lc.parse_adapter(str(adapter))
-    mp = json.load(open(map_path or
-                        paths.BRANCH_MAP))["layers"]
+    bmap = json.load(open(map_path or paths.BRANCH_MAP))["layers"]
     from branch_runtime import adapter_key
-    hit = sum(1 for rec in mp.values() if adapter_key(rec) in layers)
-    return {"hit": hit, "tot": len(mp), "pfx": ADAPTER_PFX,
+    hit = sum(1 for rec in bmap.values() if adapter_key(rec) in layers)
+    return {"hit": hit, "tot": len(bmap), "pfx": ADAPTER_PFX,
             "example_adapter_key": sorted(layers)[0]}
 
 

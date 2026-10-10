@@ -258,20 +258,25 @@ where the old one measured 18.3.
 
 A TensorRT plan has its weights baked in, so an adapter cannot simply be merged the way the
 mlx and tflite runtimes do it. A separate DiT engine instead carries the adapter as **network
-inputs**: a low-rank branch on each of 229 linears, computing
+inputs**: a low-rank branch on every adapted linear, computing
 `y = W₀·x·(1+P) + Btᵀ·(srow ⊙ (A·x))` where `A`, `Bt` and `P` are fed in like activations and
 the rank `R` is a dynamic dimension (1..512). Swapping an adapter is therefore a buffer write
 rather than a rebuild, stacking is concatenation along `R`, and `srow` gives each adapter in a
-stack its own strength:
+stack its own strength.
+
+All three DiTs have one: 229 branched linears on medium, 193 on each small DiT. They are
+different networks, so adapters do not move between them and each needs its own engine:
 
 ```bash
-python scripts/lora/build_branch.py --model sa3-m --download   # ~7.4 min on an H200, once per GPU arch
+python scripts/lora/build_branch.py --model sa3-m        --download   # ~7.4 min on an H200
+python scripts/lora/build_branch.py --model sa3-sm-music --download   # ~5.1 min
+python scripts/lora/build_branch.py --model sa3-sm-sfx   --download   # ~5.0 min
 python scripts/sa3_trt.py --dit medium --lora a.safetensors:0.8 --lora b.safetensors:0.5
 ```
 
-`--lora` is repeatable with an optional `:STRENGTH` and selects the LoRA engine
-automatically. Serves `lora`, `lora-xs`, `dora-rows` and `dora-rows-xs`; DoRA adapters need
-`bake_dora.py` run on them once. The branch costs a flat ~4–6 ms per step (**+13% at
+Once per GPU architecture. `--lora` is repeatable with an optional `:STRENGTH` and selects
+the matching LoRA engine automatically from `--dit`. Serves `lora`, `lora-xs`, `dora-rows`
+and `dora-rows-xs`; DoRA adapters need `bake_dora.py` run on them once. The branch costs a flat ~4–6 ms per step (**+13% at
 L=4096**, +37% at 1292) and you pay it with a zero stack too, so run the plain engine until
 an adapter is selected. Stacked rank is free to 32.
 

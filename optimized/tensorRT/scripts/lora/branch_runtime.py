@@ -71,16 +71,17 @@ def uniform_terms(W0, p, atype, scaling):
 class BranchLora:
     def __init__(self, engine_path=None, device="cuda", model="sa3-medium",
                  branch_map=None, engine=None):
-        # Engine, layer map and SVD bases all come from ONE place, so an engine can never be
-        # driven with a map built for a different target set -- which names layers it does not
-        # have, mis-sizes every operand, and raises nothing.
+        # Engine, layer map and SVD bases all come from ONE place, keyed by model, so an
+        # engine can never be driven with a map built for a different target set -- which
+        # names layers it does not have, mis-sizes every operand, and raises nothing. The
+        # three served DiTs are genuinely different networks (24x1536 medium, 20x1024 small),
+        # so this is not hypothetical.
         import paths
-        if model != "sa3-medium":
-            raise ValueError(f"this build serves sa3-medium only, got model={model!r}")
-        self.model = model
-        self.paths = paths
-        self.bases_path = paths.SVD_BASES
-        ep = Path(engine_path or paths.BRANCH_ENGINE)
+        mp = paths.for_model(model)
+        self.model = mp.name
+        self.paths = mp
+        self.bases_path = mp.svd_bases
+        ep = Path(engine_path or mp.branch_engine)
         if engine is not None:
             # Attach to an ALREADY-deserialised engine (the gradio has one loaded). Loading a
             # second copy just to drive its LoRA operands would double 2.9 GB of VRAM.
@@ -92,13 +93,13 @@ class BranchLora:
         self.engine_path = ep
         # Overriding the engine WITHOUT its map is the one way back into the mismatch this
         # class exists to prevent, so the two move together.
-        mp = Path(branch_map) if branch_map else paths.BRANCH_MAP
+        map_path = Path(branch_map) if branch_map else mp.branch_map
         if engine_path and not branch_map and engine is None \
-                and ep != Path(paths.BRANCH_ENGINE):
+                and ep != Path(mp.branch_engine):
             raise ValueError(f"engine_path={ep.name} overrides the default engine but no "
                              f"branch_map was given; pass the map built alongside it")
-        self.branch_map_path = mp
-        self.map = json.load(open(mp))["layers"]
+        self.branch_map_path = map_path
+        self.map = json.load(open(map_path))["layers"]
         self.dev = torch.device(device)
         self.rank = 0
         self.bufs = {}          # tensor name -> device fp16

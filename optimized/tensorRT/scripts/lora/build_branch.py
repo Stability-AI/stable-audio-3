@@ -62,6 +62,30 @@ PRESETS = {
         expect_targets=229, expect_layers=24,
         blurb="SA3-medium (24 layers) -- the shipping LoRA engine, 229 targets",
     ),
+    # The two small DiTs. Same graph as each other (20 layers x 1024, identical node names
+    # and identical IO signature to medium), different weights, so one preset shape serves
+    # both. ⚠ Their ONNX is SELF-CONTAINED -- 921 MB of proto with no .onnx.data beside it,
+    # unlike medium's 4 MB proto + 2.7 GB external file -- hence the one-element hf_files.
+    # Also unlike medium: here dit_fp16.onnx and the older dit_fp16mixed.onnx are the SAME
+    # bytes (the 2026-08 rename only renamed), so the legacy name is not a different tier.
+    "sa3-sm-music": dict(
+        onnx="sa3-sm-music/dit_fp16.onnx",
+        onnx_legacy="sa3-sm-music/dit_fp16mixed.onnx", legacy_is_same_graph=True,
+        hf_files=("onnx/sa3-sm-music/dit_fp16.onnx",),
+        engine=None, map=None,
+        targets="all", rank_max=512, rank_opt=32,
+        expect_targets=193, expect_layers=20,
+        blurb="SA3-small-music (20 layers) -- the music LoRA engine, 193 targets",
+    ),
+    "sa3-sm-sfx": dict(
+        onnx="sa3-sm-sfx/dit_fp16.onnx",
+        onnx_legacy="sa3-sm-sfx/dit_fp16mixed.onnx", legacy_is_same_graph=True,
+        hf_files=("onnx/sa3-sm-sfx/dit_fp16.onnx",),
+        engine=None, map=None,
+        targets="all", rank_max=512, rank_opt=32,
+        expect_targets=193, expect_layers=20,
+        blurb="SA3-small-sfx (20 layers) -- the SFX LoRA engine, 193 targets",
+    ),
 }
 
 
@@ -121,12 +145,17 @@ def resolve_onnx(spec, explicit=None, allow_download=True):
     legacy = spec.get("onnx_legacy")
     if legacy and (base / legacy).exists():
         lp = base / legacy
-        say("onnx", f"⚠ only the LEGACY name is present: {lp.name}")
-        say("onnx", "  that is the older fp16mixed graph (fp32 softmax island), NOT the")
-        say("onnx", f"  current {Path(spec['onnx']).name} (fp16 attention core).")
-        say("onnx", "  Building from it anyway. Pass --onnx explicitly to silence this,")
-        say("onnx", "  or delete nothing -- just fetch the current file with --download.")
-        return lp, "legacy name (older tier)"
+        say("onnx", f"only the LEGACY name is present: {lp.name}")
+        if spec.get("legacy_is_same_graph"):
+            # Verified for both small DiTs: dit_fp16.onnx and dit_fp16mixed.onnx are the
+            # same bytes on the HF repo, so this is a rename, not a different tier.
+            say("onnx", "  for this model that is the SAME graph under its pre-2026-08 name.")
+        else:
+            say("onnx", "  ⚠ that is the older fp16mixed graph (fp32 softmax island), NOT the")
+            say("onnx", f"  current {Path(spec['onnx']).name} (fp16 attention core).")
+            say("onnx", "  Building from it anyway. Pass --onnx explicitly to silence this,")
+            say("onnx", "  or just fetch the current file with --download.")
+        return lp, "legacy name"
 
     if not allow_download or not spec.get("hf_files"):
         die(f"no ONNX found at {p}",
@@ -207,10 +236,14 @@ def check_maps(map_paths):
         # The map ships with the repo; the engine is built locally, per GPU architecture.
         # So "no engine here yet" is a fresh clone, not a defect -- this gate checks that a
         # map and an engine AGREE, and there is nothing to disagree with until one exists.
-        cand = ([mp.parent / eng, ROOT / eng, Path(eng)] if eng else []) + [paths.BRANCH_ENGINE]
+        # A map names its engine relative to itself; the fallbacks cover a map that was
+        # moved. Every served model is tried, because one checkout holds all of them and a
+        # medium-only fallback reported "not built" for a small engine sitting right there.
+        known = [paths.for_model(k).branch_engine for k in paths.MODELS]
+        cand = ([mp.parent / eng, ROOT / eng, Path(eng)] if eng else []) + known
         hit = next((c for c in cand if c.exists()), None)
         if hit is None:
-            print(f"  NOT BUILT    {mp.name}: {n} layers, no engine at {paths.BRANCH_ENGINE}")
+            print(f"  NOT BUILT    {mp.name}: {n} layers, no engine on disk")
             print("               build one:  python scripts/lora/build_branch.py "
                   "--model sa3-m --download")
             continue
@@ -263,6 +296,10 @@ typical use
   # build the shipping SA3-medium LoRA engine for THIS GPU (downloads the ONNX if needed)
   python scripts/lora/build_branch.py --model sa3-m --download
 
+  # the two small DiTs (20 layers, 193 targets each)
+  python scripts/lora/build_branch.py --model sa3-sm-music --download
+  python scripts/lora/build_branch.py --model sa3-sm-sfx   --download
+
   # check that every branch map still points at an engine that exists and matches
   python scripts/lora/build_branch.py --check
 
@@ -285,22 +322,26 @@ intend to serve from. Everything the preset decides can be overridden with the f
     # ⚠ was hardcoded to lora/branch_map.json — building a second model's engine would
     # silently overwrite the first model's layer map, and the runtime reads it by name.
     # (the flag itself is declared below, after --targets, so the preset can fill it in)
-    # core = 169: the 7 block linears per layer + the seconds_total embedder, which is what
-    #        every adapter trained so far actually targets.
-    # full = 228: every adapted tensor INSIDE the DiT -- 9 per layer (adding to_local_embed),
-    #        the to_*_embed / global_cond_embedder / project_in/out stack, and both convs.
-    #        Deliberately excludes the seconds_total embedder, which lives in the conditioner.
-    # all  = 229: full + the seconds_total embedder, i.e. every tensor any sa3-medium adapter
-    #        has ever targeted. Measured to cost nothing over 168 targets in time or VRAM
-    #        (+7 MB engine, +5 MB operands at r16), so coverage here is free.
+    # Counts below are 24-layer medium / 20-layer small.
+    # core = 169 / 141: the 7 block linears per layer + the seconds_total embedder, which is
+    #        what every adapter trained so far actually targets.
+    # full = 228 / 192: every adapted tensor INSIDE the DiT -- 9 per layer (adding
+    #        to_local_embed), the to_*_embed / global_cond_embedder / project_in/out stack,
+    #        and both convs. Deliberately excludes the seconds_total embedder, which lives
+    #        in the conditioner, not the DiT.
+    # all  = 229 / 193: full + the seconds_total embedder, i.e. every tensor any adapter has
+    #        ever targeted. Measured on medium to cost nothing over 168 targets in time or
+    #        VRAM (+7 MB engine, +5 MB operands at r16), so coverage here is free.
     ap.add_argument("--targets", choices=("core", "full", "all"), default=None)
     ap.add_argument("--map", dest="map", default=None)
     args = ap.parse_args()
 
     # ---- --check: validate maps and exit -----------------------------------------
     if args.check is not None:
-        maps = args.check or sorted({str(q) for q in HERE.glob("branch_map*.json")}
-                                    | ({str(paths.BUILT_MAP)} if paths.BUILT_MAP.exists() else set()))
+        maps = args.check or sorted(
+            {str(q) for q in HERE.glob("branch_map*.json")}
+            | {str(paths.for_model(k).built_map) for k in paths.MODELS
+               if paths.for_model(k).built_map.exists()})
         print(f"checking {len(maps)} branch map(s)\n")
         sys.exit(check_maps(maps))
 
@@ -318,10 +359,12 @@ intend to serve from. Everything the preset decides can be overridden with the f
     # Where the engine lands is paths.py's call, not a string in the preset: the runtime
     # reads the same constant, so the two cannot drift. TensorRT bakes the GPU architecture
     # into the plan, hence models/<arch>/<model>/.
+    # `mp` further down is the map file; this is the model's path set. Don't merge them.
+    mpaths = paths.for_model(args.model) if args.model else paths.for_model()
     if args.engine is None:
-        args.engine = str(spec["engine"] and ROOT / spec["engine"] or paths.BRANCH_ENGINE)
+        args.engine = str(spec["engine"] and ROOT / spec["engine"] or mpaths.branch_engine)
     if args.map is None:
-        args.map = str(spec["map"] and ROOT / spec["map"] or paths.BUILT_MAP)
+        args.map = str(spec["map"] and ROOT / spec["map"] or mpaths.built_map)
 
     onnx_path, how = resolve_onnx(spec, args.onnx, allow_download=args.download) \
         if spec else (Path(args.onnx), "explicit path")
@@ -396,7 +439,12 @@ intend to serve from. Everything the preset decides can be overridden with the f
         # that layer just never gets its branch.
         want = {v[0] for v in extra.values()}
         assert got == want, f"extra targets missing from the graph: {sorted(want - got)}"
-        print(f"[build] {n_block} block linears = {n_block//n_t} layers x {n_t} targets"
+        n_layers = n_block // n_t
+        want_l = spec.get("expect_layers")
+        assert want_l is None or n_layers == want_l, (
+            f"{args.model} should have {want_l} transformer layers, the graph has "
+            f"{n_layers} -- this is the wrong ONNX for this preset")
+        print(f"[build] {n_block} block linears = {n_layers} layers x {n_t} targets"
               f"  + {len(targets)-n_block} non-block ({args.targets})")
 
         srow = net.add_input("lora_srow", trt.float16, (1, 1, -1))     # [1,1,R] broadcasts over S
@@ -533,7 +581,8 @@ intend to serve from. Everything the preset decides can be overridden with the f
     say("done", f"map {mp}")
     print()
     print("  verify it:   python scripts/lora/build_branch.py --check")
-    print("  use it:      python scripts/sa3_trt.py --dit medium --lora <adapter.safetensors>")
+    print(f"  use it:      python scripts/sa3_trt.py --dit {mpaths.dit} "
+          f"--lora <adapter.safetensors>")
 
 
 if __name__ == "__main__":

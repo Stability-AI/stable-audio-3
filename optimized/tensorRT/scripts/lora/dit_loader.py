@@ -1,4 +1,4 @@
-"""Load the SA3-medium DiT with its conditioning baked in, and the pingpong sampler.
+"""Load an SA3 DiT with its conditioning baked in, and the pingpong sampler.
 
 The same cond-baked wrapper the shipped ONNX was traced from, so a torch forward through it
 is structurally identical to an engine forward -- which is what makes the verify_* harnesses
@@ -13,9 +13,30 @@ import paths
 # One place decides which weights these are. The variant matters: the published ONNX is
 # built from ARC, and folding the other variant's weights into an ARC-built engine is wrong
 # with nothing raising -- it just reads as a large fold error.
-MODEL_DIR = str(paths.CKPT_DIR)
-CKPT = str(paths.CKPT_DIR / (paths.STEM[paths.ENGINE_VARIANT] + ".ckpt"))
-CONFIG = str(paths.config(paths.ENGINE_VARIANT))
+#
+# Resolved lazily, per model. These used to be computed at import, which called
+# paths.config() -- so importing this module AT ALL raised FileNotFoundError unless the
+# medium checkpoint happened to be on disk, including when the caller wanted a small one.
+MODEL = paths.DEFAULT_MODEL
+MODEL_DIR = CKPT = CONFIG = None
+
+
+def use_model(model=paths.DEFAULT_MODEL, variant=paths.ENGINE_VARIANT):
+    """Point this module at one DiT's weights. Returns (ckpt, config) as strings."""
+    global MODEL, MODEL_DIR, CKPT, CONFIG
+    mp = paths.for_model(model)
+    MODEL = mp.name
+    MODEL_DIR = str(mp.ckpt_dir)
+    CKPT = str(mp.checkpoint(variant))
+    CONFIG = str(mp.config(variant))
+    return CKPT, CONFIG
+
+
+def _resolved():
+    """CKPT/CONFIG, resolving the default model on first use if nobody called use_model."""
+    if CKPT is None or CONFIG is None:
+        use_model()
+    return CKPT, CONFIG
 
 SAMPLE_RATE = 44100
 SAMPLES_PER_LATENT = 4096
@@ -61,12 +82,13 @@ def patch_for_onnx():
 
 
 def load_state_dict():
+    ckpt, _ = _resolved()
     # A checkpoint may arrive as .ckpt or .safetensors -- same flat state dict either way.
-    if str(CKPT).endswith(".safetensors"):
+    if str(ckpt).endswith(".safetensors"):
         from safetensors.torch import load_file
-        sd = load_file(str(CKPT))
+        sd = load_file(str(ckpt))
     else:
-        sd = torch.load(CKPT, map_location="cpu", mmap=True, weights_only=True)
+        sd = torch.load(ckpt, map_location="cpu", mmap=True, weights_only=True)
     if isinstance(sd, dict) and "state_dict" in sd:
         sd = sd["state_dict"]
     out = {}
@@ -85,7 +107,8 @@ def load_model(device="cuda", dtype=torch.float32, verbose=True):
     from stable_audio_tools.models.factory import create_model_from_config
     from stable_audio_tools.models.utils import copy_state_dict
 
-    with open(CONFIG) as f:
+    _, config = _resolved()
+    with open(config) as f:
         cfg = json.load(f)
     t0 = time.time()
     model = create_model_from_config(cfg)

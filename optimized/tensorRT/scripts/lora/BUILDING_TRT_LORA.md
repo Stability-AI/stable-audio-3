@@ -1,7 +1,11 @@
 # Building a TensorRT DiT with live LoRA/DoRA support
 
-Everything learned building runtime-swappable LoRA into the SA3-medium TensorRT DiT
-(229 targets). Written so the next person does not re-pay for any of it.
+Everything learned building runtime-swappable LoRA into the SA3 TensorRT DiTs. Written so
+the next person does not re-pay for any of it.
+
+Numbers below are **sa3-medium** (24 layers, 229 targets) unless stated otherwise, because
+that is where every measurement was taken. §2.1 covers the two small DiTs, where the recipe
+transfers unchanged.
 
 > Scope note: this covers the **branch** approach — adapters as network *inputs*, swappable at
 > runtime with no rebuild. The alternative (merge weights + `refit`) costs 0% forward but needs
@@ -74,6 +78,45 @@ with training.
 **Full coverage is free.** 168 → 229 targets measured: +7 MB engine file, +5 MB operands at
 r16, no measurable VRAM, ≤1 ms/step at L=4096 (four builds were within 1.46 ms of each other in
 an interleaved run). Build for everything.
+
+### 2.1 The two small DiTs
+
+`sa3-sm-music` and `sa3-sm-sfx` are **20 layers × 1024** (medium is 24 × 1536). Everything
+else about them is the same, which is why the recipe needed no new graph logic:
+
+* **Identical ONNX node naming.** `classify()` matches with the default `TARGETS` and no
+  change — `/transformer/layers.0/self_attn/to_qkv/MatMul` reads the same on all three.
+* **All 13 non-block targets present** in both small graphs, by exact layer name. The
+  `EXTRA_TARGETS` / `CONV_TARGETS` / `SECONDS_TARGET` tables were derived from medium and
+  transfer verbatim, so `--targets all` means the same thing everywhere.
+* **Identical IO signature** — `x[1,256,L]`, `t5_hidden[1,256,768]`, `local_add_cond[1,257,L]`,
+  `velocity` in fp32 — so `trt_build.profile_for()` is reused unmodified.
+* **`--targets all` = 193** = 20 × 9 + 13. `core` = 141, `full` = 192.
+* **Same adapter key convention.** A real trained 20-layer `dora-rows` adapter carries
+  exactly 141 targets (20 × 7 + the seconds embedder), i.e. the same `core` set every medium
+  adapter trains.
+
+Two differences that matter when building:
+
+* **The small ONNX is self-contained** — one 921 MB proto with no `.onnx.data` beside it,
+  where medium is a 4 MB proto + 2.71 GB external file. Their presets' `hf_files` is a
+  one-element tuple, and the "proto is small and .data is missing" preflight does not fire.
+* **`dit_fp16.onnx` and `dit_fp16mixed.onnx` are the SAME BYTES** for both small DiTs — the
+  2026-08 rename was only a rename there. On medium they are genuinely different graphs
+  (fp32 softmax island vs fp16 attention core), so the builder's loud legacy-name warning is
+  gated per preset on `legacy_is_same_graph`.
+
+Measured: 0.95 GB engine each (**+15 MB** over the plain `dit_fp16.trt`), 5.0–5.1 min to
+build on an H200. Zeroed branch vs the plain engine: **40.8–43.3 dB** at L = 1 / 64 / 1292 /
+4096. Real adapter folded vs torch: fold error **0.97×** (music) and **1.04×** (sfx) of the
+engine's own fp16 floor — the fold adds nothing measurable.
+
+⚠ **Adapters are not portable between the three DiTs.** Different depth and width, so a
+medium adapter does not even load. Within one DiT, arc and base differ by only ~2–3e-3 at
+the weight level (and the published non-`-base` repo is bit-exactly the ARC checkpoint for
+both small models, as it is for medium), so the arc/base fold ambiguity that cost medium a
+27% fold error is much weaker here — but `ENGINE_VARIANT = "arc"` is still the right answer
+and still the one the engines are built from.
 
 ---
 

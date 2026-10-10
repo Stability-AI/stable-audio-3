@@ -1328,7 +1328,10 @@ class SA3Inference:
             if self._eager_dit is not None:
                 self._eager_dit.attach_lora(B)
             self._lora_specs = list(specs)
-            return {"rank": B.rank, "targets": len(B.map), "adapters": len(specs)}
+            # rank = what the adapters carry; rank_bound = what the engine binds, padded
+            # to the fast multiple of 8 (see branch_runtime.pad_rank).
+            return {"rank": B.rank_real, "rank_bound": B.rank,
+                    "targets": len(B.map), "adapters": len(specs)}
 
     def set_lora_strength(self, per_adapter):
         """Per-adapter strength, no refold and no recapture (a linear fade)."""
@@ -1954,7 +1957,7 @@ def main():
                           branch_map=_detect_map_for(runners["dit"].engine, args.dit))
         lora.set_stack_gpu(specs, {})
         dit.attach_lora(lora)
-        sub(f"{dim('lora')} {len(specs)} adapter(s), rank {lora.rank}, "
+        sub(f"{dim('lora')} {len(specs)} adapter(s), rank {lora.rank_real}, "
             f"{len(lora.map)} targets  {(time.time()-_t)*1000:.0f} ms")
     elif any(runners["dit"].engine.get_tensor_name(i).startswith("lora")
              for i in range(runners["dit"].engine.num_io_tensors)):

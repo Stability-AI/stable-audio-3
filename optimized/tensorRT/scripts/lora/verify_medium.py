@@ -232,10 +232,10 @@ def main():
         # same denominator as the fp16 floor, so the two are directly comparable
         r["fold_common"] = float((reach.float() - v_trt.float()).norm() / nb)  # kept in json
         r["vs169"] = rel(r["v169"], v_trt)
-        r["rank"] = B.rank; r["swap_ms"] = swap_ms
+        r["rank"] = B.rank_real; r["rank_bound"] = B.rank; r["swap_ms"] = swap_ms
         # both sides relative to the signal each produces, so they are directly comparable
         flag = "" if r["fold"] <= 1.5 * floor else "  <-- ABOVE fp16 floor"
-        print(f"    {Path(r['adapter']).name[:34]:34s} {B.rank:4d} "
+        print(f"    {Path(r['adapter']).name[:34]:34s} {B.rank_real:4d} "
               f"{r['match']['hit']:3d}/{r['match']['tot']:<3d} {r['eff']:9.3e} "
               f"{100*r['l169']/max(r['eff'],1e-30):6.2f}% {r['fold']:11.3e} "
               f"{r['delta']:10.3e} {r['fold_168_only']:9.3e} {r['vs169']:9.3e} "

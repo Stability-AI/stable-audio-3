@@ -68,6 +68,37 @@ def uniform_terms(W0, p, atype, scaling):
                      f"route this adapter to the merged engine")
 
 
+# The two low-rank GEMMs (lora/down, lora/up) run ~40% faster when the BOUND rank is a
+# multiple of 8, and identically for every other rank. 8 fp16 values is 16 bytes -- one
+# vectorised load -- and the fp16 tensor-core fragment wants K/N in multiples of 8, so the
+# single kernel (chosen at build time at the profile's opt point) only reaches its fast path
+# when the rank dimension fills whole fragments. Measured per-layer on sm-music at L=1292:
+# every rank in 1..24 divisible by 8 cost 3.56-3.63 ms, every other rank 4.93-5.21 ms, with
+# no exceptions. Whole-engine that is ~1.4-1.6 ms/step on the small DiTs and ~1.6-2.0 ms on
+# medium, and it holds all the way down to L=8 (where it is 16% of the step, because the
+# step itself is so cheap).
+#
+# ⚠ This is NOT a threshold -- rank 9 and 12 are exactly as slow as rank 1. So it is not
+# enough to fix the empty stack: padding applies to every real adapter too, and r4 is the
+# common offender.
+RANK_GRANULARITY = 8
+
+
+def pad_rank(r, cap=None):
+    """Round a stack rank up to RANK_GRANULARITY, never past what the engine can bind.
+
+    Padding is free because the extra rows are zeros in A, Bt AND srow, so they contribute
+    nothing: the engine returns bit-identical output (verified max|diff| 0.0). An engine
+    built with a --rank-max that is not a multiple of 8 is the one case where padding would
+    push past the profile, so there it is skipped rather than silently over-binding.
+    """
+    r = max(int(r), 1)
+    padded = -(-r // RANK_GRANULARITY) * RANK_GRANULARITY
+    if cap is not None and padded > int(cap):
+        return r
+    return padded
+
+
 class BranchLora:
     def __init__(self, engine_path=None, device="cuda", model="sa3-medium",
                  branch_map=None, engine=None):
@@ -101,22 +132,36 @@ class BranchLora:
         self.branch_map_path = map_path
         self.map = json.load(open(map_path))["layers"]
         self.dev = torch.device(device)
+        # rank      = the BOUND rank, padded to RANK_GRANULARITY; buffer shapes, srow width
+        #             and CUDA-graph shape identity all follow this one.
+        # rank_real = the rank the adapters actually carry. Everything user-facing reports
+        #             this, so an r4 adapter never reads as "rank 8".
         self.rank = 0
+        self.rank_real = 0
         self.bufs = {}          # tensor name -> device fp16
         self.blocks = []        # (start, len, strength) per adapter
         self._pchan = {}        # layer -> [n_adapters, out] fp32, for re-folding pout per step
 
     def zero(self, rank=1):
-        """No adapter: rank-1 zeros. The branch still runs -- that is its cost."""
-        self.rank = rank
+        """No adapter, but the branch must still be bound: an all-zero stack.
+
+        Rank 0 does not exist -- the optimisation profile's minimum is 1, and
+        set_input_shape REJECTS (1,1,0) -- and the inputs cannot simply be left unbound
+        either: with them unset TRT cannot even resolve the output shape (velocity comes
+        back [1,256,-1]) and enqueue refuses with "Address is not set for input tensor
+        lora_srow". So the cheapest legal "nothing loaded" is a padded rank of zeros.
+        """
+        self.rank = pad_rank(rank, self.rank_cap())
+        self.rank_real = 0
         for nm, rec in self.map.items():
-            self.bufs[rec["A"]] = torch.zeros((1, rank, rec["in"]), dtype=torch.float16,
+            self.bufs[rec["A"]] = torch.zeros((1, self.rank, rec["in"]), dtype=torch.float16,
                                               device=self.dev)
-            self.bufs[rec["B"]] = torch.zeros((1, rank, rec["out"]), dtype=torch.float16,
+            self.bufs[rec["B"]] = torch.zeros((1, self.rank, rec["out"]), dtype=torch.float16,
                                               device=self.dev)
             self.bufs[rec["P"]] = torch.zeros((1, 1, rec["out"]), dtype=torch.float16,
                                               device=self.dev)
-        self.bufs["lora_srow"] = torch.zeros((1, 1, rank), dtype=torch.float16, device=self.dev)
+        self.bufs["lora_srow"] = torch.zeros((1, 1, self.rank), dtype=torch.float16,
+                                             device=self.dev)
         self.blocks = []
         return self
 
@@ -333,13 +378,21 @@ class BranchLora:
                 r_seen = Ap.shape[0]
             self.blocks.append((start, r_seen, a["strength"]))
             start += r_seen
-        self.rank = start
-        assert self.rank >= 1, "empty stack"
+        assert start >= 1, "empty stack"
+        self.rank_real = start
+        self.rank = pad_rank(start, self.rank_cap())
+
+        def _rows(blocks, width):
+            """Concatenated blocks, zero-padded out to the bound rank."""
+            out = np.zeros((self.rank, width), np.float32)
+            if blocks:
+                got = np.concatenate(blocks, 0)
+                out[:got.shape[0]] = got
+            return out
+
         for nm, rec in self.map.items():
-            A = np.concatenate(per_layer[nm][0], 0) if per_layer[nm][0] else \
-                np.zeros((self.rank, rec["in"]), np.float32)
-            B = np.concatenate(per_layer[nm][1], 0) if per_layer[nm][1] else \
-                np.zeros((self.rank, rec["out"]), np.float32)
+            A = _rows(per_layer[nm][0], rec["in"])
+            B = _rows(per_layer[nm][1], rec["out"])
             self.bufs[rec["A"]] = torch.from_numpy(A[None]).to(self.dev, torch.float16).contiguous()
             self.bufs[rec["B"]] = torch.from_numpy(B[None]).to(self.dev, torch.float16).contiguous()
             # keep each adapter's pchan so per-step strength can re-fold pout as sum_k s_k*pchan_k

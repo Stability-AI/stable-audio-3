@@ -235,13 +235,27 @@ y = W₀·x·(1 + P)  +  Btᵀ·( srow ⊙ (A·x) )
 
 **What it costs, and why.** The branch is two small GEMMs per adapted linear — `[S,in]×[in,R]`
 then `[S,R]×[R,out]`. At low rank that is memory- and launch-bound rather than arithmetic-
-bound, which is why the overhead is a flat ~4–6 ms per step rather than a percentage, and why
-stacked rank is free up to about 32 before the GEMMs start to matter.
+bound, which is why the overhead is a flat few ms per step rather than a percentage, and why
+stacked rank is free up to about 32 before the GEMMs start to matter. Being a flat cost, its
+*relative* price depends on the DiT: +13% at L=4096 and +37% at 1292 on medium, but +34% /
++60% / +83% at L=4096 / 1292 / 323 on the small DiTs, whose base step is ~2.7× cheaper.
+
+**Rank is rounded up to a multiple of 8, and that is a real speedup.** Those two GEMMs run
+~40% faster when the bound rank is a multiple of 8 — 8 fp16 values is 16 bytes, one
+vectorised load, and the fp16 tensor-core fragment wants K/N in multiples of 8, so the kernel
+only reaches its fast path when the rank dimension fills whole fragments. It is **not** a
+threshold: rank 9 and 12 are exactly as slow as rank 1. So `pad_rank()` rounds the
+*concatenated* stack rank up and leaves the extra rows zero in `A`, `Bt` and `srow`, which
+contributes nothing and returns bit-identical output. Measured on an r4 adapter at L=1292:
+9.79 → 8.33 ms/step, max|diff| exactly 0. It holds down to L=8, where it is ~16% of the step.
+`rank` as reported is always what the adapters carry; the padded value is `rank_bound`.
 
 The flip side of operands-as-inputs: **TensorRT refuses to enqueue with any input unbound**,
 so a branch engine must be handed at least a zero stack before it will run at all — and a
-zero stack still pays the full forward cost. That is why `dit_fp16.trt` remains the default
-and the LoRA engine is only selected when an adapter is actually wanted.
+zero stack still pays the full forward cost. There is no "rank 0" either: the profile minimum
+is 1 and `set_input_shape` rejects a 0 dimension, so "no adapter" is a padded rank of zeros.
+That is why `dit_fp16.trt` remains the default and the LoRA engine is only selected when an
+adapter is actually wanted.
 
 **Why not refit instead?** Refitting the real weights gives a 0% forward overhead and
 supports every adapter variant including the ones this branch cannot express

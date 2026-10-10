@@ -281,13 +281,22 @@ def set_stack_gpu(self, specs, base_weights):
             per[nm][2].append(pch)
         self.blocks.append((start, r_a, a["strength"]))
         start += r_a
-    self.rank = start
-    assert self.rank >= 1, "empty stack"
+    assert start >= 1, "empty stack"
+    # Bound rank is padded to RANK_GRANULARITY; the extra rows stay zero in A, Bt and srow
+    # so they contribute nothing, and the GEMMs reach their fast path. See pad_rank().
+    self.rank_real = start
+    self.rank = BR.pad_rank(start, self.rank_cap())
+
+    def _rows(blocks, width):
+        out = torch.zeros(self.rank, width, device=self.dev)
+        if blocks:
+            got = torch.cat(blocks, 0)
+            out[:got.shape[0]] = got
+        return out
+
     for nm, rec in self.map.items():
-        A = (torch.cat(per[nm][0], 0) if per[nm][0]
-             else torch.zeros(self.rank, rec["in"], device=self.dev))
-        B = (torch.cat(per[nm][1], 0) if per[nm][1]
-             else torch.zeros(self.rank, rec["out"], device=self.dev))
+        A = _rows(per[nm][0], rec["in"])
+        B = _rows(per[nm][1], rec["out"])
         self.bufs[rec["A"]] = A[None].to(torch.float16).contiguous()
         self.bufs[rec["B"]] = B[None].to(torch.float16).contiguous()
         pcs = [torch.zeros(rec["out"], device=self.dev) if q is None else q for q in per[nm][2]]

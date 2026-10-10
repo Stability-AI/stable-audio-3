@@ -149,9 +149,10 @@ def main():
         fold = rel(r["v_ref"], v)
         delta = rel(r["v_ref"].float() - v_base.float(), v.float() - v0.float())
         flag = "" if fold <= 1.5 * floor else "  <-- ABOVE fp16 floor"
-        print(f"    {' + '.join(r['names'])[:62]:62s}{B.rank:6d}{r['eff']:11.3e}"
+        print(f"    {' + '.join(r['names'])[:62]:62s}{B.rank_real:6d}{r['eff']:11.3e}"
               f"{fold:11.3e}{delta:11.3e}{r['chain_gap']:11.3e}{fold_ms:9.1f}{flag}", flush=True)
-        out.append({"stack": r["names"], "rank": B.rank, "effect": r["eff"],
+        out.append({"stack": r["names"], "rank": B.rank_real, "rank_bound": B.rank,
+                    "effect": r["eff"],
                     "fold": fold, "delta": delta, "fold_ms": fold_ms,
                     "chain_gap": r["chain_gap"], "sec_cost": r["sec_cost"]})
     print(f"\n    fp16 floor {floor:.3e} — fold err at or under it means the stack is exact "

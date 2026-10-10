@@ -31,6 +31,7 @@ from models.defs.sa3_pipeline import (
 )
 from models.defs.t5gemma_mlx import T5Gemma
 from weights import ensure_local, is_present
+from prompt_weighting import parse_weighted_prompt, compute_token_spans, apply_prompt_weights
 
 SAMPLE_RATE = 44100
 SAMPLES_PER_LATENT = 4096  # PatchedPretransform downsample × SAME 16× expansion
@@ -358,7 +359,9 @@ def main():
     ap.add_argument("--prompt", default=None,
                     help="Text prompt describing the audio to generate. "
                          "Empty string is valid (unconditional generation). "
-                         "If omitted, the script asks interactively via stdin.")
+                         "If omitted, the script asks interactively via stdin. "
+                         "Supports inline (phrase:weight) syntax to emphasize/de-emphasize "
+                         "part of the prompt, e.g. \"a (driving pulse:1.8) under quiet air\".")
     ap.add_argument("--negative-prompt", default=None,
                     help="Negative prompt for CFG's unconditional branch. "
                          "When --cfg=1.0 this flag has no effect (no uncond pass is run). "
@@ -586,10 +589,14 @@ def main():
     t0 = time.time()
     t5_path = args.t5gemma_npz if args.t5gemma_npz else str(ensure_local(T5GEMMA_NPZ_REL))
     enc = T5Gemma.from_npz(t5_path)
-    embeds, mask = enc.encode([args.prompt], max_len=256)
+    clean_prompt, prompt_spans = parse_weighted_prompt(args.prompt)
+    embeds, mask = enc.encode([clean_prompt], max_len=256)
     mx.eval(embeds, mask)
     stage("[1/5]", "T5Gemma encode", (time.time()-t0)*1000, peak_b=_stage_peak_b("T5Gemma encode"))
     sub(f"embeds {embeds.shape} {embeds.dtype}")
+    if prompt_spans:
+        span_desc = ", ".join(f"'{clean_prompt[s:e]}'×{w:g}" for s, e, w in prompt_spans)
+        sub(f"prompt weighting  {len(prompt_spans)} span(s): {span_desc}")
 
     # ── 2. Conditioning ──
     # Conditioner weights are baked into the DiT .npz under "cond." prefix.
@@ -607,6 +614,8 @@ def main():
         if _n_cond:
             sub(f"lora  conditioner delta applied ({_n_cond} adapter(s), whole generation)")
     embeds = embeds.astype(dtype)
+    prompt_token_spans = compute_token_spans(clean_prompt, prompt_spans, enc.tokenizer, max_len=256)
+    embeds = apply_prompt_weights(embeds, prompt_token_spans, padding_emb.astype(dtype))
     embeds_padded = apply_prompt_padding(embeds, mask, padding_emb.astype(dtype))
     seconds_embed = secs_embedder(args.seconds).astype(dtype)              # (1, 1, 768)
     cross_attn = mx.concatenate([embeds_padded, seconds_embed], axis=1)    # (1, 257, 768)
@@ -616,9 +625,15 @@ def main():
     null_cross_attn = None
     if args.cfg != 1.0:
         if args.negative_prompt:
-            neg_embeds, neg_mask = enc.encode([args.negative_prompt], max_len=256)
+            clean_neg_prompt, neg_spans = parse_weighted_prompt(args.negative_prompt)
+            neg_embeds, neg_mask = enc.encode([clean_neg_prompt], max_len=256)
             mx.eval(neg_embeds, neg_mask)
             neg_embeds = neg_embeds.astype(dtype)
+            neg_token_spans = compute_token_spans(clean_neg_prompt, neg_spans, enc.tokenizer, max_len=256)
+            if neg_spans:
+                neg_span_desc = ", ".join(f"'{clean_neg_prompt[s:e]}'×{w:g}" for s, e, w in neg_spans)
+                sub(f"prompt weighting (negative)  {len(neg_spans)} span(s): {neg_span_desc}")
+            neg_embeds = apply_prompt_weights(neg_embeds, neg_token_spans, padding_emb.astype(dtype))
             neg_padded = apply_prompt_padding(neg_embeds, neg_mask, padding_emb.astype(dtype))
             null_cross_attn = mx.concatenate([neg_padded, seconds_embed], axis=1)
         else:

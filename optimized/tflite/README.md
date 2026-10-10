@@ -63,14 +63,16 @@ prompt ─▶ T5Gemma encoder ─▶ DiT pingpong sampler ─▶ SAME-S/L decode
 
 Precision is split between the **DiT** and the **SAME codec** — they react to quantization oppositely:
 
-- **DiT** (`--dit-precision`, or the global `--precision`):
-  - **medium**: **`w8a8` (default)** · `fp32` — a from-repo **rung ladder** (12 fixed lengths; see *Medium DiT — the
-    N=12 rung ladder* below). `w8a8` is **cache-safe int8**: ~equal quality to the old `w8a8-dyn` (cos 0.996 per
-    forward) but with **flat RAM (~2–4 GB vs the old 3–40 GB)**, faster at the rung sizes, and a single file.
-    int8 on the DiT is still a *different* (not worse) sample — the 8-step sampler is chaotically sensitive — so
-    `w8a8` is the shipped default and `fp32` is the bit-exact reference (and the pick for LoRA merges or an A/B).
-  - **sm-music / sm-sfx**: `fp32` · `w16a32` · `w8a32` · `w8a8-dyn` — still the dynamic-shape varlen graphs
-    (wXaY = weight/activation bits; "16" = fp16), until they are rung-built too.
+- **DiT** (`--dit-precision`, or the global `--precision`) — **all three DiTs** (medium, sm-music, sm-sfx) are
+  from-repo **rung ladders** (see *The rung-ladder DiTs* below), each with the same two tiers:
+  - **`w8a8` (default)** — **cache-safe int8**: ~equal quality to the old `w8a8-dyn` (cos ≥ 0.996 per forward)
+    but with **flat RAM**, faster at the rung sizes, and a single self-contained file.
+  - **`fp32`** — the bit-exact reference (and the pick for LoRA merges or an A/B).
+
+  int8 on the DiT is a *different* (not worse) sample — the 8-step sampler is chaotically sensitive — so `w8a8`
+  is the shipped default and `fp32` is the reference. medium's ladder tops at 4096 latents (380 s); the small DiTs'
+  ladder tops at 1292 (their 2-min max). The old varlen tiers (`w16a32` / `w8a32` / `w8a8-dyn`) are retired to
+  `tflite/sa3-*/legacy/`. (wXaY = weight/activation bits; "16" = fp16.)
 - **Codec** (`--decoder-precision` / `--encoder-precision`): `fp32` · **`w8a8` (default)**. The SAME enc/dec ship as
   static **rung** models — see [docs/RUNGS.md](docs/RUNGS.md). They run once on a fixed latent, so int8 is
   quality-free: a real-music round-trip is identical to fp32. `w8a8` is ~3× faster and ~half the RAM on an
@@ -78,33 +80,30 @@ Precision is split between the **DiT** and the **SAME codec** — they react to 
   codec variants added no audible quality and are retired to `tflite/same-*/legacy/`.)
 
 `--precision` is a global default that sets the DiT directly and maps to the codec (`fp32`→`fp32`, any int8→`w8a8`).
-When omitted, the DiT precision is **per-family — medium `w8a8`, the small DiTs `fp32`** (they have no rung `w8a8`
-yet) — and the **codec is `w8a8`**. All variants keep the full feature set (any `--seconds`,
-odd/even L, batched/sequential CFG) and lazy-download from HuggingFace on first use.
+When omitted, the DiT is **`w8a8` for every family** and the **codec is `w8a8`**. All variants keep the full feature
+set (any `--seconds`, odd/even L) and lazy-download from HuggingFace on first use.
 
 | component | precisions | size | notes |
 |---|---|---|---|
-| **DiT — medium** (rung) | **`w8a8`** (default) / `fp32` | 1.6 / 5.8 GB | N=12 rung ladder; `w8a8` = cache-safe int8, **flat ~2–4 GB RAM**, ≈ old `w8a8-dyn` quality; old `w16a32/w8a32/w8a8-dyn` → `legacy/`; needs litert ≥ 2.2.0 |
-| **DiT — small** | `fp32` / `w16a32` / `w8a32` / `w8a8-dyn` | sm 1.8 / 0.9 / 0.45 / 0.45 GB | varlen (not yet rung); int8 → a *different* sample |
+| **DiT — medium** (rung) | **`w8a8`** (default) / `fp32` | 1.6 / 5.8 GB | 12-rung ladder (→ 4096 / 380 s); `w8a8` = cache-safe int8, **flat ~2–4 GB RAM**, ≈ old `w8a8-dyn`; old `w16a32/w8a32/w8a8-dyn` → `legacy/`; litert ≥ 2.2.0 |
+| **DiT — small** (rung) | **`w8a8`** (default) / `fp32` | 0.5 / 1.8 GB | 8-rung ladder (→ 1292 / 2 min); same cache-safe int8, **flat ~0.8 GB RAM** (4.5× less than the old varlen at 2 min); old tiers → `legacy/` |
 | **codec** (rung) | `fp32` / `w8a8` | SAME-S enc/dec 0.22 / 0.25 → w8a8 0.06 / 0.09 GB · SAME-L 1.7 / 1.8 → w8a8 0.47 / 0.52 GB | w8a8 quality-free, ~3× faster + half RAM; needs litert ≥ 2.2.0 |
 | T5Gemma | fp16 | 0.6 GB | single-precision |
 
-*(int8 weights are per-channel; `w8a8-dyn` also quantizes activations, its int8×int8 matmuls being what make it
-faster-than-fp32 on the DiT. Codec rungs use dynamic int8 too, but there the extra activation-quant error is far
-below the AE's own loss. DiT speed factors measured on an Apple M4 Pro, XNNPACK, 8 threads.)*
+*(The rung `w8a8` uses per-channel int8 weights + per-token dynamic activation quant, so its int8×int8 matmuls
+run faster than fp32 on an int8-capable CPU. The codec rungs use dynamic int8 too, where the extra activation-quant
+error is far below the AE's own loss.)*
 
-One CFG note (small DiTs, varlen): batched vs sequential CFG is bit-identical at `fp32`/`w8a32`, ~80 dB apart at
-`w16a32`, but under `w8a8-dyn` the batch=2 invoke shares activation scales across the cond/uncond rows → a
-*different plausible sample*. Pass `--no-cfg-batched` with `w8a8-dyn` when you need run-to-run reproducibility.
-(The medium rung DiT runs batch=1 / sequential CFG, so this doesn't apply to it.)
+All three rung DiTs run **batch=1 / sequential CFG** (one forward at `--cfg 1`, a cond+uncond dual-pass otherwise),
+so `--cfg-batched` is a no-op — the old varlen "batched CFG" behavior retired with the varlen graphs.
 
-### Medium DiT — the N=12 rung ladder (replaces the old varlen tiers)
+### The rung-ladder DiTs (replace the old varlen tiers)
 
-The medium DiT now ships as a **static rung ladder**, built from the repo's own PyTorch model (see [build/](build/README.md)),
-not a dynamic-shape varlen graph. A render of length *L* runs on the **smallest of 12 fixed rungs ≥ L** in one forward,
-with the extra positions masked out of self-attention — so the result is **exact, not tiled**. Both `fp32` and the
-cache-safe int8 `w8a8` are single self-contained files (`dit_{fp32,w8a8}.tflite`; the per-step global-cond preamble
-rides inside as a `gcond` signature, so there is no extra file to ship).
+Every DiT — medium **and** the two small models — now ships as a **static rung ladder**, built from the repo's own
+PyTorch model (see [build/](build/README.md)), not a dynamic-shape varlen graph. A render of length *L* runs on the
+**smallest fixed rung ≥ L** in one forward, with the extra positions masked out of self-attention — so the result is
+**exact, not tiled**. Both `fp32` and the cache-safe int8 `w8a8` are single self-contained files (`dit_{fp32,w8a8}.tflite`;
+the per-step global-cond preamble rides inside as a `gcond` signature, so there is no extra file to ship).
 
 **Why it matters — RAM.** The old varlen graph materialized the full `[heads, S, S]` attention, so peak RAM grew with
 length and hit **~40 GB at the 380 s maximum** — unusable on a normal machine. The rung ladder's static shapes let
@@ -114,14 +113,19 @@ rung sizes and ≈ equal quality to the old `w8a8-dyn` (cos 0.996 per forward).
 
 ![Medium DiT peak RAM — rung ladder vs varlen](docs/img/dit-ram-rung-vs-varlen.png)
 
-**The 12 rungs** (in latents; audio ≈ L / 10.8 s, 4096 = 380 s max):
-`8, 48, 96, 192, 416, 704, 1056, 1496, 2040, 2824, 3536, 4096`.
-The short rungs — **8 (≈0.7 s) · 48 (≈4.5 s) · 96 (≈8.9 s) · 192 (≈18 s)** — keep tiny clips fast (a 1 s clip no longer
-pays for an 18 s render). A length *between* rungs pads up to the next one. The ladder is configurable via `DIT_LADDER`
-in [`build/build_dit.sh`](build/build_dit.sh).
+**Medium — 12 rungs** (in latents; audio ≈ L / 10.8 s, 4096 = 380 s max):
+`8, 48, 96, 192, 416, 704, 1056, 1496, 2040, 2824, 3536, 4096` (via `DIT_LADDER` in [`build/build_dit.sh`](build/build_dit.sh)).
 
-The old medium tiers (`w16a32`, `w8a32`, `w8a8-dyn`, and the previous varlen `fp32`) are retired to
-**`tflite/sa3-m/legacy/`** on HuggingFace.
+**Small (sm-music / sm-sfx) — 8 rungs**, capped at the 2-minute maximum (`valid_T_lat(120) = 1292` latents):
+`8, 48, 96, 192, 416, 704, 1056, 1292` (built by [`build/build_dit_small.sh`](build/build_dit_small.sh)). Same win —
+peak RAM stays **flat at ~0.8 GB** across the whole range, vs the old varlen graph's quadratic climb to ~3.8 GB at
+2 min (**4.5× less**). sm-music and sm-sfx are architecturally identical, so the curve is the same for both:
+
+![Small DiT peak RAM — rung ladder vs varlen](docs/img/dit-ram-rung-vs-varlen-small.png)
+
+The short rungs keep tiny clips fast (a 1 s clip no longer pays for a long render); a length *between* rungs pads up to
+the next one. The old varlen tiers (`fp32`, `w16a32`, `w8a32`, `w8a8-dyn`) for all three families are retired to
+**`tflite/sa3-{m,sm-music,sm-sfx}/legacy/`** on HuggingFace.
 
 ```bash
 # medium DiT — defaults: w8a8 rung DiT + w8a8 SAME-S codec (the `--decoder` now defaults to same-s)
@@ -146,9 +150,9 @@ codec's precision maps directly to audio fidelity; the DiT's changes *which* sam
 you get; the encoder's affects a2a/inpaint latents):
 
 ```bash
-# fastest DiT, reference-quality codec
+# fp32 DiT (bit-exact reference), reference-quality fp32 codec
 ./sa3 --prompt "lofi house loop" --dit sm-music --decoder same-s \
-      --precision fp32 --dit-precision w8a8-dyn
+      --dit-precision fp32 --decoder-precision fp32
 ```
 
 ## Install
@@ -264,9 +268,8 @@ radio with pre-generation, loop, hotswap, MP3/WAV save).
 first run it offers to install the UI-only extras (`gradio`, `pillow`,
 `soundfile`) into `.venv`. In the browser:
 
-- **Precision** dropdown next to the model picker — `fp32` (default) / `w16a32`
-  / `w8a32` / `w8a8-dyn`, applied to the DiT; the codec maps it to its rung tier
-  (`fp32` → fp32, any int8 → w8a8).
+- **Precision** dropdown next to the model picker — `w8a8` (default) / `fp32`,
+  applied to the DiT; the codec maps it to its rung tier (`fp32` → fp32, int8 → w8a8).
 - **LoRA** panel — upload a `.safetensors` adapter or pick one from
   `loras/<model>/` (e.g. `loras/sa3-medium/`), set its strength, stack several;
   settings are remembered per model. The panel is disabled under a quantized
@@ -310,8 +313,8 @@ For sub-realtime latency on a supported device, prefer the GPU siblings:
 | `--seed`              | random   | Set for reproducibility; the chosen seed is printed at the end        |
 | `--cfg`               | 1.0      | Guidance scale; 1.0 = off, >1 toward prompt, <1 toward uncond. ≠1 runs cond+uncond each step |
 | `--apg`               | 1.0      | Adaptive Projected Guidance; only matters when `--cfg ≠ 1`            |
-| `--cfg-batched`       | on       | When `--cfg ≠ 1`, run cond+uncond as one batch=2 invoke on the variable-batch DiT (~7–29% faster on Apple-Silicon AMX). `--no-cfg-batched` → sequential batch=1 dual-pass. Bit-identical at `fp32`/`w8a32` — see [Precision variants](#precision-variants---precision) for `w16a32`/`w8a8-dyn` |
-| `--lora`              | —        | A `.safetensors` LoRA adapter (SA3-native/underfit or PEFT) merged into the DiT, optional `strength=S`; repeat to stack. Requires `--dit-precision fp32` or `w16a32`. See [LoRA](#lora) |
+| `--cfg-batched`       | on       | No-op on the rung DiTs (all batch=1): when `--cfg ≠ 1` they always run a sequential cond+uncond dual-pass. Kept for interface parity with the MLX/TRT backends |
+| `--lora`              | —        | A `.safetensors` LoRA adapter (SA3-native/underfit or PEFT) merged into the DiT, optional `strength=S`; repeat to stack. Requires `--dit-precision fp32` (the int8 w8a8 rung can't be merged). See [LoRA](#lora) |
 | `--lora-strength`     | 1.0      | Default strength for `--lora` adapters without their own `strength=`  |
 | `--init-audio`        | —        | WAV (any format via ffmpeg) input for audio-to-audio / inpaint       |
 | `--init-noise-level`  | 1.0      | σmax; 0.4–0.8 typical for variation, 1.0 = full regen, >1 = overshoot |
@@ -351,19 +354,17 @@ must match `--dit`. The merge is written into a cached copy of the DiT under
 on repeat runs, so the ~5–15 s patch cost is paid once. A medium fp32 cache entry
 is ~5.4 GB — delete `lora_cache/` to reclaim.
 
-Requires an un-quantized DiT: `fp32` (any family) or `w16a32` (small DiTs only).
-Medium now defaults to `w8a8`, but when you pass `--lora` without pinning a
-precision the CLI **auto-selects `fp32`** for you (it prints a one-line note); you
-only hit the error below if you *explicitly* pin an int8 precision alongside
-`--lora`. **LoRA on the quantized
-DiTs (`w8a32` / `w8a8-dyn` / `w4a32`) isn't figured out yet** — those store
-weights as GPTQ-calibrated int8, so merging would mean dequantize → add the LoRA
-delta → re-quantize, and a naive re-quant throws away the GPTQ error-feedback
-grid (you'd get a model that's both LoRA-adapted *and* degraded). Doing it well
-needs a GPTQ pass over the merged weights; until then `--lora` refuses quantized
-precisions (the CLI errors, the web UI disables the LoRA panel). Use fp32/w16a32
-for LoRA — on CPU fp32 is the fast-and-accurate choice anyway, so this is rarely
-a real constraint. **Per-step gating (`steps=`) is also MLX-only** — a frozen
+Requires the `fp32` DiT. Every family now defaults to `w8a8`, but when you pass
+`--lora` without pinning a precision the CLI **auto-selects `fp32`** for you (it
+prints a one-line note); you only hit the error below if you *explicitly* pin
+`w8a8` alongside `--lora`. **LoRA on the int8 `w8a8` rung isn't figured out yet** —
+it stores weights as calibrated int8, so merging would mean dequantize → add the
+LoRA delta → re-quantize, and a naive re-quant throws away the quantization grid
+(you'd get a model that's both LoRA-adapted *and* degraded). Doing it well needs a
+quant pass over the merged weights; until then `--lora` refuses `w8a8` (the CLI
+errors, the web UI disables the LoRA panel). Use `fp32` for LoRA — on CPU it's the
+fast-and-accurate choice anyway, so this is rarely a real constraint. **Per-step
+gating (`steps=`) is also MLX-only** — a frozen
 TFLite graph merges weights once at load; use `optimized/mlx` for step-gated LoRA.
 
 ## Files
@@ -386,10 +387,12 @@ sa3_tflite/
     ├── tokenizer.model            ← SentencePiece model, BUNDLED (~4 MB; T5Gemma tflite is encoder-only)
     ├── defs/
     │   └── tflite_pipeline.py     ← Tokenizer + T5Gemma front-end + pingpong schedule + sampler + WAV
-    └── tflite/                    ← .tflite models (lazy-downloaded; default bundle ~2.4 GB per DiT; ~9.5 GB if you fetch every tier)
+    └── tflite/                    ← .tflite models (lazy-downloaded; default bundle ~0.7 GB small / ~2.4 GB medium)
         ├── t5gemma/encoder_fp16.tflite        564 MB   text encoder (fp16)
-        ├── sa3-sm-music/dit_fp32.tflite       1.8 GB   small music DiT (conditioner baked in)
-        ├── sa3-sm-sfx/dit_fp32.tflite         1.8 GB   small sfx DiT (conditioner baked in)
+        ├── sa3-sm-music/dit_w8a8.tflite       0.5 GB   small music DiT — DEFAULT (cache-safe rung int8)
+        ├── sa3-sm-music/dit_fp32.tflite       1.8 GB   small music DiT (fp32 reference; LoRA / A-B)
+        ├── sa3-sm-sfx/dit_w8a8.tflite         0.5 GB   small sfx DiT — DEFAULT (cache-safe rung int8)
+        ├── sa3-sm-sfx/dit_fp32.tflite         1.8 GB   small sfx DiT (fp32 reference; LoRA / A-B)
         ├── sa3-m/dit_w8a8.tflite              1.6 GB   medium DiT — DEFAULT (cache-safe rung int8)
         ├── sa3-m/dit_fp32.tflite              5.8 GB   medium DiT (fp32 reference; LoRA / A-B)
         ├── same-s/{enc,dec}_{fp32,w8a8}.tflite   rung codec (fp32 ~0.22 GB · w8a8 ~0.07 GB); legacy/ = pre-rung
@@ -413,11 +416,12 @@ is the one weight that IS committed, since the `.tflite` T5Gemma is encoder-only
 
 ## Notes on the design
 
-- **Baked-I/O varlen graphs.** Each `.tflite` is a single self-contained graph
-  with the conditioner and patch/unpatch in-graph, accepting a variable sequence
-  length — so one file serves any `--seconds`. The DiT is a 6-input graph
-  (`x, t, t5_hidden, t5_mask, seconds, local_add_cond`); feed raw T5 outputs and
-  the in-graph conditioner handles prompt-padding + seconds-embedding.
+- **Baked-I/O rung graphs.** Each `.tflite` is a single self-contained graph with the
+  conditioner and patch/unpatch in-graph, so you feed raw T5 outputs and the graph handles
+  prompt-padding + seconds-embedding. One file serves any `--seconds` by dispatching to the
+  **smallest fixed rung ≥ L** (extra positions masked out of attention — exact, not tiled).
+  The DiT rung takes `x, gc, t5_hidden, t5_mask, seconds, local_add_cond, attn_mask`; the
+  per-step global-cond `gc` is produced by the bundled `gcond` signature in the same file.
 - **Per-family precision (no longer fp32-only).** The medium DiT now ships the
   cache-safe **rung `w8a8`** as its default: int8 weights with per-token dynamic
   activation quant, so on an int8-capable CPU (VNNI/AMX) the int8×int8 matmuls run
@@ -425,10 +429,9 @@ is the one weight that IS committed, since the `.tflite` T5Gemma is encoder-only
   int8 on the DiT is a *different* (not worse) sample — per-step error compounds over
   the 8 chaotic sampling steps into another plausible draw, not a degraded one — so the
   bit-exact `fp32` tier ships alongside it (for CPUs without int8 acceleration, LoRA
-  merges, and A/B reference). fp16 (`w16a32`) is *slower* on CPU — XNNPACK dequantizes it
-  to fp32 to matmul — so it's offered only as a half-size near-lossless tier, not a speed
-  one. The small DiTs stay fp32 until they're rung-built. T5Gemma is fp16 (numerically
-  lossless there, and it halves that file).
+  merges, and A/B reference). **All three families** (medium + both small) now ship this
+  rung `fp32`/`w8a8` pair; the old fp16/int8 varlen tiers (`w16a32`/`w8a32`/`w8a8-dyn`) are
+  retired to `legacy/`. T5Gemma is fp16 (numerically lossless there, and it halves that file).
 - **Monotonic audio-to-audio schedule.** The pingpong schedule applies the LogSNR
   shift to the normalized `[1→0]` grid, then scales by σmax, so audio-to-audio
   (σmax < 1) stays monotonically decreasing while keeping all N distilled steps.
@@ -440,13 +443,10 @@ is the one weight that IS committed, since the `.tflite` T5Gemma is encoder-only
   RAM flat. This replaced the dynamic-varlen graphs whose RAM blew up (SAME-L O(S²) →
   16 GB@256; SAME-S → ~50 GB@8192). See [docs/RUNGS.md](docs/RUNGS.md).
 - **CFG (`--cfg ≠ 1`)** combines a cond and an uncond velocity in denoised space
-  (optional APG). The canonical DiT is **variable-batch**, so by default cond+uncond
-  run as **one batch=2 invoke per step** (`--cfg-batched`) — ~7–29% faster on
-  Apple-Silicon (the AMX matrix unit amortizes the weight loads across both rows;
-  measured on an M4 Pro MacBook Pro).
-  `--no-cfg-batched` falls back to a sequential batch=1 dual-pass (like the TensorRT
-  release, whose engine is static-batch=1); the two are bit-identical at `fp32`/`w8a32`
-  (~80 dB at `w16a32`; `w8a8-dyn` diverges by design — batch-shared activation scales).
+  (optional APG). The rung DiTs are **static batch=1**, so cond+uncond always run as a
+  **sequential dual-pass** (like the TensorRT release, whose engine is static-batch=1);
+  `--cfg-batched` is a no-op, kept only for interface parity with the MLX/TRT backends.
+  (The old variable-batch "batched CFG" fast-path retired with the varlen graphs.)
 
 ## License & attribution
 

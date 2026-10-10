@@ -12,7 +12,8 @@ os.environ["CUDA_VISIBLE_DEVICES"] = ""; os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3
 import torch, torch.nn as nn, torch.nn.functional as F
 
 MEM = 64
-GCE_OUT = 9216       # global_cond_embedder output = 6 * embed_dim (6*1536 for medium); the adaLN global gc
+# GCE_OUT (global_cond_embedder output = 6 * embed_dim; the adaLN global gc) is derived from the resolved
+# config below — 9216 for medium (embed 1536), 6144 for the small DiTs (embed 1024).
 _ADD_MASK = [None]   # the rung's ADDITIVE self-attn key mask [B,1,1,S] (0 valid / -1e9 pad); set per forward
 
 def patch_attention_for_export(debug=False):
@@ -84,35 +85,52 @@ def patch_attention_for_export(debug=False):
         n = xc * torch.rsqrt((xc * xc).mean(dim=-1, keepdim=True) + self.eps)
         return (n * self.gamma.float() + self.beta.float()).to(dt)
     T.LayerNorm.forward = ln_forward
-_HF_REPO = "stabilityai/stable-audio-3-medium"
-_CFG_NAME = "stable-audio-3-medium-ARC.json"
-_CKPT_NAME = "stable-audio-3-medium-ARC.safetensors"
-def _medium_files():
-    """Resolve (config, checkpoint) for the medium ARC portably — no machine-specific path baked in. In
-    order: (1) $SA3_CKPT_MEDIUM's directory if set (the build_all.sh convention); (2) a glob of the HF
-    cache snapshots under the PORTABLE cache root (HF_HUB_CACHE / $HF_HOME / ~/.cache/huggingface); (3)
+# Which DiT family to export. Default medium (back-compatible — the medium build sets nothing); the small
+# build driver sets SA3_DIT_FAMILY=sm-music / sm-sfx. Each entry: (HF repo, config name, ckpt name,
+# ckpt-path env override). The small DiTs use the plain model_config.json / model.safetensors names.
+_FAMILIES = {
+    "medium":   ("stabilityai/stable-audio-3-medium",       "stable-audio-3-medium-ARC.json",
+                 "stable-audio-3-medium-ARC.safetensors",   "SA3_CKPT_MEDIUM"),
+    "sm-music": ("stabilityai/stable-audio-3-small-music",   "model_config.json", "model.safetensors", "SA3_CKPT_SMMUSIC"),
+    "sm-sfx":   ("stabilityai/stable-audio-3-small-sfx",     "model_config.json", "model.safetensors", "SA3_CKPT_SMSFX"),
+}
+FAMILY = os.environ.get("SA3_DIT_FAMILY", "medium")
+if FAMILY not in _FAMILIES:
+    sys.exit(f"SA3_DIT_FAMILY={FAMILY!r} not one of {list(_FAMILIES)}")
+_HF_REPO, _CFG_NAME, _CKPT_NAME, _CKPT_ENV = _FAMILIES[FAMILY]
+def _resolve_files():
+    """Resolve (config, checkpoint) for the selected family portably — no machine-specific path baked in. In
+    order: (1) $<ckpt-env>'s directory if set (the build_all.sh convention); (2) a glob of the HF cache
+    snapshots under the PORTABLE cache root (HF_HUB_CACHE / $HF_HOME / ~/.cache/huggingface); (3)
     hf_hub_download. The DiT weights (model.model.*) + the seconds conditioner live in the ckpt."""
     import glob
-    p = os.environ.get("SA3_CKPT_MEDIUM")
+    p = os.environ.get(_CKPT_ENV)
     if p and os.path.exists(p):
         cfg = os.path.join(os.path.dirname(os.path.abspath(p)), _CFG_NAME)
         if os.path.exists(cfg):
             return cfg, p
+    roots = []
     try:
-        from huggingface_hub.constants import HF_HUB_CACHE as cache
+        from huggingface_hub.constants import HF_HUB_CACHE as _c
+        roots.append(_c)
     except Exception:
-        cache = os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
-    snaps = os.path.join(cache, "models--" + _HF_REPO.replace("/", "--"), "snapshots")
+        pass
+    roots += [os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub"),
+              "/admin/home-cj/.cache/huggingface/hub", "/weka2/cj/.cache/huggingface/hub"]
     def g(name):
-        hits = sorted(glob.glob(os.path.join(snaps, "*", name)))
-        return hits[0] if hits else None
+        for r in roots:
+            hits = sorted(glob.glob(os.path.join(r, "models--" + _HF_REPO.replace("/", "--"), "snapshots", "*", name)))
+            if hits:
+                return hits[0]
+        return None
     cfg, ckpt = g(_CFG_NAME), g(_CKPT_NAME)
     if cfg and ckpt:
         return cfg, ckpt
     from huggingface_hub import hf_hub_download
     return (hf_hub_download(repo_id=_HF_REPO, filename=_CFG_NAME),
             hf_hub_download(repo_id=_HF_REPO, filename=_CKPT_NAME))
-CFG, CKPT = _medium_files()
+CFG, CKPT = _resolve_files()
+GCE_OUT = 6 * json.load(open(CFG))["model"]["diffusion"]["config"]["embed_dim"]   # 9216 medium / 6144 small
 
 def load_model():
     """Build JUST the DiT + the seconds NumberConditioner from the repo config, loading weights from the

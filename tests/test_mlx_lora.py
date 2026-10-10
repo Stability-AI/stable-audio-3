@@ -41,7 +41,9 @@ from stable_audio_3.models.lora import (
 # verify byte-convention key-naming parity with underfit's saver. Opt-in:
 # point $SA3_TEST_LORA_ADAPTER at a .safetensors adapter to run this check.
 _LORA_ADAPTER_ENV = os.environ.get("SA3_TEST_LORA_ADAPTER", "")
-UNDERFIT_REFERENCE_CHECKPOINT = Path(_LORA_ADAPTER_ENV or "nonexistent-adapter.safetensors")
+UNDERFIT_REFERENCE_CHECKPOINT = Path(
+    _LORA_ADAPTER_ENV or "nonexistent-adapter.safetensors"
+)
 needs_underfit_reference = pytest.mark.skipif(
     not (_LORA_ADAPTER_ENV and UNDERFIT_REFERENCE_CHECKPOINT.exists()),
     reason="real underfit reference checkpoint not available (set $SA3_TEST_LORA_ADAPTER)",

@@ -239,13 +239,24 @@ def check_maps(map_paths):
         # A map names its engine relative to itself; the fallbacks cover a map that was
         # moved. Every served model is tried, because one checkout holds all of them and a
         # medium-only fallback reported "not built" for a small engine sitting right there.
-        known = [paths.for_model(k).branch_engine for k in paths.MODELS]
+        #
+        # ⚠ Order the fallbacks by the model whose map_name IS this file. Every SHIPPED map
+        # carries engine: null (the engine is built locally, per GPU architecture), so the
+        # fallback list decides -- and an unordered list means its first entry wins for
+        # every model, which paired both shipped small maps with medium's 229-input engine
+        # and reported MISMATCH on a perfectly good map.
+        mine = [k for k in paths.MODELS if paths.MODELS[k]["map_name"] == mp.name]
+        known = ([paths.for_model(k).branch_engine for k in mine]
+                 + [paths.for_model(k).branch_engine for k in paths.MODELS if k not in mine])
         cand = ([mp.parent / eng, ROOT / eng, Path(eng)] if eng else []) + known
         hit = next((c for c in cand if c.exists()), None)
         if hit is None:
+            # Name the model this map is FOR, not always sa3-m -- the hint is the whole
+            # point of the line and a wrong --model builds the wrong engine.
+            slug = paths.for_model(mine[0]).slug if mine else "sa3-m"
             print(f"  NOT BUILT    {mp.name}: {n} layers, no engine on disk")
-            print("               build one:  python scripts/lora/build_branch.py "
-                  "--model sa3-m --download")
+            print(f"               build one:  python scripts/lora/build_branch.py "
+                  f"--model {slug} --download")
             continue
         prov = "prov" if "provenance" in d else "NO-PROV"
         try:

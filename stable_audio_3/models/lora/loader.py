@@ -16,7 +16,24 @@ from .utils import (
 from ...verbose import vprint
 
 
-def load_and_apply_loras(model, lora_ckpt_paths, model_type, svd_bases_path=None):
+def _merge_exclude(ckpt_exclude, extra_exclude):
+    """Union of a checkpoint's saved exclude list and a caller-supplied one.
+
+    Order-preserving and de-duplicated. Returns None when both are empty, since
+    add_lora treats None as "no filtering" and takes a faster path than an empty
+    list would suggest.
+    """
+    if not extra_exclude:
+        return ckpt_exclude
+    merged = list(ckpt_exclude or [])
+    for pat in extra_exclude:
+        if pat not in merged:
+            merged.append(pat)
+    return merged or None
+
+
+def load_and_apply_loras(model, lora_ckpt_paths, model_type, svd_bases_path=None,
+                         exclude=None):
     """Load LoRA checkpoints from disk and attach them to `model`.
 
     - Uses a two-pass approach: first resolves each LoRA's adapter type, then
@@ -35,6 +52,13 @@ def load_and_apply_loras(model, lora_ckpt_paths, model_type, svd_bases_path=None
         model_type: String from the model config, e.g. "diffusion_cond".
         svd_bases_path: Optional path to a precomputed SVD bases .pt file
             (used only by -XS adapter types).
+        exclude: Optional list of substrings to exclude *in addition to* each
+            checkpoint's own saved exclude list. Additive by design: it can only
+            ever skip more layers, never resurrect one the training run
+            deliberately left out. Useful for adapters trained before a pattern
+            was added to the defaults — e.g. the SA3 conditioner's
+            `seconds_total` duration embedder, which older LoRAs adapt because
+            it matched none of the historical exclude patterns.
 
     Returns:
         List of display names (file stems) in the same order as the input paths.
@@ -77,7 +101,11 @@ def load_and_apply_loras(model, lora_ckpt_paths, model_type, svd_bases_path=None
         rank = config_dict.get("rank", infer_global_rank(state_dict))
         alpha = config_dict.get("alpha", rank)
         include = config_dict.get("include", None)
-        exclude = config_dict.get("exclude", None)
+        ckpt_exclude = config_dict.get("exclude", None)
+        lora_exclude = _merge_exclude(ckpt_exclude, exclude)
+        if lora_exclude != ckpt_exclude:
+            added = [p for p in lora_exclude if p not in (ckpt_exclude or [])]
+            print(f"  excluding additionally: {added}")
         is_xs = adapter_type.endswith("-xs")
 
         lora_config = {
@@ -89,12 +117,12 @@ def load_and_apply_loras(model, lora_ckpt_paths, model_type, svd_bases_path=None
             },
         }
         if is_cond:
-            add_lora(model.model, lora_config, include=include, exclude=exclude,
+            add_lora(model.model, lora_config, include=include, exclude=lora_exclude,
                      svd_bases=model_svd_bases if is_xs else None)
-            add_lora(model.conditioner, lora_config, include=include, exclude=exclude,
+            add_lora(model.conditioner, lora_config, include=include, exclude=lora_exclude,
                      svd_bases=cond_svd_bases if is_xs else None)
         else:
-            add_lora(model, lora_config, include=include, exclude=exclude,
+            add_lora(model, lora_config, include=include, exclude=lora_exclude,
                      svd_bases=model_svd_bases if is_xs else None)
 
         prepare_dora_state_dict(state_dict)

@@ -12,7 +12,7 @@ from einops import rearrange
 
 from stable_audio_3.interface.aeiou import audio_spectrogram_image
 from stable_audio_3.inference.distribution_shift import LogSNRShift, FluxDistributionShift, DistributionShift, IdentityDistributionShift
-from stable_audio_3.models.lora import has_lora
+from stable_audio_3.models.lora import has_lora, filter_lora_layers
 from stable_audio_3.interface.reprompt import reprompt as _reprompt_fn, get_model as _reprompt_get_model, is_model_cached as _reprompt_is_model_cached
 
 stable_audio_3_model = None
@@ -104,7 +104,7 @@ def generate_cond(
         preview_every = None
 
     # Parse per-LoRA controls from trailing args
-    # Each LoRA has 5 controls: strength, interval_min, interval_max, layer_filter
+    # Each LoRA has 4 controls: strength, interval_min, interval_max, layer_filter
     lora_configs = None
     if n_loras > 0 and len(lora_args) >= n_loras * 4:
         lora_configs = []
@@ -115,6 +115,19 @@ def generate_cond(
             interval_max = lora_args[off + 2]
             layer_filter = lora_args[off + 3]
             stable_audio_3_model.set_lora_strength(strength, lora_index=i)
+            # The DiT applies layer_filter itself, inside its forward, so it only
+            # ever sees adapters in the transformer. Conditioner adapters are
+            # unreachable from there — for SA3 that is the duration embedder
+            # (conditioners.seconds_total.embedder.embedding.1), the one non-DiT
+            # target LoRA training produces — so typing its name in the box did
+            # nothing. Apply the same filter here to cover it.
+            #
+            # Once per generate is enough: unlike the DiT, which re-filters every
+            # sampling step, nothing re-enables conditioner adapters mid-run. An
+            # empty filter re-enables them, which is the intended default.
+            conditioner = getattr(stable_audio_3_model.model, "conditioner", None)
+            if conditioner is not None:
+                filter_lora_layers(conditioner, layer_filter, lora_index=i)
             lora_configs.append({
                 "lora_index": i,
                 "interval": (interval_min, interval_max),
@@ -360,7 +373,12 @@ def create_sampling_ui(stable_audio_3_model, default_prompt=None):
                         with gr.Row():
                             int_min = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.0, label="Interval min")
                             int_max = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=1.0, label="Interval max")
-                            lyr_filt = gr.Textbox(label="Layer filter", placeholder="")
+                            lyr_filt = gr.Textbox(
+                                label="Layer filter",
+                                placeholder="seconds_total, .transformer.layers",
+                                info="Comma-separated substrings to disable. "
+                                     "Covers conditioner layers too.",
+                            )
                         lora_ui_inputs.extend([strength, int_min, int_max, lyr_filt])
 
             with gr.Accordion("Sampler params", open=False):

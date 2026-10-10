@@ -626,7 +626,10 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             **get_lora_state_dict(self.diffusion.model),
             **get_lora_state_dict(self.diffusion.conditioner)
         }
-        save_lora_safetensors(state_dict, self.lora_config, path)
+        # Pass the model so dora-* row norms are baked in at save time; see
+        # get_dora_norm_state_dict. Cheap, and it spares loaders a base-model load.
+        save_lora_safetensors(state_dict, self.lora_config, path,
+                              model=[self.diffusion.model, self.diffusion.conditioner])
 
     def on_save_checkpoint(self, checkpoint):
         if self.lora_config is not None:

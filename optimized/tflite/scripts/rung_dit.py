@@ -80,20 +80,22 @@ class RungDiT:
     def _input_slots(self, path):
         """Map each of the 7 baked inputs to its CompiledModel buffer position. create_input_buffers()
         follows the SUBGRAPH inputs order == Interpreter.get_input_details() RAW order (NOT the signature
-        alias order args_0..6) — validated max|Δ|=0 vs a name-fed run. Identify each by shape: the two rank-2
-        inputs split by width (gc[1,9216] vs t5m[1,256]); seconds is the only rank-1 input (t is gone — it is
-        folded into gc by gcond.tflite). All rungs share one export graph so subgraph 0's order holds."""
+        alias order args_0..6) — validated max|Δ|=0 vs a name-fed run. Identify each by shape: of the two
+        rank-2 inputs, t5m is [1,256] (COND_TOKENS) and gc is the other one ([1,6*embed_dim] — 9216 medium /
+        6144 small, captured as self.gce_out); seconds is the only rank-1 input (t is gone — folded into gc by
+        gcond). All rungs share one export graph so subgraph 0's order holds."""
         from ai_edge_litert.interpreter import Interpreter
         det = Interpreter(model_path=path).get_input_details()   # raw list order == buffer order
         slots = {}
+        self.gce_out = GCE_OUT                                     # default; overwritten by the gc slot below
         for j, d in enumerate(det):
             shp = [int(s) for s in d["shape"]]
             if len(shp) == 4:
                 slots["am"] = j
-            elif len(shp) == 2 and shp[1] == GCE_OUT:
-                slots["gc"] = j
+            elif len(shp) == 2 and shp[1] == COND_TOKENS:
+                slots["t5m"] = j                          # t5m[1,256]
             elif len(shp) == 2:
-                slots["t5m"] = j
+                slots["gc"] = j; self.gce_out = shp[1]     # gc[1, 6*embed_dim] (9216 medium / 6144 small)
             elif len(shp) == 3 and shp[1] == 257:
                 slots["lac"] = j
             elif len(shp) == 3 and shp[2] == COND_DIM:
@@ -171,10 +173,10 @@ class RungDiT:
             if self._gc_run is None:                                 # 'gcond' signature on self.m (flat RAM)
                 self._gc_inb[0].write(np.ascontiguousarray(sec)); self._gc_inb[1].write(np.ascontiguousarray(tt))
                 self.m.run_by_index(self._gcond_si, self._gc_inb, self._gc_outb)
-                gc = np.asarray(self._gc_outb[0].read(GCE_OUT, np.float32)).reshape(1, GCE_OUT).astype(np.float32)
+                gc = np.asarray(self._gc_outb[0].read(self.gce_out, np.float32)).reshape(1, self.gce_out).astype(np.float32)
             else:                                                    # sibling gcond.tflite SignatureRunner
                 out = self._gc_run(**{self._gc_in[0]: sec, self._gc_in[1]: tt})
-                gc = np.asarray(out[self._gc_out]).reshape(1, GCE_OUT).astype(np.float32)
+                gc = np.asarray(out[self._gc_out]).reshape(1, self.gce_out).astype(np.float32)
             self._gc_cache[key] = gc
         return gc
 

@@ -6,11 +6,10 @@ is wired, plus a precision picker the MLX/TRT UIs don't need:
   - Model picker: sm-music / sm-sfx / medium (hot-swap; the large DiT interpreter
     is cached — first use of a model/precision/length loads + XNNPACK-packs the
     weights, subsequent runs reuse it and only re-bind the conditioning).
-  - Precision picker (one knob for DiT + codec + encoder, like the CLI's --precision),
-    per DiT family: medium is w8a8 (cache-safe rung int8, default) / fp32; the small
-    DiTs are fp32 (default) / w16a32 (fp16, ≈lossless half-size) / w8a32 / w8a8-dyn
-    (GPTQ int8, ¼ size). Switching model resets the precision + decoder to the new
-    family's default.
+  - Precision picker (one knob for DiT + codec + encoder, like the CLI's --precision).
+    Every DiT (medium, sm-music, sm-sfx) is now a rung ladder with two tiers: w8a8
+    (cache-safe rung int8, the default) and fp32 (bit-exact reference / LoRA). Switching
+    model resets the precision + decoder to the family default.
   - CFG 0-10 next to seconds/steps (0 = negative prompt takes over, 0.5 = halfway
     between prompts, 1 = off, >1 = extrapolate) + negative prompt/APG under Advanced.
   - Audio-to-audio: guide audio + init_noise_level (whole clip starts from its
@@ -20,7 +19,7 @@ is wired, plus a precision picker the MLX/TRT UIs don't need:
   - LoRA: file upload + local-folder pick (loras/<model>/) + strength, per-model
     memory, add/remove. Merged once into the DiT weights at load (the frozen graph
     has no per-step gating — so no Min/Max-step sliders, unlike the MLX UI). Only
-    fp32 / w16a32 can be LoRA-merged; the panel disables itself under int8.
+    fp32 can be LoRA-merged; the panel disables itself under the int8 w8a8 rung.
   - Spectrogram-as-player (numpy port, white playhead, click-to-seek), history
     panel, Output options (Auto-play / Auto-download / Infinite Radio / Loop /
     Hotswap), MP3 (via ffmpeg) or WAV saving.
@@ -75,9 +74,10 @@ for _d in LORA_DIR_NAMES.values():
     (LORAS_DIR / _d).mkdir(parents=True, exist_ok=True)
 _DD_NONE = ""   # dropdown placeholder value ("--- Choose a LoRA ---")
 
-# Precisions whose weights can be LoRA-merged (fp32 consts + w16a32 fp16-behind-
-# DEQUANTIZE). Quantized-int8 graphs (w8a32 / w8a8-dyn) can't — see lora_patch.
-LORA_PRECISIONS = ("fp32", "w16a32")
+# Precisions whose weights can be LoRA-merged. Only fp32 now that the shipped DiT tiers are the rung
+# ladder (fp32 + the int8 w8a8 rung); int8 can't be merged (dequant->add->requant loses the grid). See
+# lora_patch. (The retired w16a32 was also mergeable but is no longer an offered tier -> legacy/.)
+LORA_PRECISIONS = ("fp32",)
 # Trained max clip length per model (repo README model table).
 MAX_SECONDS = {"sm-music": 120, "sm-sfx": 120, "medium": 380}
 DEFAULT_DECODERS = dict(DEFAULT_DECODER)
@@ -753,9 +753,8 @@ def build_ui(initial_dit: str, initial_decoder: str, initial_precision: str, *,
         srow_ups = [gr.update(visible=bool(slots[i][0] or slots[i][1] != _DD_NONE))
                     for i in range(3)]
         row_ups = [gr.update(visible=v) for v in nvis]
-        # Reset precision to the new family's default (its tiers don't overlap across
-        # families — e.g. sm's w8a8-dyn is invalid for medium), and swing the LoRA
-        # editor/note to match (int8 defaults like medium's w8a8 can't be LoRA-merged).
+        # Reset precision + decoder to the new family's default, and swing the LoRA
+        # editor/note to match (the w8a8 rung default can't be LoRA-merged, fp32 can).
         new_prec = DEFAULT_DIT_PRECISIONS.get(dit_name, "fp32")
         lora_ok = new_prec in LORA_PRECISIONS
         return (gr.update(value=DEFAULT_DECODERS.get(dit_name, "same-s")),
@@ -783,7 +782,7 @@ def build_ui(initial_dit: str, initial_decoder: str, initial_precision: str, *,
             # API callers / stale state. get_patched_dit would raise anyway — surface
             # it as a clean note + skip the LoRA rather than failing the generation.
             notes.append(f"LoRA ignored — precision {precision} can't be LoRA-merged "
-                         f"(needs fp32 or w16a32)")
+                         f"(needs fp32)")
             lora_specs = None
         # blank or -1 → random seed, kept small (1-9999) for readability
         try:
@@ -1006,9 +1005,9 @@ def build_ui(initial_dit: str, initial_decoder: str, initial_precision: str, *,
         gr.Markdown(
             "# SA3 TFLite — portable CPU (XNNPACK)\n"
             "Text-to-audio, CFG + negative prompt, audio-to-audio, inpainting, LoRA. "
-            "Precision is per-family — **medium**: w8a8 (cache-safe rung int8, default) / fp32; "
-            "**small**: fp32 (default) / w16a32 / w8a32 / w8a8-dyn. Picking a model resets "
-            "the precision + decoder to that family's default. First use of a "
+            "Every DiT (medium / sm-music / sm-sfx) is a rung ladder with two tiers: "
+            "**w8a8** (cache-safe rung int8, the default) and **fp32** (reference / LoRA). "
+            "Picking a model resets precision + decoder to the family default. First use of a "
             "model/precision loads weights; subsequent runs are cached."
         )
         st = gr.State({"current": None, "queued": None, "history": []})
@@ -1047,8 +1046,8 @@ def build_ui(initial_dit: str, initial_decoder: str, initial_precision: str, *,
                 with gr.Accordion("LoRA", open=False):
                     # Shown only under a quantized precision (LoRA disabled there).
                     lora_note = gr.Markdown(
-                        "*LoRA needs precision **fp32** or **w16a32** — quantized-int8 "
-                        "graphs (w8a32 / w8a8-dyn) can't be LoRA-merged.*",
+                        "*LoRA needs precision **fp32** — the int8 **w8a8** rung can't be "
+                        "LoRA-merged (dequant→add→requant loses the int8 grid).*",
                         visible=initial_precision not in LORA_PRECISIONS)
                     with gr.Group(visible=initial_precision in LORA_PRECISIONS) as lora_editor:
                         _dd0 = _lora_dd_choices(initial_dit)
@@ -1142,8 +1141,8 @@ def build_ui(initial_dit: str, initial_decoder: str, initial_precision: str, *,
                       ).then(None, js=_JS_FIX_SLIDERS)
 
         def on_precision_change(prec):
-            """Quantized-int8 precisions can't be LoRA-merged — hide the editor
-            and show the note. fp32 / w16a32 re-enable it."""
+            """The int8 w8a8 rung can't be LoRA-merged — hide the editor
+            and show the note. fp32 re-enables it."""
             disabled = prec not in LORA_PRECISIONS
             return gr.update(visible=disabled), gr.update(visible=not disabled)
         precision_dd.change(on_precision_change, inputs=[precision_dd],
@@ -1283,10 +1282,9 @@ def main():
     ap.add_argument("--decoder", choices=list(DEC_REL.keys()), default=None,
                     help="Initial decoder. Default: pairs with --dit")
     ap.add_argument("--precision", choices=list(PRECISIONS), default=None,
-                    help="Initial precision (switchable at runtime). Default: the DiT "
-                         "family's own default (medium w8a8, small DiTs fp32). Tiers — "
-                         "medium: w8a8 (cache-safe rung int8) / fp32; small: fp32 / "
-                         "w16a32 (fp16) / w8a32 / w8a8-dyn (GPTQ int8)")
+                    help="Initial precision (switchable at runtime). Default: w8a8 for every "
+                         "family. All DiTs are rung ladders with two tiers: w8a8 (cache-safe "
+                         "rung int8) / fp32 (bit-exact reference / LoRA).")
     ap.add_argument("--default-seconds", type=float, default=30.0,
                     help="Length to pre-warm the initial DiT at")
     ap.add_argument("--default-steps", type=int, default=8)

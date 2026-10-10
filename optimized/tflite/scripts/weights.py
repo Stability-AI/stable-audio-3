@@ -28,18 +28,18 @@ SCRIPT_DIR = Path(__file__).resolve().parent.parent
 # T5Gemma is in SHARED because every bundle needs it. All three families ship
 # the SAME-S codec by default (medium's latents decode fine on SAME-S — ~7x
 # faster and ~5x smaller than SAME-L, which lazy-downloads if asked). Each ships
-# at its runtime default precision — medium DiT w8a8 (the cache-safe rung int8),
-# the small DiTs fp32 (no rung w8a8 yet); SAME codec w8a8 (quality-free and ~5x
-# smaller). Any other tier lazy-downloads on demand.
+# at its runtime default precision — all three DiTs now ship the cache-safe rung
+# w8a8 (int8); SAME codec w8a8 (quality-free and ~5x smaller). Any other tier
+# (fp32, etc.) lazy-downloads on demand.
 
 DIT_BUNDLES: dict[str, list[tuple[str, str]]] = {
     "sm-music": [
-        ("models/tflite/sa3-sm-music/dit_fp32.tflite", "tflite/sa3-sm-music/dit_fp32.tflite"),
+        ("models/tflite/sa3-sm-music/dit_w8a8.tflite", "tflite/sa3-sm-music/dit_w8a8.tflite"),
         ("models/tflite/same-s/enc_w8a8.tflite",       "tflite/same-s/enc_w8a8.tflite"),
         ("models/tflite/same-s/dec_w8a8.tflite",       "tflite/same-s/dec_w8a8.tflite"),
     ],
     "sm-sfx": [
-        ("models/tflite/sa3-sm-sfx/dit_fp32.tflite",   "tflite/sa3-sm-sfx/dit_fp32.tflite"),
+        ("models/tflite/sa3-sm-sfx/dit_w8a8.tflite",   "tflite/sa3-sm-sfx/dit_w8a8.tflite"),
         ("models/tflite/same-s/enc_w8a8.tflite",       "tflite/same-s/enc_w8a8.tflite"),
         ("models/tflite/same-s/dec_w8a8.tflite",       "tflite/same-s/dec_w8a8.tflite"),
     ],
@@ -56,25 +56,26 @@ SHARED: list[tuple[str, str]] = [
 
 # Human-friendly bundle sizes (for the install prompt). Exact, from HF metadata.
 BUNDLE_SIZES = {
-    "sm-music": "2.0 GB  (small music DiT fp32 + SAME-S codec w8a8)",
-    "sm-sfx":   "2.0 GB  (small sfx DiT fp32 + SAME-S codec w8a8)",
+    "sm-music": "0.7 GB  (small music DiT w8a8 + SAME-S codec w8a8)",
+    "sm-sfx":   "0.7 GB  (small sfx DiT w8a8 + SAME-S codec w8a8)",
     "medium":   "1.8 GB  (medium DiT w8a8 + SAME-S codec w8a8)",
 }
 # T5Gemma (shared, fp16) adds ~0.6 GB the first time any bundle is fetched.
 
-# DiT precision tiers are PER-FAMILY. The medium DiT now ships as the static RUNG ladder — exactly two
-# files, dit_fp32.tflite + dit_w8a8.tflite, built from stable_audio_3.models.dit by build/build_dit.sh and
-# merged into one weight-shared multi-signature .tflite (needs litert >= 2.2.0, like the SAME rungs), so
-# RAM stays flat across length. The medium's old varlen tiers (w16a32/w8a32/w8a8-dyn) are retired to
-# tflite/sa3-m/legacy/. The small DiTs are still the varlen graphs (fp32 + fp16/int8 tiers) until they're
-# rung-built too. NB: int8 on the DiT is NOT bit-identical (the distilled few-step sampler is chaotically
-# sensitive, so w8a8 is a different — not necessarily worse — sample); it is the SPEED tier that supersedes
-# the old published w8a8-dyn. w8a8 is now the medium default (CJ's call 2026-10-09); fp32 lazy-downloads
-# for LoRA merges or a bit-exact A/B. wXaY = weight/activation bits ("16" = fp16).
+# DiT precision tiers are PER-FAMILY. ALL THREE DiTs now ship as static RUNG ladders — exactly two files
+# each, dit_fp32.tflite + dit_w8a8.tflite, built from stable_audio_3.models.dit by build/build_dit.sh
+# (medium) / build/build_dit_small.sh (sm-music, sm-sfx) and merged into one weight-shared multi-signature
+# .tflite (needs litert >= 2.2.0, like the SAME rungs), so RAM stays flat across length. medium's ladder tops
+# at 4096 (380 s); the small DiTs' ladder tops at 1292 (their 2-min max). The old varlen tiers
+# (fp32/w16a32/w8a32/w8a8-dyn) are retired to tflite/sa3-*/legacy/. NB: int8 on the DiT is NOT bit-identical
+# (the distilled few-step sampler is chaotically sensitive, so w8a8 is a different — not necessarily worse —
+# sample); it supersedes the old published w8a8-dyn. w8a8 is the default for every family (CJ's calls:
+# 2026-10-09 medium, 2026-10-10 small); fp32 lazy-downloads for LoRA merges or a bit-exact A/B. wXaY =
+# weight/activation bits ("16" = fp16).
 DIT_PRECISIONS_BY_FAMILY = {
     "medium":   ("fp32", "w8a8"),
-    "sm-music": ("fp32", "w16a32", "w8a32", "w8a8-dyn"),
-    "sm-sfx":   ("fp32", "w16a32", "w8a32", "w8a8-dyn"),
+    "sm-music": ("fp32", "w8a8"),
+    "sm-sfx":   ("fp32", "w8a8"),
 }
 DIT_SUBDIR = {"sm-music": "sa3-sm-music", "sm-sfx": "sa3-sm-sfx", "medium": "sa3-m"}
 # Union across families — what --precision / --dit-precision may name (validated per-family at load).

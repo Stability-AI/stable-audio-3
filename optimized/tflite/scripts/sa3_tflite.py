@@ -84,9 +84,9 @@ DEC_REL = {d: dec_rel(d) for d in ("same-s", "same-l")}
 ENC_REL = {d: enc_rel(d) for d in ("same-s", "same-l")}
 T5_REL = "models/tflite/t5gemma/encoder_fp16.tflite"
 DEFAULT_DECODER = {"sm-music": "same-s", "sm-sfx": "same-s", "medium": "same-s"}
-# Default DiT precision per family. medium ships the rung w8a8 (cache-safe int8, ~equal quality to the
-# retired w8a8-dyn, flat RAM) as its default; the small DiTs have no rung w8a8, so they stay fp32.
-DEFAULT_DIT_PRECISION = {"medium": "w8a8", "sm-music": "fp32", "sm-sfx": "fp32"}
+# Default DiT precision per family — all three now ship the cache-safe rung w8a8 (int8, flat RAM, ~equal
+# quality to the retired varlen w8a8-dyn) as the default; fp32 is the opt-in reference/LoRA tier.
+DEFAULT_DIT_PRECISION = {"medium": "w8a8", "sm-music": "w8a8", "sm-sfx": "w8a8"}
 
 # The SAME codec runs as static RUNG models: RungEncoder/RungDecoder auto-dispatch the optimal rung
 # per length (no chunk-size knob), holding RAM flat while the old dense-varlen graphs blew up
@@ -482,14 +482,14 @@ def main():
                          "If omitted, prompts interactively with an arrow-key picker.")
     ap.add_argument("--precision", choices=list(PRECISIONS), default=None,
                     help="Global precision default: sets the DiT directly and maps to the SAME codec "
-                         "(fp32->fp32, any int8 -> the codec's w8a8). wXaY = weight/activation bits. "
-                         "Tiers are per-family: medium 'w8a8'/'fp32'; small 'fp32'/'w16a32'/'w8a32'/"
-                         "'w8a8-dyn'. Defaults when omitted: DiT per-family (medium w8a8, small fp32), "
-                         "codec w8a8. Per-component overrides below; T5Gemma is single-precision.")
+                         "(fp32->fp32, any int8 -> the codec's w8a8). wXaY = weight/activation bits. All "
+                         "three DiTs are rung ladders with the same two tiers: 'w8a8' / 'fp32'. Defaults "
+                         "when omitted: DiT w8a8 (every family), codec w8a8. Per-component overrides below; "
+                         "T5Gemma is single-precision.")
     ap.add_argument("--dit-precision", choices=list(PRECISIONS), default=None,
-                    help="Override the DiT precision (medium: w8a8 | fp32; small: fp32 | w16a32 | "
-                         "w8a32 | w8a8-dyn). int8 gives a *different* (not worse) draw on the 8-step "
-                         "sampler; medium defaults to the cache-safe w8a8 rung, fp32 is the bit-exact reference.")
+                    help="Override the DiT precision ('w8a8' | 'fp32', every family). int8 gives a "
+                         "*different* (not worse) draw on the 8-step sampler; w8a8 is the cache-safe rung "
+                         "default, fp32 is the bit-exact reference (and the pick for LoRA merges).")
     ap.add_argument("--decoder-precision", choices=list(CODEC_PRECISIONS), default=None,
                     help="SAME decoder rung tier: 'w8a8' (default — faster, ~half RAM, quality-free) "
                          "or 'fp32' (bit-exact / for CPUs without int8 acceleration).")

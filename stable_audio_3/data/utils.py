@@ -216,7 +216,7 @@ def compute_effective_seq_len_from_conditioning(
     conditioning: list,
     sample_rate: int,
     downsampling_ratio: int = 1,
-    device: str = "cuda"
+    device: str = None
 ) -> Optional[torch.Tensor]:
     """
     Compute effective sequence lengths from seconds_total in conditioning dicts.

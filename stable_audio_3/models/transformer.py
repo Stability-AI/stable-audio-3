@@ -72,6 +72,7 @@ def precompute_varlen_metadata(padding_mask: torch.Tensor):
     }
 
 from .utils import compile
+from ..utils.device import disable_autocast
 
 
 def _left_pad_to_match(emb, target_len):
@@ -161,19 +162,25 @@ def _sliding_window_chunked_halo_sdpa(q, k, v, w_left, w_right, chunk_size=_SLID
 
 def checkpoint(function, *args, **kwargs):
     kwargs.setdefault("use_reentrant", False)
-    # Preserve autocast context during recomputation to avoid dtype mismatches
+    # Preserve autocast context during recomputation to avoid dtype mismatches.
+    # Device-generic: torch.is_autocast_enabled() with no args only checks CUDA,
+    # which silently skips this on MPS/CPU autocast.
     if "context_fn" not in kwargs:
         from torch.amp import autocast
-        import functools
-        # Get current autocast state
-        if torch.is_autocast_enabled():
-            dtype = torch.get_autocast_dtype('cuda')
-            def get_contexts():
-                return (
-                    autocast('cuda', dtype=dtype),
-                    autocast('cuda', dtype=dtype),
-                )
-            kwargs["context_fn"] = get_contexts
+        for _device_type in ("cuda", "mps", "cpu"):
+            try:
+                _ac_enabled = torch.is_autocast_enabled(_device_type)
+            except (RuntimeError, ValueError, TypeError):
+                _ac_enabled = False
+            if _ac_enabled:
+                dtype = torch.get_autocast_dtype(_device_type)
+                def get_contexts(_device_type=_device_type, dtype=dtype):
+                    return (
+                        autocast(_device_type, dtype=dtype),
+                        autocast(_device_type, dtype=dtype),
+                    )
+                kwargs["context_fn"] = get_contexts
+                break
     return torch.utils.checkpoint.checkpoint(function, *args, **kwargs)
 
 
@@ -273,7 +280,7 @@ class RotaryEmbedding(nn.Module):
         t = torch.arange(seq_len, device = device)
         return self.forward(t)
 
-    @autocast("cuda", enabled = False)
+    @disable_autocast
     def forward(self, t):
         device = self.inv_freq.device
 
@@ -299,7 +306,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim = -1)
 
 
-@autocast("cuda", enabled = False)
+@disable_autocast
 def apply_rotary_pos_emb(t, freqs, scale = 1):
     out_dtype = t.dtype
 

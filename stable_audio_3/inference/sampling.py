@@ -35,10 +35,13 @@ def build_schedule(
     """
     n_points = steps + 1 if include_endpoint else steps
 
+    # Warp a normalized schedule, then scale it to the requested audio-to-audio
+    # starting noise level.  Warping an already-scaled schedule can move interior
+    # points above sigma_max even when the shift itself is monotonic.
     if include_endpoint:
-        t = torch.linspace(sigma_max, 0, n_points, device=device)
+        t = torch.linspace(1.0, 0, n_points, device=device)
     else:
-        t = torch.linspace(sigma_max, 0, n_points + 1, device=device)[:-1]
+        t = torch.linspace(1.0, 0, n_points + 1, device=device)[:-1]
 
     if dist_shift is not None:
         seq_len = effective_seq_len if effective_seq_len is not None else fallback_seq_len
@@ -50,16 +53,17 @@ def build_schedule(
             seq_len = max(int(seq_len), 1)
         t = dist_shift.shift(t, seq_len)
 
-        # Ensure the first timestep remains aligned with sigma_max after shifting.
-        # This keeps the schedule consistent with the initialization in sample_diffusion(),
-        # which mixes init_data using sigma_max.
-        if isinstance(t, torch.Tensor):
-            sigma_max_tensor = t.new_tensor(sigma_max)
-            if t.ndim == 1:
-                t[0] = sigma_max_tensor
-            else:
-                # For batched/per-element schedules, enforce sigma_max at the first time index.
-                t[..., 0] = sigma_max_tensor
+    t = t * sigma_max
+
+    # Keep the schedule's first point exactly aligned with sample_diffusion()'s
+    # init_data mix. Distribution shifts preserve this endpoint; assigning it
+    # explicitly also avoids small floating-point drift.
+    if isinstance(t, torch.Tensor):
+        sigma_max_tensor = t.new_tensor(sigma_max)
+        if t.ndim == 1:
+            t[0] = sigma_max_tensor
+        else:
+            t[..., 0] = sigma_max_tensor
 
     return t
 

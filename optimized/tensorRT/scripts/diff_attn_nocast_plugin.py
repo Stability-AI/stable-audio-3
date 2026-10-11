@@ -31,6 +31,7 @@ import torch
 import tensorrt.plugin as trtp
 from typing import Tuple
 
+from _arch import detect_arch
 from diff_swa_ptx_kernel import generate_diff_swa_ptx
 
 WINDOW = 17
@@ -48,13 +49,20 @@ _ptx_cache: dict = {}
 SWA_AOT_BACKEND = os.environ.get("SA3_SWA_AOT", "mma").lower()
 
 
-def _ptx_for(num_heads: int):
-    """(kernel_name, ptx) for this head count, generated once and cached."""
-    if num_heads not in _ptx_cache:
-        _ptx_cache[num_heads] = generate_diff_swa_ptx(
+def _ptx_for(num_heads: int, arch: str):
+    """(kernel_name, ptx) for this head count and target arch, generated once and cached.
+
+    The cache key includes `arch`: a single process may build engines for more than one
+    GPU (e.g. CUDA_VISIBLE_DEVICES changed between builds), and a PTX blob generated for
+    one arch must never be reused for another — the .target is a minimum requirement, so
+    reusing a newer-arch blob on an older card fails at load time.
+    """
+    key = (num_heads, arch)
+    if key not in _ptx_cache:
+        _ptx_cache[key] = generate_diff_swa_ptx(
             window=WINDOW, D=HEAD_DIM, H=num_heads,
-            warps_per_block=WARPS_PER_BLOCK)
-    return _ptx_cache[num_heads]
+            warps_per_block=WARPS_PER_BLOCK, target_sm=arch)
+    return _ptx_cache[key]
 
 _stream_cache = {}
 _triton_fn = None
@@ -126,7 +134,9 @@ def diff_attn_swa_aot(q_bat: trtp.TensorDesc, k_bat: trtp.TensorDesc,
                 extra)
 
     # Hand-written scalar kernel: one warp per query, strides passed at runtime.
-    name, ptx = _ptx_for(num_heads)
+    # Target the arch we are actually building for -- this scalar kernel uses no
+    # arch-specific instructions, so it is the path that has to work on older GPUs.
+    name, ptx = _ptx_for(num_heads, detect_arch())
     extra = trtp.SymIntExprs(5)
     extra[0] = N
     extra[1] = H2 * D        # stride between positions, input

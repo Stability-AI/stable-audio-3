@@ -7,6 +7,7 @@ from stable_audio_3.factory import (
     create_autoencoder_from_config,
     create_diffusion_cond_from_config,
 )
+from stable_audio_3.utils.device import resolve_device
 
 
 def copy_state_dict(model, state_dict):
@@ -61,9 +62,10 @@ def load_autoencoder(config_path: str, ckpt_path: str, device: str = "cpu"):
 def load_diffusion_cond(
     model_config,
     ckpt_path: str,
-    device: str = "cuda",
+    device: str = None,
     model_half: bool = False,
 ):
+    device = resolve_device(device)
     model = create_diffusion_cond_from_config(model_config)
     copy_state_dict(model, load_file(ckpt_path))
     model.to(device).eval().requires_grad_(False)

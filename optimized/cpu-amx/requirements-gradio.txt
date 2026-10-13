@@ -1,0 +1,4 @@
+# Web UI extras (on top of requirements.txt).
+gradio>=4.0
+pillow>=10.0
+soundfile>=0.12

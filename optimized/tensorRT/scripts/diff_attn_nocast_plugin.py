@@ -27,6 +27,8 @@ the kernel, which is also what the Triton path does via o[:, :, :H] - o[:, :, H:
 """
 import os
 
+import numpy as np
+import numpy.typing as npt
 import torch
 import tensorrt.plugin as trtp
 from typing import Tuple
@@ -62,7 +64,8 @@ _triton_fn = None
 
 @trtp.register("samel::diff_attn_swa")
 def diff_attn_swa_desc(q_bat: trtp.TensorDesc, k_bat: trtp.TensorDesc,
-                        v_bat: trtp.TensorDesc, num_heads: int) -> trtp.TensorDesc:
+                        v_bat: trtp.TensorDesc,
+                        num_heads: npt.NDArray[np.int64]) -> trtp.TensorDesc:
     out = q_bat.like()
     out.shape_expr[-2] = q_bat.shape_expr[-2] // 2
     return out
@@ -70,7 +73,8 @@ def diff_attn_swa_desc(q_bat: trtp.TensorDesc, k_bat: trtp.TensorDesc,
 
 @trtp.impl("samel::diff_attn_swa")
 def diff_attn_swa_impl(q_bat: trtp.Tensor, k_bat: trtp.Tensor, v_bat: trtp.Tensor,
-                         num_heads: int, outputs: Tuple[trtp.Tensor], stream: int):
+                         num_heads: npt.NDArray[np.int64],
+                         outputs: Tuple[trtp.Tensor], stream: int):
     global _triton_fn
     if stream not in _stream_cache:
         _stream_cache[stream] = torch.cuda.ExternalStream(stream)
@@ -86,13 +90,14 @@ def diff_attn_swa_impl(q_bat: trtp.Tensor, k_bat: trtp.Tensor, v_bat: trtp.Tenso
 
         # NO dtype cast — Triton auto-compiles for the input dtype
         o = _triton_fn(q, k, v, window=17)
-        H = num_heads
+        H = int(np.asarray(num_heads).reshape(-1)[0])
         out_t.copy_(o[:, :, :H, :] - o[:, :, H:, :])
 
 
 @trtp.aot_impl("samel::diff_attn_swa")
 def diff_attn_swa_aot(q_bat: trtp.TensorDesc, k_bat: trtp.TensorDesc,
-                       v_bat: trtp.TensorDesc, num_heads: int,
+                       v_bat: trtp.TensorDesc,
+                       num_heads: npt.NDArray[np.int64],
                        outputs: Tuple[trtp.TensorDesc], tactic: int = None
                        ) -> Tuple[str, str, trtp.KernelLaunchParams, trtp.SymIntExprs]:
     """AOT PTX variant — makes the engine graph-capturable. See module docstring.
@@ -106,6 +111,7 @@ def diff_attn_swa_aot(q_bat: trtp.TensorDesc, k_bat: trtp.TensorDesc,
     H2 = q_bat.shape_expr[2]
     D = q_bat.shape_expr[3]
     H_out = H2 // 2
+    H = int(np.asarray(num_heads).reshape(-1)[0])
 
     if SWA_AOT_BACKEND == "mma":
         # Block-tiled tensor-core kernel. Its scalars are baked in as constexprs at
@@ -113,7 +119,7 @@ def diff_attn_swa_aot(q_bat: trtp.TensorDesc, k_bat: trtp.TensorDesc,
         # (query tile, output head, batch); shared memory holds the Q/K/V tiles.
         import swa_mma_aot
         from _arch import detect_arch
-        name, ptx, shared, warps = swa_mma_aot.build(num_heads, detect_arch())
+        name, ptx, shared, warps = swa_mma_aot.build(H, detect_arch())
         extra = trtp.SymIntExprs(1)
         extra[0] = N
         return (name, ptx,
@@ -126,7 +132,7 @@ def diff_attn_swa_aot(q_bat: trtp.TensorDesc, k_bat: trtp.TensorDesc,
                 extra)
 
     # Hand-written scalar kernel: one warp per query, strides passed at runtime.
-    name, ptx = _ptx_for(num_heads)
+    name, ptx = _ptx_for(H)
     extra = trtp.SymIntExprs(5)
     extra[0] = N
     extra[1] = H2 * D        # stride between positions, input

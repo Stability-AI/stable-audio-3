@@ -22,9 +22,11 @@ Args:
 Optional flags:
     --opt N           Optimization point on L axis (default 1292). TRT picks
                        kernels to run fastest at this shape.
-    --precision P     "bf16" (default, matches canonical build) or "fp32"
-                       (omits the BF16 flag entirely — forces full FP32
-                       execution; engine ~2x larger, build slower).
+    --precision P     "bf16" (default; matches the sa3-m-bf16 recipe, NOT the
+                       canonical fp16-mixed one — this script builds from the raw
+                       fp32 dit.onnx) or "fp32" (omits the BF16 flag entirely —
+                       forces full FP32 execution; engine ~2x larger, build
+                       slower).
 
 Build flags mirror sa3-sm-music / sa3-m in build_from_onnx.py: BF16 +
 EXPLICIT_BATCH, 16 GB workspace. With --precision fp32 the BF16 flag is
@@ -188,7 +190,8 @@ def main():
                     help="Maximum L for the profile (default 4096). Set to "
                          "match min for a fully-static engine.")
     ap.add_argument("--precision", choices=("bf16", "fp32"), default="bf16",
-                    help="Builder precision: bf16 (default, matches canonical) "
+                    help="Builder precision: bf16 (default; matches the "
+                         "sa3-m-bf16 recipe, not the canonical fp16-mixed one) "
                          "or fp32 (omits BF16 flag, forces FP32 throughout).")
     args = ap.parse_args()
     build_dit(args.target_name, args.profile_min, args.output_name,

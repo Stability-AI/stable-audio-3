@@ -119,32 +119,170 @@ Omit `--dit` / `--decoder` for an interactive arrow-key picker. Relative
 
 ### DiT precision (`--precision`)
 
-The default resolves per model — no flag needed for the recommended setup:
+`fp16` is the default for every model — no flag needed for the recommended setup:
 
 | model            | default     | why                                                        |
 |------------------|-------------|------------------------------------------------------------|
-| `medium`         | `bf16`      | FMHA-fused (0 → 96 fused attention nodes) → **1.8× @256 / 4.7× @4096** vs fp16-mixed, within the perceptual floor |
-| `sm-music`/`sm-sfx` | `fp16mixed` | standard attention — already fuses in fp16-mixed           |
+| `medium`         | `fp16` | FMHA-fused (96 fused attention nodes) **and** fp32-accurate at every length |
+| `sm-music`/`sm-sfx` | `fp16` | standard attention — already fuses in fp16           |
 
-`--precision` also takes `fp16mixed` and `fp32` explicitly:
+`--precision` also takes `fp8` (all DiTs) and `fp32` explicitly:
 
-- **`bf16`** — *medium only.* Same `dit.onnx` as fp32, built with `BuilderFlag.BF16`;
-  bf16 carries fp32's range so the FP32-softmax islands vanish and TRT's FMHA fuser
-  fires. **Not seed-reproducible vs fp16-mixed** — the medium DiT uses *differential*
-  attention (cancellation-sensitive), so bf16 is a different-but-equal take per seed
-  (quality within the re-seed floor; exact samples differ). Same varlen profile
-  (L 1..4096, opt 1292) and full mode/feature set as the other precisions.
-- **`fp16mixed`** — canonical FP16 trunk + FP32 islands. Bit-reproducible; use it when
-  you need exact per-seed reproducibility or max per-step fidelity.
+- **`fp16`** — canonical **and default for every DiT** (formerly `fp16mixed`; every
+  tier is mixed-precision, so the qualifier was dropped). FP16 trunk, FP32 islands
+  around RMSNorm and RoPE generation, and an FP16 attention core (QK^T → Softmax →
+  P·V) so TRT's FMHA fuser fires. Teacher-forced velocity cos **1.0000** vs the FP32
+  engine at every length. Bit-reproducible run to run.
+  <br>Medium used to default to a uniform-`bf16` engine because this engine's
+  attention core was stuck in FP32 and therefore unfused — 0 fused MHA nodes.
+  Bounding the RoPE island before QK^T fixed that (**4.3× faster at L=4096**), which
+  retired the `bf16` tier entirely (it also drifted at long sequence — see below).
+  Engines built before 2026-07 are the slow variant; rebuild with
+  `build_from_onnx.py sa3-m`.
+- **`fp8`** — *medium: the max-speed clean tier, calibrated; sm-music/sm-sfx: a clean
+  weight-halving tier (see the end of this bullet).* On **medium**: fp8 E4M3 on the 176
+  linear GEMMs + bf16 fused FMHA (96 nodes) + a **baked fp32 RoPE constant table** (position
+  cos/sin computed host-side at build and frozen as a graph constant — no in-graph trig,
+  so the island is precision-policy-robust and cross-runtime-stable). **~1.3× faster than
+  `fp16` at every length** (H200, same-run round-robin: 1.40× @L129 / 1.32× @L1292 /
+  1.34× @L4092 — also ahead of `bf16`) and **clean at long sequence** (latent std 0.86 vs
+  eager 0.95, **0.000% clip** at 2-min and 6-min), so it stays clean exactly where `bf16`
+  clips. The fp8 scales are **calibrated on real conditioning** (per-tensor activation amax +
+  per-channel weight scales from @ryanontheinside's #47, captured via `make_calib.py`) — a
+  **speed-free** change (31.2 vs the earlier uncalibrated 30.8 ms/fwd) that lifts worst-step
+  velocity-cos vs fp32 on adversarial seeds **0.52/0.57/0.64 → 0.92/0.94/0.92** (steps 1–7
+  match the fully-calibrated reference within ~0.001). It remains a **speed tier over an
+  already-good default, not a fidelity upgrade over it**: single-step velocity cos ~0.92–0.94
+  (below fp16's ~1.0) but the 8-step render stays coherent — it just no longer collapses
+  at the highest-noise first step the way the uncalibrated engine did. **Capped at L≤4096** —
+  the baked table is sized to the profile max, which is *also* the SAME-L decoder's own cap,
+  so this is not a new end-to-end limit; longer renders are rejected (a re-bake would be
+  needed). **Not seed-reproducible vs fp16.** Built weakly-typed `EXPLICIT_BATCH` +
+  `BF16` + `FP8` + `OBEY_PRECISION_CONSTRAINTS` (rebuild: `build_from_onnx.py sa3-m-fp8`;
+  producer: `build/build_dit_bf16.py` RoPE-baker + `build/transplant_scales.py` calibrated-scale
+  transplant; identity check: `scripts/verify_fp8_rope.py`; calibration by @ryanontheinside,
+  [#47](https://github.com/Stability-AI/stable-audio-3/pull/47)).
+  <br>On **sm-music / sm-sfx** fp8 is a **different, simpler recipe** — fp8 E4M3 grafted onto
+  the linear GEMMs of the fp16 graph (attention stays fp16-fused, fp32 islands untouched;
+  no baked RoPE — these DiTs never had bf16's long-angle problem). It's a **clean weight-halving
+  tier** (engine 479 vs 936 MB, velocity-cos **~0.99** vs eager, clip% at/below fp16) that
+  is only **marginally faster (~1.1×)**: a small DiT's ~5 ms forward at batch 1 is overhead-bound,
+  so fp8's GEMM savings barely show. Default stays fp16. Rebuild: `build_from_onnx.py
+  sa3-sm-music-fp8` / `sa3-sm-sfx-fp8`; producer: `build/make_dit_fp8_smalldit.py`. Not
+  seed-reproducible vs fp16.
 - **`fp32`** — pure FP32, bit-equivalent to PyTorch eager (~2× slower, ~2× VRAM).
 
+> **Retired: `bf16` (was medium-only).** A uniform-bf16 trunk was ~3% faster than
+> `fp16` but **drifted at long sequence** — weakly-typed BF16 evaluated RoPE's
+> rotation angle in bf16, which reaches ~4155 rad at L=4092 where bf16's spacing is
+> 32 rad (> 2π), destroying position info for the fast-rotating dims (latent inflates
+> ~2.5×, a 6-min render clips 2–3% of samples). `fp16` matches its FMHA fusion
+> without the drift, so `bf16` was removed. `--precision bf16` (and the old
+> `--precision fp16mixed`) now silently alias to `fp16`.
+
 ```bash
-# medium defaults to bf16 (fast); force the reproducible engine instead:
-./sa3 --prompt "..." --dit medium --decoder same-l --precision fp16mixed
+# medium defaults to fp16. fp8 is the max-speed clean tier (~1.3x faster at
+# every length, clean at long sequence):
+./sa3 --prompt "..." --dit medium --decoder same-l --precision fp8
 ```
 
 The TRT DiT engines are static batch=1 (the ONNX bakes batch=1), so CFG runs as a
 sequential cond+uncond dual-pass at batch=1 for every precision.
+
+### SAME-L attention kernel
+
+`--decoder same-l` uses a custom sliding-window-attention plugin. Prebuilt engines embed
+an ahead-of-time PTX kernel, so nothing re-enters Python during inference and the engine
+goes inside the full-pipeline CUDA graph. This matters on **sm_120**, where the older
+JIT-dispatched build is not stream-capturable: the decode is silently dropped from the
+graph and every render comes back as the same wash of noise, with exit code 0.
+
+If you see byte-identical output across seeds, you are on an affected engine. Re-pull it
+(the published `sm_120` engines were rebuilt 2026-07-31), or run with `--no-mega-graph` to
+bypass capture. The `sm_90` engines are unaffected and still ship the JIT kernel, which is
+why **Triton is required at inference on sm_90 but not on sm_120**. Building your own is
+covered under "Choosing the SAME-L attention kernel" in
+[`build/README.md`](build/README.md).
+
+### Chunkable engines (canonical, both decoders)
+
+`--decoder same-l` now resolves to `dec_fp16_chunkable_limiter.trt` / `enc_fp16_chunkable.trt`,
+and `--decoder same-s` to `dec_bf16_chunkable_limiter.trt` / `enc_bf16_chunkable.trt`, with
+`--dec-precision fp8` selecting SAME-L's fp8 pair. (SAME-S is **bf16** — SAME-L is the fp16 one.)
+Two things changed.
+
+**Two optimization profiles per engine.** TensorRT commits a context's scratch at
+`create_execution_context()` — sized from the profile ceiling, *before any shape is bound* — so the
+old single-profile decoder reserved **8143 MB whether it decoded five seconds or six minutes**. The
+new engines carry a low band (decoder 256 latents, encoder 64) and a wide band (4096):
+
+| | scratch | decode |
+|---|---|---|
+| `--chunking` (default), SAME-L | **509 MB** decoder, **521 MB** encoder | 256-latent windows |
+| `--chunking` (default), SAME-S | **363 MB** decoder, **365 MB** encoder | 256-latent windows |
+| `--no-chunking` | 8143 / 8330 MB (SAME-L), 5780 / 5800 (SAME-S) | one single-shot call |
+
+Chunking is a **memory** mechanism, not a speed one. It wins on time only at exactly L=256, where
+the whole request is one window; above that, single-shot is 10–20% faster. Whole-pipeline resident
+VRAM for a six-minute render drops from ~21.5 GB to ~3.9 GB.
+
+**A limiter.** The decoder emits already-limited PCM (5.8 ms window, sample-peak, ceiling
+0.977 = −0.2021 dBFS) in place of the old hard clip. The ceiling is **baked**, so the engines keep
+the `('latent', 'pcm')` signature of the pre-limiter builds and drop straight in — a baked engine
+is bit-exact against a runtime-input one and about 4% faster. Rebuild with `--ceiling-input` if you
+want it settable per call. ⚠ **This changes the audio.** To reproduce renders made before it landed,
+the pre-limiter engines are no longer reachable from the runtime — rebuild one from the pristine
+`onnx/same-*/dec_dynamic_*.onnx` if you need it.
+
+The low band's ceiling is 256 latents on both decoders and both encoders. It is a real dial:
+raising it costs scratch and cuts the window count, lowering it does the reverse. On SAME-S the
+choice carries no quality axis at all — windowed decode there is *bit-identical* to single-shot,
+because its receptive field fits inside the 16-latent trim. On SAME-L it does: encode accuracy
+improves monotonically with window width, which is why the encoder's low band is 256 and not the
+64 it originally shipped with (1.3&ndash;1.5&times; faster and cos 0.99969 against 0.99831).
+
+Also worth knowing when building your own: a profile is `(min, opt, max)`, and the two ends do
+different jobs. **`max` sets VRAM; `opt` sets which shapes get the good kernels** and costs nothing.
+The inherited default of `min(1292, ceiling)` — 1292 latents being exactly 120.0 s — costs 17–23%
+at short L on the wide band while buying nothing at long L. See
+[`build/build_samel_chunkable.py`](build/build_samel_chunkable.py) for the tuned values.
+
+⚠ The old `same-l/enc_fp8.trt` was **removed** from the model repo. Its activation quantisers were
+calibrated with a doubly-conservative percentile plus a `1e-4` floor, putting the clip points at
+0.04–1.22 where the decoder's plain `amax` puts them at 22.4; that cost up to 2.16 dB of round trip
+on clean acoustic material. `enc_fp8_chunkable.trt` is the same weights recalibrated
+([`quantize/recalib_enc_fp8.py`](quantize/recalib_enc_fp8.py)) and measures 30.9 dB of latent SNR
+where the old one measured 18.3.
+
+### LoRA / DoRA adapters
+
+A TensorRT plan has its weights baked in, so an adapter cannot simply be merged the way the
+mlx and tflite runtimes do it. A separate DiT engine instead carries the adapter as **network
+inputs**: a low-rank branch on every adapted linear, computing
+`y = W₀·x·(1+P) + Btᵀ·(srow ⊙ (A·x))` where `A`, `Bt` and `P` are fed in like activations and
+the rank `R` is a dynamic dimension (1..512). Swapping an adapter is therefore a buffer write
+rather than a rebuild, stacking is concatenation along `R`, and `srow` gives each adapter in a
+stack its own strength.
+
+All three DiTs have one: 229 branched linears on medium, 193 on each small DiT. They are
+different networks, so adapters do not move between them and each needs its own engine:
+
+```bash
+python scripts/lora/build_branch.py --model sa3-m        --download   # ~7.4 min on an H200
+python scripts/lora/build_branch.py --model sa3-sm-music --download   # ~5.1 min
+python scripts/lora/build_branch.py --model sa3-sm-sfx   --download   # ~5.0 min
+python scripts/sa3_trt.py --dit medium --lora a.safetensors:0.8 --lora b.safetensors:0.5
+```
+
+Once per GPU architecture. `--lora` is repeatable with an optional `:STRENGTH` and selects
+the matching LoRA engine automatically from `--dit`. Serves `lora`, `lora-xs`, `dora-rows`
+and `dora-rows-xs`; DoRA adapters need `bake_dora.py` run on them once. The branch costs a flat ~4–6 ms per step (**+13% at
+L=4096**, +37% at 1292) and you pay it with a zero stack too, so run the plain engine until
+an adapter is selected. Stacked rank is free to 32.
+
+Full documentation in [`scripts/lora/README.md`](scripts/lora/README.md); the design and the
+traps are in [`scripts/lora/BUILDING_TRT_LORA.md`](scripts/lora/BUILDING_TRT_LORA.md).
+
 
 ## Speed & memory
 
@@ -165,7 +303,7 @@ variance once the graph is built).
 
 ```bash
 .venv/bin/python scripts/bench_dit_profile.py \
-    --engines "canonical=models/sm_90/sa3-sm-music/dit_bf16.trt" \
+    --engines "canonical=models/sm_90/sa3-sm-music/dit_fp16.trt" \
     --lvals 1,32,128,256,512,1024,1292,2048,4096 --warmup 3 --runs 7
 ```
 
@@ -185,6 +323,9 @@ variance once the graph is built).
 | `--init-audio`       | —           | WAV (44.1 kHz, 16-bit PCM) for audio-to-audio / inpaint                        |
 | `--init-noise-level` | 1.0         | σmax; 0.4–0.8 typical for variation, 1.0 = full regen                          |
 | `--inpaint-range`    | —           | `START,END` seconds; regenerate that span, keep the rest                       |
+| `--chunking`         | on          | SAME-L: windowed decode on the low profile (509 MB scratch). `--no-chunking` = single-shot on the wide profile, faster above L=256, ~5.4 GB more resident |
+| `--limiter-ceiling`  | baked 0.977 | Only for engines built `--ceiling-input`; the shipped ones bake it |
+| `--dec-precision`    | canonical   | `canonical` (fp16 for SAME-L, bf16 for SAME-S) or `fp8`. Both are chunkable and carry the limiter |
 | `--quiet`            | off         | Suppress per-stage prints + NVML probes — saves ~4 ms                          |
 | `--pinned-copy`      | on          | Pinned host buffer + non_blocking DtoH for Stage 5                             |
 | `--free-models`      | off         | Free TRT engine memory after each stage's last use                             |
@@ -215,12 +356,13 @@ optimized/tensorRT/
 │   └── build_dit_profile.py     ← DiT with custom (min, opt, max) profile shapes
 └── models/                      ← .trt engines (auto-downloaded per arch; ~8 GB)
     └── sm_<cc>/                 ← arch dir matches `nvidia-smi --query-gpu=compute_cap`
-        ├── t5gemma/t5gemma_fp16mixed.trt
-        ├── sa3-sm-music/dit_bf16.trt
-        ├── sa3-sm-sfx/dit_bf16.trt
-        ├── sa3-m/dit_bf16.trt
+        ├── t5gemma/t5gemma_fp16.trt
+        ├── sa3-sm-music/dit_fp16.trt
+        ├── sa3-sm-sfx/dit_fp16.trt
+        ├── sa3-m/dit_fp16.trt      ← + dit_fp8.trt / dit_fp32.trt if selected
         ├── same-s/{enc,dec}_dynamic_bf16.trt
-        └── same-l/{enc,dec}_dynamic_triton_swa.trt
+        └── same-l/{enc_fp16_chunkable,dec_fp16_chunkable_limiter}.trt
+            (+ the fp8 pair, and the pre-limiter *_dynamic_triton_swa.trt as `legacy`)
 ```
 
 DiT engines support a dynamic L range of **1 → 4096** at `opt=1292`
@@ -243,7 +385,8 @@ invocation per sampling step handles everything.
   specific cross-attention output token collapsed in magnitude.
 - **PCM-baked SAME-S decoder**: the int16 narrow + transpose are folded
   into the decoder engine itself; saves ~3 ms of post-decode CPU work.
-- **Mixed precision**: DiT runs BF16, decoder int32→int16, T5Gemma
+- **Mixed precision**: DiT runs FP16-mixed (FP16 trunk + FP32 RMSNorm/RoPE
+  islands + FMHA-fused FP16 attention core), decoder int32→int16, T5Gemma
   FP16-mixed. `--quiet` skips per-stage NVML probes for an extra ~4 ms.
 - **Auto-download**: missing engines are pulled from
   `stabilityai/stable-audio-3-optimized/tensorRT/sm_<cc>/` on first use.

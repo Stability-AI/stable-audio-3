@@ -1,4 +1,4 @@
-ai_edge_litert>=1.0
+ai_edge_litert>=2.2.0  # CompiledModel + XNNPACK weight cache (SAME rung models)
 numpy>=1.24
 sentencepiece>=0.2
 soundfile>=0.12

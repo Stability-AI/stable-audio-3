@@ -6,9 +6,10 @@ is wired, plus a precision picker the MLX/TRT UIs don't need:
   - Model picker: sm-music / sm-sfx / medium (hot-swap; the large DiT interpreter
     is cached — first use of a model/precision/length loads + XNNPACK-packs the
     weights, subsequent runs reuse it and only re-bind the conditioning).
-  - Precision picker: fp32 / w16a32 / w8a32 / w8a8-dyn (one knob for DiT + codec +
-    encoder, exactly like the CLI's --precision). fp32 is the CPU fast-and-accurate
-    default; w16a32 is ≈lossless half-size; w8a32/w8a8-dyn are GPTQ int8 (¼ size).
+  - Precision picker (one knob for DiT + codec + encoder, like the CLI's --precision).
+    Every DiT (medium, sm-music, sm-sfx) is now a rung ladder with two tiers: w8a8
+    (cache-safe rung int8, the default) and fp32 (bit-exact reference / LoRA). Switching
+    model resets the precision + decoder to the family default.
   - CFG 0-10 next to seconds/steps (0 = negative prompt takes over, 0.5 = halfway
     between prompts, 1 = off, >1 = extrapolate) + negative prompt/APG under Advanced.
   - Audio-to-audio: guide audio + init_noise_level (whole clip starts from its
@@ -18,14 +19,14 @@ is wired, plus a precision picker the MLX/TRT UIs don't need:
   - LoRA: file upload + local-folder pick (loras/<model>/) + strength, per-model
     memory, add/remove. Merged once into the DiT weights at load (the frozen graph
     has no per-step gating — so no Min/Max-step sliders, unlike the MLX UI). Only
-    fp32 / w16a32 can be LoRA-merged; the panel disables itself under int8.
+    fp32 can be LoRA-merged; the panel disables itself under the int8 w8a8 rung.
   - Spectrogram-as-player (numpy port, white playhead, click-to-seek), history
     panel, Output options (Auto-play / Auto-download / Infinite Radio / Loop /
     Hotswap), MP3 (via ffmpeg) or WAV saving.
 
 Launch:
-    ./sa3-gradio                  # share=True by default, sm-music + same-s, fp32
-    ./sa3-gradio --dit medium --precision w8a32
+    ./sa3-gradio                  # share=True by default; sm-music + same-s + fp32
+    ./sa3-gradio --dit medium     # medium + same-s + w8a8 (the family defaults)
     ./sa3-gradio --no-share       # local-only
 """
 from __future__ import annotations
@@ -51,10 +52,10 @@ sys.path.insert(0, str(REPO))          # so `from models.defs.* import` resolves
 sys.path.insert(0, str(SCRIPTS_DIR))   # so `from weights / lora_* / spec import` resolves
 
 from sa3_tflite import (  # noqa: E402
-    BakedDiT, BakedEncoder, BakedDecoder, read_wav,
-    valid_T_lat, DEFAULT_DECODER, DIT_REL, DEC_REL, T5_REL,
+    BakedDiT, make_dit_backend, RungEncoder, RungDecoder, read_wav,
+    valid_T_lat, DEFAULT_DECODER, DEFAULT_DIT_PRECISION, DIT_REL, DEC_REL, T5_REL,
     COND_TOKENS, COND_DIM, SAMPLE_RATE, SAMPLES_PER_LATENT,
-    SAMEL_CHUNK, SAMEL_OVERLAP, MIN_SIGMA,
+    RUNG_TRIM, MIN_SIGMA,
 )
 from models.defs import tflite_pipeline as P   # noqa: E402
 from lora_core import parse_lora_spec, LoraError  # noqa: E402
@@ -73,12 +74,15 @@ for _d in LORA_DIR_NAMES.values():
     (LORAS_DIR / _d).mkdir(parents=True, exist_ok=True)
 _DD_NONE = ""   # dropdown placeholder value ("--- Choose a LoRA ---")
 
-# Precisions whose weights can be LoRA-merged (fp32 consts + w16a32 fp16-behind-
-# DEQUANTIZE). Quantized-int8 graphs (w8a32 / w8a8-dyn) can't — see lora_patch.
-LORA_PRECISIONS = ("fp32", "w16a32")
+# Precisions whose weights can be LoRA-merged. Only fp32 now that the shipped DiT tiers are the rung
+# ladder (fp32 + the int8 w8a8 rung); int8 can't be merged (dequant->add->requant loses the grid). See
+# lora_patch. (The retired w16a32 was also mergeable but is no longer an offered tier -> legacy/.)
+LORA_PRECISIONS = ("fp32",)
 # Trained max clip length per model (repo README model table).
 MAX_SECONDS = {"sm-music": 120, "sm-sfx": 120, "medium": 380}
 DEFAULT_DECODERS = dict(DEFAULT_DECODER)
+# Per-family default DiT precision (medium -> cache-safe rung w8a8; small DiTs -> fp32).
+DEFAULT_DIT_PRECISIONS = dict(DEFAULT_DIT_PRECISION)
 # XNNPACK CPU threads (set from --threads in main()).
 _THREADS = 8
 
@@ -172,12 +176,12 @@ def _save_wav(pcm_int16, out_path):
 # batch (cfg) or length changes. Codec enc/dec are cached by (name, precision).
 _t5 = None
 _tok = None
-_dit_cache: dict[str, BakedDiT] = {}
+_dit_cache: dict[str, object] = {}   # BakedDiT (varlen small DiTs) or RungDiT (medium rung ladder)
 _dit_lru: list[str] = []
 _DIT_CACHE_MAX = 1          # one big DiT resident at a time (medium fp32 = 5.8 GB)
-_dec_cache: dict[tuple, BakedDecoder] = {}
+_dec_cache: dict[tuple, RungDecoder] = {}
 _dec_lru: list[tuple] = []
-_enc_cache: dict[tuple, BakedEncoder] = {}
+_enc_cache: dict[tuple, RungEncoder] = {}
 _enc_lru: list[tuple] = []
 _CODEC_CACHE_MAX = 2
 # Encoded-latent cache: rerunning a2a/inpainting with the same input audio skips
@@ -215,17 +219,23 @@ def get_dit(dit_path, T_lat, t5_hidden, t5_mask, seconds, cfg, apg,
         _dit_cache.pop(old, None)
         gc.collect()
     t0 = time.time()
-    model = BakedDiT(dit_path, T_lat, t5_hidden, t5_mask, seconds, _THREADS,
-                     cfg=cfg, apg=apg, null_hidden=null_h, null_mask=null_m,
-                     local_add_cond=local_add_cond, batched=batched)
+    model = make_dit_backend(dit_path, T_lat, t5_hidden, t5_mask, seconds, _THREADS,
+                             cfg=cfg, apg=apg, null_hidden=null_h, null_mask=null_m,
+                             local_add_cond=local_add_cond, batched=batched)
     load_ms = (time.time() - t0) * 1000
     _dit_cache[key] = model
     _dit_lru.append(key)
     return model, load_ms
 
 
-def get_decoder(name: str, precision: str) -> BakedDecoder:
-    key = (name, precision)
+def _codec_prec(precision: str) -> str:
+    """Map the (DiT-style) precision from the UI to the codec's 2 rung tiers: fp32 -> fp32, any int8 -> w8a8."""
+    return "fp32" if precision == "fp32" else "w8a8"
+
+
+def get_decoder(name: str, precision: str) -> RungDecoder:
+    cprec = _codec_prec(precision)
+    key = (name, cprec)
     if key in _dec_cache:
         _dec_lru.remove(key)
         _dec_lru.append(key)
@@ -234,15 +244,15 @@ def get_decoder(name: str, precision: str) -> BakedDecoder:
         old = _dec_lru.pop(0)
         _dec_cache.pop(old, None)
         gc.collect()
-    dec = BakedDecoder(ensure_local(dec_rel(name, precision)), _THREADS,
-                       needs_even=(name == "same-s"))
+    dec = RungDecoder(ensure_local(dec_rel(name, cprec)), threads=_THREADS, trim=RUNG_TRIM[name])
     _dec_cache[key] = dec
     _dec_lru.append(key)
     return dec
 
 
-def get_encoder(name: str, precision: str) -> BakedEncoder:
-    key = (name, precision)
+def get_encoder(name: str, precision: str) -> RungEncoder:
+    cprec = _codec_prec(precision)
+    key = (name, cprec)
     if key in _enc_cache:
         _enc_lru.remove(key)
         _enc_lru.append(key)
@@ -251,8 +261,7 @@ def get_encoder(name: str, precision: str) -> BakedEncoder:
         old = _enc_lru.pop(0)
         _enc_cache.pop(old, None)
         gc.collect()
-    enc = BakedEncoder(ensure_local(enc_rel(name, precision)), _THREADS,
-                       needs_even=(name == "same-s"))
+    enc = RungEncoder(ensure_local(enc_rel(name, cprec)), threads=_THREADS, trim=RUNG_TRIM[name])
     _enc_cache[key] = enc
     _enc_lru.append(key)
     return enc
@@ -316,7 +325,7 @@ def run_generation(dit_name: str, decoder_name: str, precision: str, prompt: str
             audio_np = audio_np[:, :target]
         else:
             audio_np = np.pad(audio_np, ((0, 0), (0, target - audio_np.shape[-1])))
-        lat = enc.encode(audio_np[None], T_lat)   # (1,256,T_lat)
+        lat = enc.encode(audio_np[None])[:, :, :T_lat]   # (1,256,T_lat); RungEncoder auto-dispatches rungs
         while len(_latent_cache) >= _LATENT_CACHE_MAX:
             _latent_cache.pop(next(iter(_latent_cache)))
         _latent_cache[ck] = lat
@@ -367,13 +376,13 @@ def run_generation(dit_name: str, decoder_name: str, precision: str, prompt: str
     t["sample_ms"] = (time.time() - t0) * 1000
     t["n_fwd"] = backend.n_fwd
 
-    # 6. Decode (whole for SAME-S; chunked for SAME-L past the window)
+    # 6. Decode — RungDecoder auto-dispatches the optimal rung per length (no chunk knob)
     decoder = get_decoder(dec, precision)
     t0 = time.time()
-    if dec == "same-l" and T_lat > SAMEL_CHUNK:
-        audio = decoder.decode_chunked(latents, SAMEL_CHUNK, SAMEL_OVERLAP)
-    else:
-        audio = decoder.decode_whole(latents)
+    dec_lat = latents
+    if needs_even and T_lat % 2:                  # SAME-S needs even L: pad one latent, trim the audio
+        dec_lat = np.concatenate([latents, latents[:, :, -1:]], axis=2)
+    audio = decoder.decode(dec_lat)[:, :, :T_lat * SAMPLES_PER_LATENT]
     t["decode_ms"] = (time.time() - t0) * 1000
 
     audio_np = audio[0]                               # (2, L*4096)
@@ -526,7 +535,7 @@ def _lora_specs_from_ui(vals, notes):
 
 
 def _lora_disp(specs) -> str:
-    """Short human tag per adapter: 'plini×0.8, rain'."""
+    """Short human tag per adapter: 'myband×0.8, rain'."""
     tags = []
     for s in specs or []:
         name = Path(s["path"]).stem
@@ -744,8 +753,14 @@ def build_ui(initial_dit: str, initial_decoder: str, initial_precision: str, *,
         srow_ups = [gr.update(visible=bool(slots[i][0] or slots[i][1] != _DD_NONE))
                     for i in range(3)]
         row_ups = [gr.update(visible=v) for v in nvis]
+        # Reset precision + decoder to the new family's default, and swing the LoRA
+        # editor/note to match (the w8a8 rung default can't be LoRA-merged, fp32 can).
+        new_prec = DEFAULT_DIT_PRECISIONS.get(dit_name, "fp32")
+        lora_ok = new_prec in LORA_PRECISIONS
         return (gr.update(value=DEFAULT_DECODERS.get(dit_name, "same-s")),
                 gr.update(maximum=max_s, value=min(cur_seconds, max_s)),
+                gr.update(value=new_prec),
+                gr.update(visible=not lora_ok), gr.update(visible=lora_ok),
                 *dd_ups, *srow_ups, *row_ups,
                 gr.update(visible=not all(nvis)), nvis, dit_name, mem,
                 slots[0][0], slots[1][0], slots[2][0],
@@ -767,7 +782,7 @@ def build_ui(initial_dit: str, initial_decoder: str, initial_precision: str, *,
             # API callers / stale state. get_patched_dit would raise anyway — surface
             # it as a clean note + skip the LoRA rather than failing the generation.
             notes.append(f"LoRA ignored — precision {precision} can't be LoRA-merged "
-                         f"(needs fp32 or w16a32)")
+                         f"(needs fp32)")
             lora_specs = None
         # blank or -1 → random seed, kept small (1-9999) for readability
         try:
@@ -824,7 +839,7 @@ def build_ui(initial_dit: str, initial_decoder: str, initial_precision: str, *,
         if not np.isfinite(audio_np).all():
             return None, "error: model produced non-finite audio (try a higher σmax or different seed)"
 
-        pcm = (np.clip(audio_np, -1, 1) * 32767.0).astype(np.int16).T   # (T, 2)
+        pcm = np.rint(np.clip(audio_np, -1, 1) * 32767.0).astype(np.int16).T   # (T, 2); round-to-nearest (matches TRT)
         basename = verbose_basename(prompt, negative_prompt, cfg, sigma_max, seed, precision)
         out_path = OUTPUT_DIR / f"{basename}.wav"
         _save_wav(pcm, out_path)
@@ -990,7 +1005,9 @@ def build_ui(initial_dit: str, initial_decoder: str, initial_precision: str, *,
         gr.Markdown(
             "# SA3 TFLite — portable CPU (XNNPACK)\n"
             "Text-to-audio, CFG + negative prompt, audio-to-audio, inpainting, LoRA. "
-            "Pick a precision (fp32 / w16a32 / w8a32 / w8a8-dyn). First use of a "
+            "Every DiT (medium / sm-music / sm-sfx) is a rung ladder with two tiers: "
+            "**w8a8** (cache-safe rung int8, the default) and **fp32** (reference / LoRA). "
+            "Picking a model resets precision + decoder to the family default. First use of a "
             "model/precision loads weights; subsequent runs are cached."
         )
         st = gr.State({"current": None, "queued": None, "history": []})
@@ -1029,8 +1046,8 @@ def build_ui(initial_dit: str, initial_decoder: str, initial_precision: str, *,
                 with gr.Accordion("LoRA", open=False):
                     # Shown only under a quantized precision (LoRA disabled there).
                     lora_note = gr.Markdown(
-                        "*LoRA needs precision **fp32** or **w16a32** — quantized-int8 "
-                        "graphs (w8a32 / w8a8-dyn) can't be LoRA-merged.*",
+                        "*LoRA needs precision **fp32** — the int8 **w8a8** rung can't be "
+                        "LoRA-merged (dequant→add→requant loses the int8 grid).*",
                         visible=initial_precision not in LORA_PRECISIONS)
                     with gr.Group(visible=initial_precision in LORA_PRECISIONS) as lora_editor:
                         _dd0 = _lora_dd_choices(initial_dit)
@@ -1114,7 +1131,8 @@ def build_ui(initial_dit: str, initial_decoder: str, initial_precision: str, *,
         dit_dd.change(on_dit_change,
                       inputs=[dit_dd, seconds, prev_dit, lora_mem,
                               lora_vis] + lora_inputs,
-                      outputs=[decoder_dd, seconds] + lora_dds + lora_srows
+                      outputs=[decoder_dd, seconds, precision_dd, lora_note, lora_editor]
+                              + lora_dds + lora_srows
                               + lora_rows
                               + [lora_add_btn, lora_vis, prev_dit, lora_mem]
                               + lora_files
@@ -1123,8 +1141,8 @@ def build_ui(initial_dit: str, initial_decoder: str, initial_precision: str, *,
                       ).then(None, js=_JS_FIX_SLIDERS)
 
         def on_precision_change(prec):
-            """Quantized-int8 precisions can't be LoRA-merged — hide the editor
-            and show the note. fp32 / w16a32 re-enable it."""
+            """The int8 w8a8 rung can't be LoRA-merged — hide the editor
+            and show the note. fp32 re-enables it."""
             disabled = prec not in LORA_PRECISIONS
             return gr.update(visible=disabled), gr.update(visible=not disabled)
         precision_dd.change(on_precision_change, inputs=[precision_dd],
@@ -1263,10 +1281,10 @@ def main():
                     help="Initial DiT bundle (switchable at runtime)")
     ap.add_argument("--decoder", choices=list(DEC_REL.keys()), default=None,
                     help="Initial decoder. Default: pairs with --dit")
-    ap.add_argument("--precision", choices=list(PRECISIONS), default="fp32",
-                    help="Initial precision (switchable at runtime): fp32 (default, "
-                         "CPU fast+accurate) | w16a32 (fp16, ≈lossless, half size) | "
-                         "w8a32 / w8a8-dyn (GPTQ int8, ¼ size)")
+    ap.add_argument("--precision", choices=list(PRECISIONS), default=None,
+                    help="Initial precision (switchable at runtime). Default: w8a8 for every "
+                         "family. All DiTs are rung ladders with two tiers: w8a8 (cache-safe "
+                         "rung int8) / fp32 (bit-exact reference / LoRA).")
     ap.add_argument("--default-seconds", type=float, default=30.0,
                     help="Length to pre-warm the initial DiT at")
     ap.add_argument("--default-steps", type=int, default=8)
@@ -1279,6 +1297,8 @@ def main():
 
     if args.decoder is None:
         args.decoder = DEFAULT_DECODERS[args.dit]
+    if args.precision is None:
+        args.precision = DEFAULT_DIT_PRECISIONS.get(args.dit, "fp32")
 
     global _THREADS
     _THREADS = args.threads

@@ -1,6 +1,6 @@
 """Mel-spectrogram renderer ported from Underfit's dashboard.
 
-Source: /weka2/cj/clod/underfit/dashboard/server.py — the 3-band tinted stereo
+Source: /path/to/underfit/dashboard/server.py — the 3-band tinted stereo
 mel spectrogram used in the Underfit run dashboards. Same algorithm,
 same constants, same Slaney mel scale + librosa-compatible mel filterbank.
 

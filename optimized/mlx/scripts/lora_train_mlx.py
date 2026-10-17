@@ -91,6 +91,7 @@ from models.defs.lora import (  # noqa: E402
     load_lora_checkpoint, load_trainable_lora_state, save_lora_checkpoint,
     underfit_lora_config,
 )
+from models.defs.lora_merge import merge_trainable_layers_into_model  # noqa: E402
 from models.defs import demo_mlx as demo  # noqa: E402
 from models.defs.latent_dataset import (  # noqa: E402
     PreEncodedLatentDataset, iterate_batches,
@@ -177,7 +178,7 @@ def parse_args():
                     help="Comma-separated; default = underfit's dashboard exclude list")
     ap.add_argument("--no-conditioner-lora", action="store_true",
                     help="Skip the seconds-conditioner adapter (underfit adapts it "
-                         "by default — e.g. the plini checkpoint carries its delta)")
+                         "by default — e.g. the myband checkpoint carries its delta)")
     ap.add_argument("--bora-mode", default="speed", choices=["speed", "memory"],
                     help="bora/bora-xs forward: 'speed' (default) caches W0² per "
                          "adapted layer (+1 weight copy) for the reformulated "
@@ -610,31 +611,91 @@ def main():
         gcond = sec_tok[:, 0, :].astype(mx.float16)
         return cross, gcond
 
+    # Encoding the mp3 (ffmpeg) and drawing the spectrogram are CPU work that
+    # left the GPU idle between demos. One writer thread does them while the
+    # next demo samples; one thread keeps saves in order and bounds the extra
+    # memory to the clips in flight. Drained before run_demos returns.
+    from concurrent.futures import ThreadPoolExecutor
+    _demo_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="demo-writer")
+    _demo_writes = []
+
+    def _save_demo_async(audio, i, step, meta, label, t_gen):
+        def _write():
+            try:
+                demo.save_demo_mp3(audio, i, step, demo.SAMPLE_RATE, demo_dir, meta)
+                print(f"{label} → demo_{i}_{step:08d}.mp3 "
+                      f"({time.time()-t_gen:.0f}s)", flush=True)
+            except Exception as e:
+                print(f"  demo {i} failed while saving: {e}", flush=True)
+        _demo_writes.append(_demo_writer.submit(_write))
+
+    def _drain_demo_writes():
+        while _demo_writes:
+            _demo_writes.pop(0).result()
+
     def _run_arc_demos(step, arc_pending, decoder, chunk_fn, chunk_cfg):
         """Merge the trained LoRA into a fresh copy of the SHIPPED rf_denoiser
         weights and sample with the pingpong integrator. Loaded once for the
-        whole ARC set (length-agnostic), freed after (peak = base + ARC DiT)."""
+        whole ARC set (length-agnostic), freed after (peak = base + ARC DiT).
+
+        Re-read from disk every round rather than kept resident: the npz read
+        is ~0.5 s (page cache) and keeping it would cost a full DiT of memory
+        for the whole run. The merge was the expensive part (4-9 s of numpy
+        fp32 on the CPU per round); it now runs on the GPU straight from the
+        live adapters (lora_merge.merge_trainable_layers_into_model)."""
         arc_path = args.arc_weights or str(
             ensure_local(f"models/mlx/dit_{args.dit}_f16.npz"))
-        # Scratch LoRA for merging into the ARC DiT — write it to the SESSION
-        # dir (ckpt_dir.parent), NOT the scanned checkpoints/ dir, so it never
-        # shows up as a checkpoint (dotfile too, belt + suspenders).
-        tmp_ckpt = ckpt_dir.parent / f".arc_demo_tmp_{step:08d}.safetensors"
-        save_lora_checkpoint(
-            bundle, tmp_ckpt, include=lora_config.get("include"),
-            exclude=lora_config.get("exclude"),
-            extra_config={"step": int(step), "base_model": base_model})
+        layers = list(iter_trainable_lora_layers(bundle))
+        # A fresh run's step-0 LoRA is untrained, so the baseline ARC demos use
+        # the shipped ARC weights as-is. (Merging the untrained adapter is not
+        # a no-op for dora/bora: their initial magnitudes are the BASE model's
+        # norms, which a merge would stamp onto ARC.)
+        untrained = step == 0 and not args.lora_ckpt_path
+        use_ckpt_path = (not untrained and layers
+                         and layers[0].adapter_type.endswith("-xs"))
+        tmp_ckpt = None
+        if use_ckpt_path:
+            # -xs adapters re-derive their SVD bases from the target weight,
+            # which the checkpoint merge does. Scratch LoRA goes in the SESSION
+            # dir (ckpt_dir.parent), NOT the scanned checkpoints/ dir, so it
+            # never shows up as a checkpoint (dotfile too, belt + suspenders).
+            tmp_ckpt = ckpt_dir.parent / f".arc_demo_tmp_{step:08d}.safetensors"
+            save_lora_checkpoint(
+                bundle, tmp_ckpt, include=lora_config.get("include"),
+                exclude=lora_config.get("exclude"),
+                extra_config={"step": int(step), "base_model": base_model})
         t_a = time.time()
+        # Hand MLX's buffer cache back before loading a second DiT: after
+        # training steps it holds 2.4-3.1 GB (sm-music, crop 64) of freed
+        # activation buffers that the ARC weights mostly can't reuse. Measured
+        # no slower (ARC load 4.4-6.9 s with, 5.6-15.7 s without), and on a
+        # 16 GB Mac that's the headroom a medium ARC load runs out of.
+        if hasattr(mx, "clear_cache"):
+            mx.clear_cache()
+        # Announce before the load: it holds a second DiT in memory and merges
+        # the LoRA, so it is a likely place to run out of memory, and
+        # underfit's failure report reads this line to say so.
+        what = "untrained LoRA at step 0, no merge" if untrained else "merging LoRA"
+        print(f"  loading ARC model ({args.dit}) + {what} …", flush=True)
         try:
-            arc_dit = mod.load_dit(arc_path, T_lat=crop_len, dtype=mx.float16,
-                                   compile_=False, lora_paths=[str(tmp_ckpt)],
-                                   lora_strength=1.0, lora_log=lambda *a, **k: None)
-            print(f"  ARC model ({args.dit}) + LoRA merged "
+            if use_ckpt_path:
+                arc_dit = mod.load_dit(arc_path, T_lat=crop_len, dtype=mx.float16,
+                                       compile_=False, lora_paths=[str(tmp_ckpt)],
+                                       lora_strength=1.0,
+                                       lora_log=lambda *a, **k: None)
+            else:
+                arc_dit = mod.load_dit(arc_path, T_lat=crop_len, dtype=mx.float16,
+                                       compile_=False)
+                if not untrained:
+                    merge_trainable_layers_into_model(arc_dit, layers)
+            print(f"  ARC model ({args.dit}) ready, "
+                  f"{'shipped weights' if untrained else 'LoRA merged'} "
                   f"({time.time()-t_a:.1f}s)")
         except Exception as e:
             print(f"  ARC demos skipped: could not load "
                   f"{Path(arc_path).name} with LoRA merged: {e}", flush=True)
-            _rm(tmp_ckpt)
+            if tmp_ckpt is not None:
+                _rm(tmp_ckpt)
             return
         try:
             for i, entry in arc_pending:
@@ -661,19 +722,25 @@ def main():
                                                 latent, T_lat)
                     meta = {"prompt": prompt, "cfg": cfg, "seed": seed,
                             "steps": steps, "step": int(step), "arc": True}
-                    demo.save_demo_mp3(audio, i, step, demo.SAMPLE_RATE,
-                                       demo_dir, meta)
-                    print(f"  ♪ ARC demo {i} @ step {step}: {prompt[:44]!r} "
-                          f"→ demo_{i}_{step:08d}.mp3 ({time.time()-t_gen:.0f}s)", flush=True)
+                    _save_demo_async(audio, i, step, meta,
+                                     f"  ♪ ARC demo {i} @ step {step}: {prompt[:44]!r}",
+                                     t_gen)
                 except Exception as e:
                     print(f"  ARC demo {i} failed: {e}", flush=True)
         finally:
             del arc_dit
             if hasattr(mx, "clear_cache"):
                 mx.clear_cache()
-            _rm(tmp_ckpt)
+            if tmp_ckpt is not None:
+                _rm(tmp_ckpt)
 
     def run_demos(step):
+        try:
+            _render_demos(step)
+        finally:
+            _drain_demo_writes()  # every clip on disk before training resumes
+
+    def _render_demos(step):
         if not demo_entries:
             return
         os.makedirs(demo_dir, exist_ok=True)
@@ -732,9 +799,8 @@ def main():
                     meta["lora_strength"] = strength
                 if interval is not None:
                     meta["lora_interval_max"] = interval
-                demo.save_demo_mp3(audio, i, step, demo.SAMPLE_RATE, demo_dir, meta)
-                print(f"  ♪ demo {i} @ step {step}: {prompt[:48]!r} "
-                      f"→ demo_{i}_{step:08d}.mp3 ({time.time()-t_gen:.0f}s)", flush=True)
+                _save_demo_async(audio, i, step, meta,
+                                 f"  ♪ demo {i} @ step {step}: {prompt[:48]!r}", t_gen)
             except Exception as e:
                 print(f"  demo {i} failed: {e}", flush=True)
             finally:

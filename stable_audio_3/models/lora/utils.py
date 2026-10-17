@@ -198,7 +198,46 @@ def resolve_adapter_type(adapter_type, state_dict=None):
 # ------------------- helper functions for safetensors LoRA checkpoints -------------------
 
 
-def save_lora_safetensors(state_dict, lora_config, path):
+BAKED_VNORM_KEY = "baked_vnorm_row"
+
+
+def get_dora_norm_state_dict(model):
+    """Baked row norms for every dora-* adapter on `model`.
+
+    Emits {f"{name}.parametrizations.weight.{lora_index}.baked_vnorm_row": vn},
+    matching the layout bake_dora.py writes so the two paths are
+    interchangeable.
+
+    Only adapters whose runtime norm is taken along dim 1 are baked: that is the
+    convention the key name and the offline baker both assume, and a dora-cols
+    adapter normalises along dim 0, so a row norm would be silently wrong for
+    it. Plain `lora` has no magnitude and needs no norm. bora/bora-xs are
+    skipped too — their column magnitude is applied to the row-scaled
+    intermediate, so its norm is not a function of base weights and delta alone
+    and cannot be baked with a single tensor.
+
+    Walks named_modules rather than get_lora_layers because computing the norm
+    needs the module's original weight, and get_lora_layers yields only
+    (name, parametrization).
+    """
+    out = {}
+    for name, module in model.named_modules():
+        plist = getattr(getattr(module, "parametrizations", None), "weight", None)
+        if plist is None:
+            continue
+        for p in plist:
+            if not isinstance(p, LoRAParametrization):
+                continue
+            if not p.adapter_type.startswith("dora"):
+                continue
+            if getattr(p, "_norm_dim", 1) != 1:
+                continue
+            key = f"{name}.parametrizations.weight.{p.lora_index}.{BAKED_VNORM_KEY}"
+            out[key] = p.baked_vnorm_row(module)
+    return out
+
+
+def save_lora_safetensors(state_dict, lora_config, path, model=None, norm_base=None):
     """Save a LoRA checkpoint in safetensors format with config as metadata.
 
     The lora_config dict is JSON-serialized and stored under the metadata key
@@ -208,9 +247,40 @@ def save_lora_safetensors(state_dict, lora_config, path):
         state_dict: Dict of LoRA tensors (from get_lora_state_dict).
         lora_config: Dict with keys like rank, alpha, adapter_type, include, exclude.
         path: Output file path (should end in .safetensors).
+        model: Optional model the adapters are attached to. When given, dora-*
+            row norms are baked in (see get_dora_norm_state_dict), which lets a
+            loader reconstruct adapted weights without first loading the base
+            model. Costs well under a second.
+        norm_base: Identity of the base checkpoint the norms were computed
+            against, recorded in the metadata. A baked norm is only exact for
+            that base — sa3-medium's base and arc variants reconstruct each
+            other's norms to about 2.2e-3 relative — so an unlabelled norm makes
+            that mismatch undetectable at load time.
     """
+    if model is not None:
+        # Accept a sequence so a caller can bake from the same submodules it
+        # built the state dict from. Baking from a parent wrapper instead would
+        # prefix the keys ("model.", "conditioner.") and no longer line up with
+        # the adapter tensors.
+        submodels = model if isinstance(model, (list, tuple)) else [model]
+        baked = {}
+        for sub in submodels:
+            baked.update(get_dora_norm_state_dict(sub))
+        if baked:
+            state_dict = {**state_dict, **baked}
+            lora_config = dict(lora_config)
+            lora_config["baked_norms"] = len(baked)
+            if norm_base:
+                lora_config["norm_base"] = str(norm_base)
     metadata = {"lora_config": json.dumps(lora_config)}
-    fp16_dict = {k: v.half() if v.is_floating_point() else v for k, v in state_dict.items()}
+    # The baked norm stays fp32: c = mag/vn scales every DoRA weight, and fp16
+    # storage of the denominator costs a measured worst case of ~4.9e-4 relative.
+    # Keeping it fp32 costs ~3.5 MB across a full adapter set.
+    fp16_dict = {
+        k: v if k.endswith(BAKED_VNORM_KEY)
+        else (v.half() if v.is_floating_point() else v)
+        for k, v in state_dict.items()
+    }
     _st_save_file(fp16_dict, str(path), metadata=metadata)
 
 

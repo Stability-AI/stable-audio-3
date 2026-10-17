@@ -22,6 +22,7 @@ touches no forward code, so the parity-verified training path is untouched.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
@@ -150,6 +151,59 @@ def decode_latents(decoder, chunk_fn, chunk_cfg, latents, T_lat):
 # Warn once (not per demo) when ffmpeg is missing and we fall back to WAV.
 _WARNED_NO_FFMPEG = False
 
+# underfit's spectrogram renderer, loaded once by file path from
+# UNDERFIT_SPECTROGRAM_MODULE (set by underfit's MLX engine). None = not tried
+# yet, False = unavailable (standalone run, or the load failed).
+_SPEC_MOD = None
+SPEC_SAMPLE_RATE = 32000   # what the dashboard's mel expects
+
+
+def _spectrogram_module():
+    global _SPEC_MOD
+    if _SPEC_MOD is None:
+        _SPEC_MOD = False
+        path = os.environ.get("UNDERFIT_SPECTROGRAM_MODULE")
+        if path:
+            try:
+                spec = importlib.util.spec_from_file_location("underfit_spectrogram", path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                _SPEC_MOD = mod
+            except Exception as e:
+                print(f"WARNING: demo spectrograms disabled — could not load {path}: "
+                      f"{type(e).__name__}: {e}\n"
+                      f"         the dashboard will render them instead (slower).",
+                      file=sys.stderr, flush=True)
+    return _SPEC_MOD or None
+
+
+def _write_demo_spectrogram(pcm, sample_rate, out_dir, stem):
+    """Draw the demo's spectrogram from audio already in memory, as underfit's
+    torch loop does (demo_step._write_demo_spectrogram), so the dashboard never
+    re-decodes the clip — `<stem>.jpg` beside it is the marker it checks.
+
+    Written before the audio file lands, so the dashboard can never see a demo
+    without its image. Best-effort: a failure never touches the run.
+    """
+    mod = _spectrogram_module()
+    if mod is None:
+        return
+    jpg = os.path.join(out_dir, f"{stem}.jpg")
+    if os.path.exists(jpg):
+        return
+    tmp = os.path.join(out_dir, f".tmp_{stem}.jpg")
+    try:
+        y = mod.resample_linear(pcm.astype(np.float32) / 32768.0,
+                                sample_rate, SPEC_SAMPLE_RATE)
+        mod.render_to_jpg(y, SPEC_SAMPLE_RATE, tmp)
+        os.replace(tmp, jpg)
+    except Exception as e:
+        print(f"  spectrogram skipped for {stem}: {type(e).__name__}: {e}", flush=True)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
 
 def save_demo_mp3(audio_np, demo_index, step, sample_rate, out_dir, meta=None):
     """Peak-normalized int16 → mp3 (or WAV without ffmpeg) + json sidecar.
@@ -173,6 +227,7 @@ def save_demo_mp3(audio_np, demo_index, step, sample_rate, out_dir, meta=None):
 
     peak = float(np.abs(audio_np).max())
     pcm = (audio_np / max(peak, 1e-8) * 32767.0).astype(np.int16)  # (2, T)
+    _write_demo_spectrogram(pcm, sample_rate, out_dir, f"demo_{demo_index}_{step:08d}")
 
     def _write_wav(path):
         import wave

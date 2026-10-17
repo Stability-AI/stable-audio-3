@@ -4,8 +4,8 @@ Stdlib unittest, no torch / no mlx / no pytest (matches test_windows_compat.py).
 Two tiers:
   * CI-safe: safetensors reader, per-type merge math (independent re-derivation),
     spec parser, quantized-precision refusal — no model files needed.
-  * Model-dependent (skipped unless a local DiT .tflite is present): the real
-    plini adapter's 169/169 name-mapping bijection on medium; w16a32 fp16
+  * Model-dependent (skipped unless a local DiT .tflite is present): a real
+    LoRA adapter's 169/169 name-mapping bijection on medium; w16a32 fp16
     buffer discovery; and a synthetic FULL-target-set adapter on sm-music that
     exercises every mapping tier + the clone/patch/read-back path.
 
@@ -38,7 +38,8 @@ _MODELS = {
     ("medium", "fp32"): f"{_CHECKOUT}/sa3-m/dit_fp32.tflite",
     ("sm-music", "w8a32"): f"{_CHECKOUT}/sa3-sm-music/dit_w8a32.tflite",
 }
-_PLINI = "/Users/cj/clod/speed-metal/scripts/lora_bench/plini-sa3-380.safetensors"
+# Opt-in: point this at a real .safetensors LoRA to run the name-mapping test.
+_ADAPTER = os.environ.get("SA3_TEST_LORA_ADAPTER", "")
 
 
 def _have(key):
@@ -164,17 +165,17 @@ class TestQuantizedRefusal(unittest.TestCase):
 
 # ── model-dependent tests ────────────────────────────────────────────────────
 
-@unittest.skipUnless(_have(("medium", "fp32")) and os.path.exists(_PLINI),
-                     "medium fp32 DiT + plini adapter not present")
+@unittest.skipUnless(_have(("medium", "fp32")) and _ADAPTER and os.path.exists(_ADAPTER),
+                     "medium fp32 DiT + a LoRA adapter ($SA3_TEST_LORA_ADAPTER) not present")
 class TestRealAdapterMapping(unittest.TestCase):
-    def test_plini_169_bijection_on_medium(self):
+    def test_adapter_169_bijection_on_medium(self):
         import mmap
         import lora_patch as lp
         f = open(_MODELS[("medium", "fp32")], "rb")
         buf = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
         try:
             mapper = lp._Mapper(list(lp._fc_weight_buffers(buf)))
-            _at, _sc, layers = lc.parse_adapter(_PLINI)
+            _at, _sc, layers = lc.parse_adapter(_ADAPTER)
             offs = set()
             for layer, p in layers.items():
                 want = (p["lora_B"].shape[0], p["lora_A"].shape[1])

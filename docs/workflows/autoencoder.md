@@ -8,7 +8,9 @@ Stable Audio 3 uses a 44.1k stereo audio autoencoder known as SAME to compress w
 import torchaudio
 from stable_audio_3 import AutoencoderModel
 
-ae = AutoencoderModel.from_pretrained("same-l")  # "same-s" (small), "same-l" (medium/large)
+ae = AutoencoderModel.from_pretrained(
+    "same-l"
+)  # "same-s" (small), "same-l" (medium/large)
 waveform, sr = torchaudio.load("audio.wav")
 latents = ae.encode(waveform, sr)
 # → (1, latent_dim, latent_time)

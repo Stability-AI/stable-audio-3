@@ -1,0 +1,1753 @@
+{
+ "engine": null,
+ "rank_max": 512,
+ "layers": {
+  "lora::seconds_embed": {
+   "in": 256,
+   "out": 768,
+   "ckpt_suffix": "conditioners.seconds_total.embedder.embedding.1",
+   "adapter_key": "conditioners.seconds_total.embedder.embedding.1",
+   "A": "loraA::seconds_embed",
+   "B": "loraB::seconds_embed",
+   "P": "loraP::seconds_embed"
+  },
+  "lora::to_cond_embed.0": {
+   "in": 768,
+   "out": 1024,
+   "ckpt_suffix": "to_cond_embed.0",
+   "adapter_key": "model.to_cond_embed.0",
+   "A": "loraA::to_cond_embed.0",
+   "B": "loraB::to_cond_embed.0",
+   "P": "loraP::to_cond_embed.0"
+  },
+  "lora::to_cond_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "to_cond_embed.2",
+   "adapter_key": "model.to_cond_embed.2",
+   "A": "loraA::to_cond_embed.2",
+   "B": "loraB::to_cond_embed.2",
+   "P": "loraP::to_cond_embed.2"
+  },
+  "lora::to_global_embed.0": {
+   "in": 768,
+   "out": 1024,
+   "ckpt_suffix": "to_global_embed.0",
+   "adapter_key": "model.to_global_embed.0",
+   "A": "loraA::to_global_embed.0",
+   "B": "loraB::to_global_embed.0",
+   "P": "loraP::to_global_embed.0"
+  },
+  "lora::to_global_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "to_global_embed.2",
+   "adapter_key": "model.to_global_embed.2",
+   "A": "loraA::to_global_embed.2",
+   "B": "loraB::to_global_embed.2",
+   "P": "loraP::to_global_embed.2"
+  },
+  "lora::to_timestep_embed.0": {
+   "in": 256,
+   "out": 1024,
+   "ckpt_suffix": "to_timestep_embed.0",
+   "adapter_key": "model.to_timestep_embed.0",
+   "A": "loraA::to_timestep_embed.0",
+   "B": "loraB::to_timestep_embed.0",
+   "P": "loraP::to_timestep_embed.0"
+  },
+  "lora::to_timestep_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "to_timestep_embed.2",
+   "adapter_key": "model.to_timestep_embed.2",
+   "A": "loraA::to_timestep_embed.2",
+   "B": "loraB::to_timestep_embed.2",
+   "P": "loraP::to_timestep_embed.2"
+  },
+  "lora::preprocess_conv": {
+   "in": 256,
+   "out": 256,
+   "ckpt_suffix": "preprocess_conv",
+   "adapter_key": "model.preprocess_conv",
+   "A": "loraA::preprocess_conv",
+   "B": "loraB::preprocess_conv",
+   "P": "loraP::preprocess_conv"
+  },
+  "lora::project_in": {
+   "in": 256,
+   "out": 1024,
+   "ckpt_suffix": "project_in",
+   "adapter_key": "model.transformer.project_in",
+   "A": "loraA::project_in",
+   "B": "loraB::project_in",
+   "P": "loraP::project_in"
+  },
+  "lora::global_cond_embedder.0": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "global_cond_embedder.0",
+   "adapter_key": "model.transformer.global_cond_embedder.0",
+   "A": "loraA::global_cond_embedder.0",
+   "B": "loraB::global_cond_embedder.0",
+   "P": "loraP::global_cond_embedder.0"
+  },
+  "lora::global_cond_embedder.2": {
+   "in": 1024,
+   "out": 6144,
+   "ckpt_suffix": "global_cond_embedder.2",
+   "adapter_key": "model.transformer.global_cond_embedder.2",
+   "A": "loraA::global_cond_embedder.2",
+   "B": "loraB::global_cond_embedder.2",
+   "P": "loraP::global_cond_embedder.2"
+  },
+  "lora::layers.0.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.0.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.0.self_attn.to_qkv",
+   "A": "loraA::layers.0.self_attn.to_qkv",
+   "B": "loraB::layers.0.self_attn.to_qkv",
+   "P": "loraP::layers.0.self_attn.to_qkv"
+  },
+  "lora::layers.0.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.0.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.0.self_attn.to_out",
+   "A": "loraA::layers.0.self_attn.to_out",
+   "B": "loraB::layers.0.self_attn.to_out",
+   "P": "loraP::layers.0.self_attn.to_out"
+  },
+  "lora::layers.0.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.0.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.0.cross_attn.to_q",
+   "A": "loraA::layers.0.cross_attn.to_q",
+   "B": "loraB::layers.0.cross_attn.to_q",
+   "P": "loraP::layers.0.cross_attn.to_q"
+  },
+  "lora::layers.0.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.0.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.0.cross_attn.to_kv",
+   "A": "loraA::layers.0.cross_attn.to_kv",
+   "B": "loraB::layers.0.cross_attn.to_kv",
+   "P": "loraP::layers.0.cross_attn.to_kv"
+  },
+  "lora::layers.0.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.0.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.0.cross_attn.to_out",
+   "A": "loraA::layers.0.cross_attn.to_out",
+   "B": "loraB::layers.0.cross_attn.to_out",
+   "P": "loraP::layers.0.cross_attn.to_out"
+  },
+  "lora::layers.0.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.0.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.0.to_local_embed.0",
+   "A": "loraA::layers.0.to_local_embed.0",
+   "B": "loraB::layers.0.to_local_embed.0",
+   "P": "loraP::layers.0.to_local_embed.0"
+  },
+  "lora::layers.0.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.0.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.0.to_local_embed.2",
+   "A": "loraA::layers.0.to_local_embed.2",
+   "B": "loraB::layers.0.to_local_embed.2",
+   "P": "loraP::layers.0.to_local_embed.2"
+  },
+  "lora::layers.0.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.0.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.0.ff.ff.0.proj",
+   "A": "loraA::layers.0.ff.ff.0.proj",
+   "B": "loraB::layers.0.ff.ff.0.proj",
+   "P": "loraP::layers.0.ff.ff.0.proj"
+  },
+  "lora::layers.0.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.0.ff.ff.2",
+   "adapter_key": "model.transformer.layers.0.ff.ff.2",
+   "A": "loraA::layers.0.ff.ff.2",
+   "B": "loraB::layers.0.ff.ff.2",
+   "P": "loraP::layers.0.ff.ff.2"
+  },
+  "lora::layers.1.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.1.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.1.self_attn.to_qkv",
+   "A": "loraA::layers.1.self_attn.to_qkv",
+   "B": "loraB::layers.1.self_attn.to_qkv",
+   "P": "loraP::layers.1.self_attn.to_qkv"
+  },
+  "lora::layers.1.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.1.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.1.self_attn.to_out",
+   "A": "loraA::layers.1.self_attn.to_out",
+   "B": "loraB::layers.1.self_attn.to_out",
+   "P": "loraP::layers.1.self_attn.to_out"
+  },
+  "lora::layers.1.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.1.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.1.cross_attn.to_q",
+   "A": "loraA::layers.1.cross_attn.to_q",
+   "B": "loraB::layers.1.cross_attn.to_q",
+   "P": "loraP::layers.1.cross_attn.to_q"
+  },
+  "lora::layers.1.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.1.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.1.cross_attn.to_kv",
+   "A": "loraA::layers.1.cross_attn.to_kv",
+   "B": "loraB::layers.1.cross_attn.to_kv",
+   "P": "loraP::layers.1.cross_attn.to_kv"
+  },
+  "lora::layers.1.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.1.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.1.cross_attn.to_out",
+   "A": "loraA::layers.1.cross_attn.to_out",
+   "B": "loraB::layers.1.cross_attn.to_out",
+   "P": "loraP::layers.1.cross_attn.to_out"
+  },
+  "lora::layers.1.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.1.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.1.to_local_embed.0",
+   "A": "loraA::layers.1.to_local_embed.0",
+   "B": "loraB::layers.1.to_local_embed.0",
+   "P": "loraP::layers.1.to_local_embed.0"
+  },
+  "lora::layers.1.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.1.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.1.to_local_embed.2",
+   "A": "loraA::layers.1.to_local_embed.2",
+   "B": "loraB::layers.1.to_local_embed.2",
+   "P": "loraP::layers.1.to_local_embed.2"
+  },
+  "lora::layers.1.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.1.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.1.ff.ff.0.proj",
+   "A": "loraA::layers.1.ff.ff.0.proj",
+   "B": "loraB::layers.1.ff.ff.0.proj",
+   "P": "loraP::layers.1.ff.ff.0.proj"
+  },
+  "lora::layers.1.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.1.ff.ff.2",
+   "adapter_key": "model.transformer.layers.1.ff.ff.2",
+   "A": "loraA::layers.1.ff.ff.2",
+   "B": "loraB::layers.1.ff.ff.2",
+   "P": "loraP::layers.1.ff.ff.2"
+  },
+  "lora::layers.2.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.2.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.2.self_attn.to_qkv",
+   "A": "loraA::layers.2.self_attn.to_qkv",
+   "B": "loraB::layers.2.self_attn.to_qkv",
+   "P": "loraP::layers.2.self_attn.to_qkv"
+  },
+  "lora::layers.2.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.2.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.2.self_attn.to_out",
+   "A": "loraA::layers.2.self_attn.to_out",
+   "B": "loraB::layers.2.self_attn.to_out",
+   "P": "loraP::layers.2.self_attn.to_out"
+  },
+  "lora::layers.2.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.2.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.2.cross_attn.to_q",
+   "A": "loraA::layers.2.cross_attn.to_q",
+   "B": "loraB::layers.2.cross_attn.to_q",
+   "P": "loraP::layers.2.cross_attn.to_q"
+  },
+  "lora::layers.2.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.2.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.2.cross_attn.to_kv",
+   "A": "loraA::layers.2.cross_attn.to_kv",
+   "B": "loraB::layers.2.cross_attn.to_kv",
+   "P": "loraP::layers.2.cross_attn.to_kv"
+  },
+  "lora::layers.2.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.2.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.2.cross_attn.to_out",
+   "A": "loraA::layers.2.cross_attn.to_out",
+   "B": "loraB::layers.2.cross_attn.to_out",
+   "P": "loraP::layers.2.cross_attn.to_out"
+  },
+  "lora::layers.2.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.2.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.2.to_local_embed.0",
+   "A": "loraA::layers.2.to_local_embed.0",
+   "B": "loraB::layers.2.to_local_embed.0",
+   "P": "loraP::layers.2.to_local_embed.0"
+  },
+  "lora::layers.2.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.2.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.2.to_local_embed.2",
+   "A": "loraA::layers.2.to_local_embed.2",
+   "B": "loraB::layers.2.to_local_embed.2",
+   "P": "loraP::layers.2.to_local_embed.2"
+  },
+  "lora::layers.2.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.2.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.2.ff.ff.0.proj",
+   "A": "loraA::layers.2.ff.ff.0.proj",
+   "B": "loraB::layers.2.ff.ff.0.proj",
+   "P": "loraP::layers.2.ff.ff.0.proj"
+  },
+  "lora::layers.2.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.2.ff.ff.2",
+   "adapter_key": "model.transformer.layers.2.ff.ff.2",
+   "A": "loraA::layers.2.ff.ff.2",
+   "B": "loraB::layers.2.ff.ff.2",
+   "P": "loraP::layers.2.ff.ff.2"
+  },
+  "lora::layers.3.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.3.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.3.self_attn.to_qkv",
+   "A": "loraA::layers.3.self_attn.to_qkv",
+   "B": "loraB::layers.3.self_attn.to_qkv",
+   "P": "loraP::layers.3.self_attn.to_qkv"
+  },
+  "lora::layers.3.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.3.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.3.self_attn.to_out",
+   "A": "loraA::layers.3.self_attn.to_out",
+   "B": "loraB::layers.3.self_attn.to_out",
+   "P": "loraP::layers.3.self_attn.to_out"
+  },
+  "lora::layers.3.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.3.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.3.cross_attn.to_q",
+   "A": "loraA::layers.3.cross_attn.to_q",
+   "B": "loraB::layers.3.cross_attn.to_q",
+   "P": "loraP::layers.3.cross_attn.to_q"
+  },
+  "lora::layers.3.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.3.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.3.cross_attn.to_kv",
+   "A": "loraA::layers.3.cross_attn.to_kv",
+   "B": "loraB::layers.3.cross_attn.to_kv",
+   "P": "loraP::layers.3.cross_attn.to_kv"
+  },
+  "lora::layers.3.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.3.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.3.cross_attn.to_out",
+   "A": "loraA::layers.3.cross_attn.to_out",
+   "B": "loraB::layers.3.cross_attn.to_out",
+   "P": "loraP::layers.3.cross_attn.to_out"
+  },
+  "lora::layers.3.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.3.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.3.to_local_embed.0",
+   "A": "loraA::layers.3.to_local_embed.0",
+   "B": "loraB::layers.3.to_local_embed.0",
+   "P": "loraP::layers.3.to_local_embed.0"
+  },
+  "lora::layers.3.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.3.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.3.to_local_embed.2",
+   "A": "loraA::layers.3.to_local_embed.2",
+   "B": "loraB::layers.3.to_local_embed.2",
+   "P": "loraP::layers.3.to_local_embed.2"
+  },
+  "lora::layers.3.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.3.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.3.ff.ff.0.proj",
+   "A": "loraA::layers.3.ff.ff.0.proj",
+   "B": "loraB::layers.3.ff.ff.0.proj",
+   "P": "loraP::layers.3.ff.ff.0.proj"
+  },
+  "lora::layers.3.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.3.ff.ff.2",
+   "adapter_key": "model.transformer.layers.3.ff.ff.2",
+   "A": "loraA::layers.3.ff.ff.2",
+   "B": "loraB::layers.3.ff.ff.2",
+   "P": "loraP::layers.3.ff.ff.2"
+  },
+  "lora::layers.4.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.4.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.4.self_attn.to_qkv",
+   "A": "loraA::layers.4.self_attn.to_qkv",
+   "B": "loraB::layers.4.self_attn.to_qkv",
+   "P": "loraP::layers.4.self_attn.to_qkv"
+  },
+  "lora::layers.4.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.4.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.4.self_attn.to_out",
+   "A": "loraA::layers.4.self_attn.to_out",
+   "B": "loraB::layers.4.self_attn.to_out",
+   "P": "loraP::layers.4.self_attn.to_out"
+  },
+  "lora::layers.4.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.4.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.4.cross_attn.to_q",
+   "A": "loraA::layers.4.cross_attn.to_q",
+   "B": "loraB::layers.4.cross_attn.to_q",
+   "P": "loraP::layers.4.cross_attn.to_q"
+  },
+  "lora::layers.4.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.4.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.4.cross_attn.to_kv",
+   "A": "loraA::layers.4.cross_attn.to_kv",
+   "B": "loraB::layers.4.cross_attn.to_kv",
+   "P": "loraP::layers.4.cross_attn.to_kv"
+  },
+  "lora::layers.4.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.4.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.4.cross_attn.to_out",
+   "A": "loraA::layers.4.cross_attn.to_out",
+   "B": "loraB::layers.4.cross_attn.to_out",
+   "P": "loraP::layers.4.cross_attn.to_out"
+  },
+  "lora::layers.4.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.4.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.4.to_local_embed.0",
+   "A": "loraA::layers.4.to_local_embed.0",
+   "B": "loraB::layers.4.to_local_embed.0",
+   "P": "loraP::layers.4.to_local_embed.0"
+  },
+  "lora::layers.4.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.4.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.4.to_local_embed.2",
+   "A": "loraA::layers.4.to_local_embed.2",
+   "B": "loraB::layers.4.to_local_embed.2",
+   "P": "loraP::layers.4.to_local_embed.2"
+  },
+  "lora::layers.4.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.4.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.4.ff.ff.0.proj",
+   "A": "loraA::layers.4.ff.ff.0.proj",
+   "B": "loraB::layers.4.ff.ff.0.proj",
+   "P": "loraP::layers.4.ff.ff.0.proj"
+  },
+  "lora::layers.4.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.4.ff.ff.2",
+   "adapter_key": "model.transformer.layers.4.ff.ff.2",
+   "A": "loraA::layers.4.ff.ff.2",
+   "B": "loraB::layers.4.ff.ff.2",
+   "P": "loraP::layers.4.ff.ff.2"
+  },
+  "lora::layers.5.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.5.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.5.self_attn.to_qkv",
+   "A": "loraA::layers.5.self_attn.to_qkv",
+   "B": "loraB::layers.5.self_attn.to_qkv",
+   "P": "loraP::layers.5.self_attn.to_qkv"
+  },
+  "lora::layers.5.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.5.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.5.self_attn.to_out",
+   "A": "loraA::layers.5.self_attn.to_out",
+   "B": "loraB::layers.5.self_attn.to_out",
+   "P": "loraP::layers.5.self_attn.to_out"
+  },
+  "lora::layers.5.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.5.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.5.cross_attn.to_q",
+   "A": "loraA::layers.5.cross_attn.to_q",
+   "B": "loraB::layers.5.cross_attn.to_q",
+   "P": "loraP::layers.5.cross_attn.to_q"
+  },
+  "lora::layers.5.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.5.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.5.cross_attn.to_kv",
+   "A": "loraA::layers.5.cross_attn.to_kv",
+   "B": "loraB::layers.5.cross_attn.to_kv",
+   "P": "loraP::layers.5.cross_attn.to_kv"
+  },
+  "lora::layers.5.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.5.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.5.cross_attn.to_out",
+   "A": "loraA::layers.5.cross_attn.to_out",
+   "B": "loraB::layers.5.cross_attn.to_out",
+   "P": "loraP::layers.5.cross_attn.to_out"
+  },
+  "lora::layers.5.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.5.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.5.to_local_embed.0",
+   "A": "loraA::layers.5.to_local_embed.0",
+   "B": "loraB::layers.5.to_local_embed.0",
+   "P": "loraP::layers.5.to_local_embed.0"
+  },
+  "lora::layers.5.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.5.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.5.to_local_embed.2",
+   "A": "loraA::layers.5.to_local_embed.2",
+   "B": "loraB::layers.5.to_local_embed.2",
+   "P": "loraP::layers.5.to_local_embed.2"
+  },
+  "lora::layers.5.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.5.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.5.ff.ff.0.proj",
+   "A": "loraA::layers.5.ff.ff.0.proj",
+   "B": "loraB::layers.5.ff.ff.0.proj",
+   "P": "loraP::layers.5.ff.ff.0.proj"
+  },
+  "lora::layers.5.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.5.ff.ff.2",
+   "adapter_key": "model.transformer.layers.5.ff.ff.2",
+   "A": "loraA::layers.5.ff.ff.2",
+   "B": "loraB::layers.5.ff.ff.2",
+   "P": "loraP::layers.5.ff.ff.2"
+  },
+  "lora::layers.6.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.6.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.6.self_attn.to_qkv",
+   "A": "loraA::layers.6.self_attn.to_qkv",
+   "B": "loraB::layers.6.self_attn.to_qkv",
+   "P": "loraP::layers.6.self_attn.to_qkv"
+  },
+  "lora::layers.6.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.6.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.6.self_attn.to_out",
+   "A": "loraA::layers.6.self_attn.to_out",
+   "B": "loraB::layers.6.self_attn.to_out",
+   "P": "loraP::layers.6.self_attn.to_out"
+  },
+  "lora::layers.6.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.6.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.6.cross_attn.to_q",
+   "A": "loraA::layers.6.cross_attn.to_q",
+   "B": "loraB::layers.6.cross_attn.to_q",
+   "P": "loraP::layers.6.cross_attn.to_q"
+  },
+  "lora::layers.6.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.6.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.6.cross_attn.to_kv",
+   "A": "loraA::layers.6.cross_attn.to_kv",
+   "B": "loraB::layers.6.cross_attn.to_kv",
+   "P": "loraP::layers.6.cross_attn.to_kv"
+  },
+  "lora::layers.6.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.6.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.6.cross_attn.to_out",
+   "A": "loraA::layers.6.cross_attn.to_out",
+   "B": "loraB::layers.6.cross_attn.to_out",
+   "P": "loraP::layers.6.cross_attn.to_out"
+  },
+  "lora::layers.6.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.6.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.6.to_local_embed.0",
+   "A": "loraA::layers.6.to_local_embed.0",
+   "B": "loraB::layers.6.to_local_embed.0",
+   "P": "loraP::layers.6.to_local_embed.0"
+  },
+  "lora::layers.6.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.6.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.6.to_local_embed.2",
+   "A": "loraA::layers.6.to_local_embed.2",
+   "B": "loraB::layers.6.to_local_embed.2",
+   "P": "loraP::layers.6.to_local_embed.2"
+  },
+  "lora::layers.6.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.6.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.6.ff.ff.0.proj",
+   "A": "loraA::layers.6.ff.ff.0.proj",
+   "B": "loraB::layers.6.ff.ff.0.proj",
+   "P": "loraP::layers.6.ff.ff.0.proj"
+  },
+  "lora::layers.6.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.6.ff.ff.2",
+   "adapter_key": "model.transformer.layers.6.ff.ff.2",
+   "A": "loraA::layers.6.ff.ff.2",
+   "B": "loraB::layers.6.ff.ff.2",
+   "P": "loraP::layers.6.ff.ff.2"
+  },
+  "lora::layers.7.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.7.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.7.self_attn.to_qkv",
+   "A": "loraA::layers.7.self_attn.to_qkv",
+   "B": "loraB::layers.7.self_attn.to_qkv",
+   "P": "loraP::layers.7.self_attn.to_qkv"
+  },
+  "lora::layers.7.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.7.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.7.self_attn.to_out",
+   "A": "loraA::layers.7.self_attn.to_out",
+   "B": "loraB::layers.7.self_attn.to_out",
+   "P": "loraP::layers.7.self_attn.to_out"
+  },
+  "lora::layers.7.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.7.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.7.cross_attn.to_q",
+   "A": "loraA::layers.7.cross_attn.to_q",
+   "B": "loraB::layers.7.cross_attn.to_q",
+   "P": "loraP::layers.7.cross_attn.to_q"
+  },
+  "lora::layers.7.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.7.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.7.cross_attn.to_kv",
+   "A": "loraA::layers.7.cross_attn.to_kv",
+   "B": "loraB::layers.7.cross_attn.to_kv",
+   "P": "loraP::layers.7.cross_attn.to_kv"
+  },
+  "lora::layers.7.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.7.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.7.cross_attn.to_out",
+   "A": "loraA::layers.7.cross_attn.to_out",
+   "B": "loraB::layers.7.cross_attn.to_out",
+   "P": "loraP::layers.7.cross_attn.to_out"
+  },
+  "lora::layers.7.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.7.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.7.to_local_embed.0",
+   "A": "loraA::layers.7.to_local_embed.0",
+   "B": "loraB::layers.7.to_local_embed.0",
+   "P": "loraP::layers.7.to_local_embed.0"
+  },
+  "lora::layers.7.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.7.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.7.to_local_embed.2",
+   "A": "loraA::layers.7.to_local_embed.2",
+   "B": "loraB::layers.7.to_local_embed.2",
+   "P": "loraP::layers.7.to_local_embed.2"
+  },
+  "lora::layers.7.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.7.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.7.ff.ff.0.proj",
+   "A": "loraA::layers.7.ff.ff.0.proj",
+   "B": "loraB::layers.7.ff.ff.0.proj",
+   "P": "loraP::layers.7.ff.ff.0.proj"
+  },
+  "lora::layers.7.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.7.ff.ff.2",
+   "adapter_key": "model.transformer.layers.7.ff.ff.2",
+   "A": "loraA::layers.7.ff.ff.2",
+   "B": "loraB::layers.7.ff.ff.2",
+   "P": "loraP::layers.7.ff.ff.2"
+  },
+  "lora::layers.8.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.8.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.8.self_attn.to_qkv",
+   "A": "loraA::layers.8.self_attn.to_qkv",
+   "B": "loraB::layers.8.self_attn.to_qkv",
+   "P": "loraP::layers.8.self_attn.to_qkv"
+  },
+  "lora::layers.8.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.8.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.8.self_attn.to_out",
+   "A": "loraA::layers.8.self_attn.to_out",
+   "B": "loraB::layers.8.self_attn.to_out",
+   "P": "loraP::layers.8.self_attn.to_out"
+  },
+  "lora::layers.8.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.8.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.8.cross_attn.to_q",
+   "A": "loraA::layers.8.cross_attn.to_q",
+   "B": "loraB::layers.8.cross_attn.to_q",
+   "P": "loraP::layers.8.cross_attn.to_q"
+  },
+  "lora::layers.8.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.8.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.8.cross_attn.to_kv",
+   "A": "loraA::layers.8.cross_attn.to_kv",
+   "B": "loraB::layers.8.cross_attn.to_kv",
+   "P": "loraP::layers.8.cross_attn.to_kv"
+  },
+  "lora::layers.8.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.8.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.8.cross_attn.to_out",
+   "A": "loraA::layers.8.cross_attn.to_out",
+   "B": "loraB::layers.8.cross_attn.to_out",
+   "P": "loraP::layers.8.cross_attn.to_out"
+  },
+  "lora::layers.8.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.8.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.8.to_local_embed.0",
+   "A": "loraA::layers.8.to_local_embed.0",
+   "B": "loraB::layers.8.to_local_embed.0",
+   "P": "loraP::layers.8.to_local_embed.0"
+  },
+  "lora::layers.8.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.8.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.8.to_local_embed.2",
+   "A": "loraA::layers.8.to_local_embed.2",
+   "B": "loraB::layers.8.to_local_embed.2",
+   "P": "loraP::layers.8.to_local_embed.2"
+  },
+  "lora::layers.8.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.8.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.8.ff.ff.0.proj",
+   "A": "loraA::layers.8.ff.ff.0.proj",
+   "B": "loraB::layers.8.ff.ff.0.proj",
+   "P": "loraP::layers.8.ff.ff.0.proj"
+  },
+  "lora::layers.8.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.8.ff.ff.2",
+   "adapter_key": "model.transformer.layers.8.ff.ff.2",
+   "A": "loraA::layers.8.ff.ff.2",
+   "B": "loraB::layers.8.ff.ff.2",
+   "P": "loraP::layers.8.ff.ff.2"
+  },
+  "lora::layers.9.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.9.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.9.self_attn.to_qkv",
+   "A": "loraA::layers.9.self_attn.to_qkv",
+   "B": "loraB::layers.9.self_attn.to_qkv",
+   "P": "loraP::layers.9.self_attn.to_qkv"
+  },
+  "lora::layers.9.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.9.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.9.self_attn.to_out",
+   "A": "loraA::layers.9.self_attn.to_out",
+   "B": "loraB::layers.9.self_attn.to_out",
+   "P": "loraP::layers.9.self_attn.to_out"
+  },
+  "lora::layers.9.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.9.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.9.cross_attn.to_q",
+   "A": "loraA::layers.9.cross_attn.to_q",
+   "B": "loraB::layers.9.cross_attn.to_q",
+   "P": "loraP::layers.9.cross_attn.to_q"
+  },
+  "lora::layers.9.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.9.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.9.cross_attn.to_kv",
+   "A": "loraA::layers.9.cross_attn.to_kv",
+   "B": "loraB::layers.9.cross_attn.to_kv",
+   "P": "loraP::layers.9.cross_attn.to_kv"
+  },
+  "lora::layers.9.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.9.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.9.cross_attn.to_out",
+   "A": "loraA::layers.9.cross_attn.to_out",
+   "B": "loraB::layers.9.cross_attn.to_out",
+   "P": "loraP::layers.9.cross_attn.to_out"
+  },
+  "lora::layers.9.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.9.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.9.to_local_embed.0",
+   "A": "loraA::layers.9.to_local_embed.0",
+   "B": "loraB::layers.9.to_local_embed.0",
+   "P": "loraP::layers.9.to_local_embed.0"
+  },
+  "lora::layers.9.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.9.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.9.to_local_embed.2",
+   "A": "loraA::layers.9.to_local_embed.2",
+   "B": "loraB::layers.9.to_local_embed.2",
+   "P": "loraP::layers.9.to_local_embed.2"
+  },
+  "lora::layers.9.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.9.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.9.ff.ff.0.proj",
+   "A": "loraA::layers.9.ff.ff.0.proj",
+   "B": "loraB::layers.9.ff.ff.0.proj",
+   "P": "loraP::layers.9.ff.ff.0.proj"
+  },
+  "lora::layers.9.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.9.ff.ff.2",
+   "adapter_key": "model.transformer.layers.9.ff.ff.2",
+   "A": "loraA::layers.9.ff.ff.2",
+   "B": "loraB::layers.9.ff.ff.2",
+   "P": "loraP::layers.9.ff.ff.2"
+  },
+  "lora::layers.10.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.10.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.10.self_attn.to_qkv",
+   "A": "loraA::layers.10.self_attn.to_qkv",
+   "B": "loraB::layers.10.self_attn.to_qkv",
+   "P": "loraP::layers.10.self_attn.to_qkv"
+  },
+  "lora::layers.10.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.10.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.10.self_attn.to_out",
+   "A": "loraA::layers.10.self_attn.to_out",
+   "B": "loraB::layers.10.self_attn.to_out",
+   "P": "loraP::layers.10.self_attn.to_out"
+  },
+  "lora::layers.10.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.10.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.10.cross_attn.to_q",
+   "A": "loraA::layers.10.cross_attn.to_q",
+   "B": "loraB::layers.10.cross_attn.to_q",
+   "P": "loraP::layers.10.cross_attn.to_q"
+  },
+  "lora::layers.10.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.10.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.10.cross_attn.to_kv",
+   "A": "loraA::layers.10.cross_attn.to_kv",
+   "B": "loraB::layers.10.cross_attn.to_kv",
+   "P": "loraP::layers.10.cross_attn.to_kv"
+  },
+  "lora::layers.10.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.10.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.10.cross_attn.to_out",
+   "A": "loraA::layers.10.cross_attn.to_out",
+   "B": "loraB::layers.10.cross_attn.to_out",
+   "P": "loraP::layers.10.cross_attn.to_out"
+  },
+  "lora::layers.10.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.10.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.10.to_local_embed.0",
+   "A": "loraA::layers.10.to_local_embed.0",
+   "B": "loraB::layers.10.to_local_embed.0",
+   "P": "loraP::layers.10.to_local_embed.0"
+  },
+  "lora::layers.10.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.10.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.10.to_local_embed.2",
+   "A": "loraA::layers.10.to_local_embed.2",
+   "B": "loraB::layers.10.to_local_embed.2",
+   "P": "loraP::layers.10.to_local_embed.2"
+  },
+  "lora::layers.10.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.10.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.10.ff.ff.0.proj",
+   "A": "loraA::layers.10.ff.ff.0.proj",
+   "B": "loraB::layers.10.ff.ff.0.proj",
+   "P": "loraP::layers.10.ff.ff.0.proj"
+  },
+  "lora::layers.10.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.10.ff.ff.2",
+   "adapter_key": "model.transformer.layers.10.ff.ff.2",
+   "A": "loraA::layers.10.ff.ff.2",
+   "B": "loraB::layers.10.ff.ff.2",
+   "P": "loraP::layers.10.ff.ff.2"
+  },
+  "lora::layers.11.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.11.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.11.self_attn.to_qkv",
+   "A": "loraA::layers.11.self_attn.to_qkv",
+   "B": "loraB::layers.11.self_attn.to_qkv",
+   "P": "loraP::layers.11.self_attn.to_qkv"
+  },
+  "lora::layers.11.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.11.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.11.self_attn.to_out",
+   "A": "loraA::layers.11.self_attn.to_out",
+   "B": "loraB::layers.11.self_attn.to_out",
+   "P": "loraP::layers.11.self_attn.to_out"
+  },
+  "lora::layers.11.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.11.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.11.cross_attn.to_q",
+   "A": "loraA::layers.11.cross_attn.to_q",
+   "B": "loraB::layers.11.cross_attn.to_q",
+   "P": "loraP::layers.11.cross_attn.to_q"
+  },
+  "lora::layers.11.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.11.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.11.cross_attn.to_kv",
+   "A": "loraA::layers.11.cross_attn.to_kv",
+   "B": "loraB::layers.11.cross_attn.to_kv",
+   "P": "loraP::layers.11.cross_attn.to_kv"
+  },
+  "lora::layers.11.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.11.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.11.cross_attn.to_out",
+   "A": "loraA::layers.11.cross_attn.to_out",
+   "B": "loraB::layers.11.cross_attn.to_out",
+   "P": "loraP::layers.11.cross_attn.to_out"
+  },
+  "lora::layers.11.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.11.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.11.to_local_embed.0",
+   "A": "loraA::layers.11.to_local_embed.0",
+   "B": "loraB::layers.11.to_local_embed.0",
+   "P": "loraP::layers.11.to_local_embed.0"
+  },
+  "lora::layers.11.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.11.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.11.to_local_embed.2",
+   "A": "loraA::layers.11.to_local_embed.2",
+   "B": "loraB::layers.11.to_local_embed.2",
+   "P": "loraP::layers.11.to_local_embed.2"
+  },
+  "lora::layers.11.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.11.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.11.ff.ff.0.proj",
+   "A": "loraA::layers.11.ff.ff.0.proj",
+   "B": "loraB::layers.11.ff.ff.0.proj",
+   "P": "loraP::layers.11.ff.ff.0.proj"
+  },
+  "lora::layers.11.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.11.ff.ff.2",
+   "adapter_key": "model.transformer.layers.11.ff.ff.2",
+   "A": "loraA::layers.11.ff.ff.2",
+   "B": "loraB::layers.11.ff.ff.2",
+   "P": "loraP::layers.11.ff.ff.2"
+  },
+  "lora::layers.12.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.12.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.12.self_attn.to_qkv",
+   "A": "loraA::layers.12.self_attn.to_qkv",
+   "B": "loraB::layers.12.self_attn.to_qkv",
+   "P": "loraP::layers.12.self_attn.to_qkv"
+  },
+  "lora::layers.12.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.12.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.12.self_attn.to_out",
+   "A": "loraA::layers.12.self_attn.to_out",
+   "B": "loraB::layers.12.self_attn.to_out",
+   "P": "loraP::layers.12.self_attn.to_out"
+  },
+  "lora::layers.12.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.12.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.12.cross_attn.to_q",
+   "A": "loraA::layers.12.cross_attn.to_q",
+   "B": "loraB::layers.12.cross_attn.to_q",
+   "P": "loraP::layers.12.cross_attn.to_q"
+  },
+  "lora::layers.12.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.12.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.12.cross_attn.to_kv",
+   "A": "loraA::layers.12.cross_attn.to_kv",
+   "B": "loraB::layers.12.cross_attn.to_kv",
+   "P": "loraP::layers.12.cross_attn.to_kv"
+  },
+  "lora::layers.12.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.12.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.12.cross_attn.to_out",
+   "A": "loraA::layers.12.cross_attn.to_out",
+   "B": "loraB::layers.12.cross_attn.to_out",
+   "P": "loraP::layers.12.cross_attn.to_out"
+  },
+  "lora::layers.12.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.12.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.12.to_local_embed.0",
+   "A": "loraA::layers.12.to_local_embed.0",
+   "B": "loraB::layers.12.to_local_embed.0",
+   "P": "loraP::layers.12.to_local_embed.0"
+  },
+  "lora::layers.12.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.12.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.12.to_local_embed.2",
+   "A": "loraA::layers.12.to_local_embed.2",
+   "B": "loraB::layers.12.to_local_embed.2",
+   "P": "loraP::layers.12.to_local_embed.2"
+  },
+  "lora::layers.12.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.12.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.12.ff.ff.0.proj",
+   "A": "loraA::layers.12.ff.ff.0.proj",
+   "B": "loraB::layers.12.ff.ff.0.proj",
+   "P": "loraP::layers.12.ff.ff.0.proj"
+  },
+  "lora::layers.12.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.12.ff.ff.2",
+   "adapter_key": "model.transformer.layers.12.ff.ff.2",
+   "A": "loraA::layers.12.ff.ff.2",
+   "B": "loraB::layers.12.ff.ff.2",
+   "P": "loraP::layers.12.ff.ff.2"
+  },
+  "lora::layers.13.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.13.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.13.self_attn.to_qkv",
+   "A": "loraA::layers.13.self_attn.to_qkv",
+   "B": "loraB::layers.13.self_attn.to_qkv",
+   "P": "loraP::layers.13.self_attn.to_qkv"
+  },
+  "lora::layers.13.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.13.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.13.self_attn.to_out",
+   "A": "loraA::layers.13.self_attn.to_out",
+   "B": "loraB::layers.13.self_attn.to_out",
+   "P": "loraP::layers.13.self_attn.to_out"
+  },
+  "lora::layers.13.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.13.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.13.cross_attn.to_q",
+   "A": "loraA::layers.13.cross_attn.to_q",
+   "B": "loraB::layers.13.cross_attn.to_q",
+   "P": "loraP::layers.13.cross_attn.to_q"
+  },
+  "lora::layers.13.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.13.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.13.cross_attn.to_kv",
+   "A": "loraA::layers.13.cross_attn.to_kv",
+   "B": "loraB::layers.13.cross_attn.to_kv",
+   "P": "loraP::layers.13.cross_attn.to_kv"
+  },
+  "lora::layers.13.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.13.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.13.cross_attn.to_out",
+   "A": "loraA::layers.13.cross_attn.to_out",
+   "B": "loraB::layers.13.cross_attn.to_out",
+   "P": "loraP::layers.13.cross_attn.to_out"
+  },
+  "lora::layers.13.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.13.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.13.to_local_embed.0",
+   "A": "loraA::layers.13.to_local_embed.0",
+   "B": "loraB::layers.13.to_local_embed.0",
+   "P": "loraP::layers.13.to_local_embed.0"
+  },
+  "lora::layers.13.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.13.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.13.to_local_embed.2",
+   "A": "loraA::layers.13.to_local_embed.2",
+   "B": "loraB::layers.13.to_local_embed.2",
+   "P": "loraP::layers.13.to_local_embed.2"
+  },
+  "lora::layers.13.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.13.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.13.ff.ff.0.proj",
+   "A": "loraA::layers.13.ff.ff.0.proj",
+   "B": "loraB::layers.13.ff.ff.0.proj",
+   "P": "loraP::layers.13.ff.ff.0.proj"
+  },
+  "lora::layers.13.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.13.ff.ff.2",
+   "adapter_key": "model.transformer.layers.13.ff.ff.2",
+   "A": "loraA::layers.13.ff.ff.2",
+   "B": "loraB::layers.13.ff.ff.2",
+   "P": "loraP::layers.13.ff.ff.2"
+  },
+  "lora::layers.14.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.14.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.14.self_attn.to_qkv",
+   "A": "loraA::layers.14.self_attn.to_qkv",
+   "B": "loraB::layers.14.self_attn.to_qkv",
+   "P": "loraP::layers.14.self_attn.to_qkv"
+  },
+  "lora::layers.14.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.14.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.14.self_attn.to_out",
+   "A": "loraA::layers.14.self_attn.to_out",
+   "B": "loraB::layers.14.self_attn.to_out",
+   "P": "loraP::layers.14.self_attn.to_out"
+  },
+  "lora::layers.14.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.14.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.14.cross_attn.to_q",
+   "A": "loraA::layers.14.cross_attn.to_q",
+   "B": "loraB::layers.14.cross_attn.to_q",
+   "P": "loraP::layers.14.cross_attn.to_q"
+  },
+  "lora::layers.14.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.14.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.14.cross_attn.to_kv",
+   "A": "loraA::layers.14.cross_attn.to_kv",
+   "B": "loraB::layers.14.cross_attn.to_kv",
+   "P": "loraP::layers.14.cross_attn.to_kv"
+  },
+  "lora::layers.14.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.14.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.14.cross_attn.to_out",
+   "A": "loraA::layers.14.cross_attn.to_out",
+   "B": "loraB::layers.14.cross_attn.to_out",
+   "P": "loraP::layers.14.cross_attn.to_out"
+  },
+  "lora::layers.14.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.14.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.14.to_local_embed.0",
+   "A": "loraA::layers.14.to_local_embed.0",
+   "B": "loraB::layers.14.to_local_embed.0",
+   "P": "loraP::layers.14.to_local_embed.0"
+  },
+  "lora::layers.14.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.14.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.14.to_local_embed.2",
+   "A": "loraA::layers.14.to_local_embed.2",
+   "B": "loraB::layers.14.to_local_embed.2",
+   "P": "loraP::layers.14.to_local_embed.2"
+  },
+  "lora::layers.14.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.14.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.14.ff.ff.0.proj",
+   "A": "loraA::layers.14.ff.ff.0.proj",
+   "B": "loraB::layers.14.ff.ff.0.proj",
+   "P": "loraP::layers.14.ff.ff.0.proj"
+  },
+  "lora::layers.14.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.14.ff.ff.2",
+   "adapter_key": "model.transformer.layers.14.ff.ff.2",
+   "A": "loraA::layers.14.ff.ff.2",
+   "B": "loraB::layers.14.ff.ff.2",
+   "P": "loraP::layers.14.ff.ff.2"
+  },
+  "lora::layers.15.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.15.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.15.self_attn.to_qkv",
+   "A": "loraA::layers.15.self_attn.to_qkv",
+   "B": "loraB::layers.15.self_attn.to_qkv",
+   "P": "loraP::layers.15.self_attn.to_qkv"
+  },
+  "lora::layers.15.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.15.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.15.self_attn.to_out",
+   "A": "loraA::layers.15.self_attn.to_out",
+   "B": "loraB::layers.15.self_attn.to_out",
+   "P": "loraP::layers.15.self_attn.to_out"
+  },
+  "lora::layers.15.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.15.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.15.cross_attn.to_q",
+   "A": "loraA::layers.15.cross_attn.to_q",
+   "B": "loraB::layers.15.cross_attn.to_q",
+   "P": "loraP::layers.15.cross_attn.to_q"
+  },
+  "lora::layers.15.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.15.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.15.cross_attn.to_kv",
+   "A": "loraA::layers.15.cross_attn.to_kv",
+   "B": "loraB::layers.15.cross_attn.to_kv",
+   "P": "loraP::layers.15.cross_attn.to_kv"
+  },
+  "lora::layers.15.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.15.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.15.cross_attn.to_out",
+   "A": "loraA::layers.15.cross_attn.to_out",
+   "B": "loraB::layers.15.cross_attn.to_out",
+   "P": "loraP::layers.15.cross_attn.to_out"
+  },
+  "lora::layers.15.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.15.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.15.to_local_embed.0",
+   "A": "loraA::layers.15.to_local_embed.0",
+   "B": "loraB::layers.15.to_local_embed.0",
+   "P": "loraP::layers.15.to_local_embed.0"
+  },
+  "lora::layers.15.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.15.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.15.to_local_embed.2",
+   "A": "loraA::layers.15.to_local_embed.2",
+   "B": "loraB::layers.15.to_local_embed.2",
+   "P": "loraP::layers.15.to_local_embed.2"
+  },
+  "lora::layers.15.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.15.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.15.ff.ff.0.proj",
+   "A": "loraA::layers.15.ff.ff.0.proj",
+   "B": "loraB::layers.15.ff.ff.0.proj",
+   "P": "loraP::layers.15.ff.ff.0.proj"
+  },
+  "lora::layers.15.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.15.ff.ff.2",
+   "adapter_key": "model.transformer.layers.15.ff.ff.2",
+   "A": "loraA::layers.15.ff.ff.2",
+   "B": "loraB::layers.15.ff.ff.2",
+   "P": "loraP::layers.15.ff.ff.2"
+  },
+  "lora::layers.16.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.16.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.16.self_attn.to_qkv",
+   "A": "loraA::layers.16.self_attn.to_qkv",
+   "B": "loraB::layers.16.self_attn.to_qkv",
+   "P": "loraP::layers.16.self_attn.to_qkv"
+  },
+  "lora::layers.16.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.16.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.16.self_attn.to_out",
+   "A": "loraA::layers.16.self_attn.to_out",
+   "B": "loraB::layers.16.self_attn.to_out",
+   "P": "loraP::layers.16.self_attn.to_out"
+  },
+  "lora::layers.16.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.16.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.16.cross_attn.to_q",
+   "A": "loraA::layers.16.cross_attn.to_q",
+   "B": "loraB::layers.16.cross_attn.to_q",
+   "P": "loraP::layers.16.cross_attn.to_q"
+  },
+  "lora::layers.16.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.16.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.16.cross_attn.to_kv",
+   "A": "loraA::layers.16.cross_attn.to_kv",
+   "B": "loraB::layers.16.cross_attn.to_kv",
+   "P": "loraP::layers.16.cross_attn.to_kv"
+  },
+  "lora::layers.16.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.16.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.16.cross_attn.to_out",
+   "A": "loraA::layers.16.cross_attn.to_out",
+   "B": "loraB::layers.16.cross_attn.to_out",
+   "P": "loraP::layers.16.cross_attn.to_out"
+  },
+  "lora::layers.16.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.16.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.16.to_local_embed.0",
+   "A": "loraA::layers.16.to_local_embed.0",
+   "B": "loraB::layers.16.to_local_embed.0",
+   "P": "loraP::layers.16.to_local_embed.0"
+  },
+  "lora::layers.16.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.16.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.16.to_local_embed.2",
+   "A": "loraA::layers.16.to_local_embed.2",
+   "B": "loraB::layers.16.to_local_embed.2",
+   "P": "loraP::layers.16.to_local_embed.2"
+  },
+  "lora::layers.16.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.16.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.16.ff.ff.0.proj",
+   "A": "loraA::layers.16.ff.ff.0.proj",
+   "B": "loraB::layers.16.ff.ff.0.proj",
+   "P": "loraP::layers.16.ff.ff.0.proj"
+  },
+  "lora::layers.16.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.16.ff.ff.2",
+   "adapter_key": "model.transformer.layers.16.ff.ff.2",
+   "A": "loraA::layers.16.ff.ff.2",
+   "B": "loraB::layers.16.ff.ff.2",
+   "P": "loraP::layers.16.ff.ff.2"
+  },
+  "lora::layers.17.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.17.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.17.self_attn.to_qkv",
+   "A": "loraA::layers.17.self_attn.to_qkv",
+   "B": "loraB::layers.17.self_attn.to_qkv",
+   "P": "loraP::layers.17.self_attn.to_qkv"
+  },
+  "lora::layers.17.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.17.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.17.self_attn.to_out",
+   "A": "loraA::layers.17.self_attn.to_out",
+   "B": "loraB::layers.17.self_attn.to_out",
+   "P": "loraP::layers.17.self_attn.to_out"
+  },
+  "lora::layers.17.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.17.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.17.cross_attn.to_q",
+   "A": "loraA::layers.17.cross_attn.to_q",
+   "B": "loraB::layers.17.cross_attn.to_q",
+   "P": "loraP::layers.17.cross_attn.to_q"
+  },
+  "lora::layers.17.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.17.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.17.cross_attn.to_kv",
+   "A": "loraA::layers.17.cross_attn.to_kv",
+   "B": "loraB::layers.17.cross_attn.to_kv",
+   "P": "loraP::layers.17.cross_attn.to_kv"
+  },
+  "lora::layers.17.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.17.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.17.cross_attn.to_out",
+   "A": "loraA::layers.17.cross_attn.to_out",
+   "B": "loraB::layers.17.cross_attn.to_out",
+   "P": "loraP::layers.17.cross_attn.to_out"
+  },
+  "lora::layers.17.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.17.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.17.to_local_embed.0",
+   "A": "loraA::layers.17.to_local_embed.0",
+   "B": "loraB::layers.17.to_local_embed.0",
+   "P": "loraP::layers.17.to_local_embed.0"
+  },
+  "lora::layers.17.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.17.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.17.to_local_embed.2",
+   "A": "loraA::layers.17.to_local_embed.2",
+   "B": "loraB::layers.17.to_local_embed.2",
+   "P": "loraP::layers.17.to_local_embed.2"
+  },
+  "lora::layers.17.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.17.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.17.ff.ff.0.proj",
+   "A": "loraA::layers.17.ff.ff.0.proj",
+   "B": "loraB::layers.17.ff.ff.0.proj",
+   "P": "loraP::layers.17.ff.ff.0.proj"
+  },
+  "lora::layers.17.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.17.ff.ff.2",
+   "adapter_key": "model.transformer.layers.17.ff.ff.2",
+   "A": "loraA::layers.17.ff.ff.2",
+   "B": "loraB::layers.17.ff.ff.2",
+   "P": "loraP::layers.17.ff.ff.2"
+  },
+  "lora::layers.18.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.18.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.18.self_attn.to_qkv",
+   "A": "loraA::layers.18.self_attn.to_qkv",
+   "B": "loraB::layers.18.self_attn.to_qkv",
+   "P": "loraP::layers.18.self_attn.to_qkv"
+  },
+  "lora::layers.18.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.18.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.18.self_attn.to_out",
+   "A": "loraA::layers.18.self_attn.to_out",
+   "B": "loraB::layers.18.self_attn.to_out",
+   "P": "loraP::layers.18.self_attn.to_out"
+  },
+  "lora::layers.18.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.18.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.18.cross_attn.to_q",
+   "A": "loraA::layers.18.cross_attn.to_q",
+   "B": "loraB::layers.18.cross_attn.to_q",
+   "P": "loraP::layers.18.cross_attn.to_q"
+  },
+  "lora::layers.18.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.18.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.18.cross_attn.to_kv",
+   "A": "loraA::layers.18.cross_attn.to_kv",
+   "B": "loraB::layers.18.cross_attn.to_kv",
+   "P": "loraP::layers.18.cross_attn.to_kv"
+  },
+  "lora::layers.18.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.18.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.18.cross_attn.to_out",
+   "A": "loraA::layers.18.cross_attn.to_out",
+   "B": "loraB::layers.18.cross_attn.to_out",
+   "P": "loraP::layers.18.cross_attn.to_out"
+  },
+  "lora::layers.18.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.18.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.18.to_local_embed.0",
+   "A": "loraA::layers.18.to_local_embed.0",
+   "B": "loraB::layers.18.to_local_embed.0",
+   "P": "loraP::layers.18.to_local_embed.0"
+  },
+  "lora::layers.18.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.18.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.18.to_local_embed.2",
+   "A": "loraA::layers.18.to_local_embed.2",
+   "B": "loraB::layers.18.to_local_embed.2",
+   "P": "loraP::layers.18.to_local_embed.2"
+  },
+  "lora::layers.18.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.18.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.18.ff.ff.0.proj",
+   "A": "loraA::layers.18.ff.ff.0.proj",
+   "B": "loraB::layers.18.ff.ff.0.proj",
+   "P": "loraP::layers.18.ff.ff.0.proj"
+  },
+  "lora::layers.18.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.18.ff.ff.2",
+   "adapter_key": "model.transformer.layers.18.ff.ff.2",
+   "A": "loraA::layers.18.ff.ff.2",
+   "B": "loraB::layers.18.ff.ff.2",
+   "P": "loraP::layers.18.ff.ff.2"
+  },
+  "lora::layers.19.self_attn.to_qkv": {
+   "in": 1024,
+   "out": 3072,
+   "ckpt_suffix": "layers.19.self_attn.to_qkv",
+   "adapter_key": "model.transformer.layers.19.self_attn.to_qkv",
+   "A": "loraA::layers.19.self_attn.to_qkv",
+   "B": "loraB::layers.19.self_attn.to_qkv",
+   "P": "loraP::layers.19.self_attn.to_qkv"
+  },
+  "lora::layers.19.self_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.19.self_attn.to_out",
+   "adapter_key": "model.transformer.layers.19.self_attn.to_out",
+   "A": "loraA::layers.19.self_attn.to_out",
+   "B": "loraB::layers.19.self_attn.to_out",
+   "P": "loraP::layers.19.self_attn.to_out"
+  },
+  "lora::layers.19.cross_attn.to_q": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.19.cross_attn.to_q",
+   "adapter_key": "model.transformer.layers.19.cross_attn.to_q",
+   "A": "loraA::layers.19.cross_attn.to_q",
+   "B": "loraB::layers.19.cross_attn.to_q",
+   "P": "loraP::layers.19.cross_attn.to_q"
+  },
+  "lora::layers.19.cross_attn.to_kv": {
+   "in": 1024,
+   "out": 2048,
+   "ckpt_suffix": "layers.19.cross_attn.to_kv",
+   "adapter_key": "model.transformer.layers.19.cross_attn.to_kv",
+   "A": "loraA::layers.19.cross_attn.to_kv",
+   "B": "loraB::layers.19.cross_attn.to_kv",
+   "P": "loraP::layers.19.cross_attn.to_kv"
+  },
+  "lora::layers.19.cross_attn.to_out": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.19.cross_attn.to_out",
+   "adapter_key": "model.transformer.layers.19.cross_attn.to_out",
+   "A": "loraA::layers.19.cross_attn.to_out",
+   "B": "loraB::layers.19.cross_attn.to_out",
+   "P": "loraP::layers.19.cross_attn.to_out"
+  },
+  "lora::layers.19.to_local_embed.0": {
+   "in": 257,
+   "out": 1024,
+   "ckpt_suffix": "layers.19.to_local_embed.0",
+   "adapter_key": "model.transformer.layers.19.to_local_embed.0",
+   "A": "loraA::layers.19.to_local_embed.0",
+   "B": "loraB::layers.19.to_local_embed.0",
+   "P": "loraP::layers.19.to_local_embed.0"
+  },
+  "lora::layers.19.to_local_embed.2": {
+   "in": 1024,
+   "out": 1024,
+   "ckpt_suffix": "layers.19.to_local_embed.2",
+   "adapter_key": "model.transformer.layers.19.to_local_embed.2",
+   "A": "loraA::layers.19.to_local_embed.2",
+   "B": "loraB::layers.19.to_local_embed.2",
+   "P": "loraP::layers.19.to_local_embed.2"
+  },
+  "lora::layers.19.ff.ff.0.proj": {
+   "in": 1024,
+   "out": 8192,
+   "ckpt_suffix": "layers.19.ff.ff.0.proj",
+   "adapter_key": "model.transformer.layers.19.ff.ff.0.proj",
+   "A": "loraA::layers.19.ff.ff.0.proj",
+   "B": "loraB::layers.19.ff.ff.0.proj",
+   "P": "loraP::layers.19.ff.ff.0.proj"
+  },
+  "lora::layers.19.ff.ff.2": {
+   "in": 4096,
+   "out": 1024,
+   "ckpt_suffix": "layers.19.ff.ff.2",
+   "adapter_key": "model.transformer.layers.19.ff.ff.2",
+   "A": "loraA::layers.19.ff.ff.2",
+   "B": "loraB::layers.19.ff.ff.2",
+   "P": "loraP::layers.19.ff.ff.2"
+  },
+  "lora::project_out": {
+   "in": 1024,
+   "out": 256,
+   "ckpt_suffix": "project_out",
+   "adapter_key": "model.transformer.project_out",
+   "A": "loraA::project_out",
+   "B": "loraB::project_out",
+   "P": "loraP::project_out"
+  },
+  "lora::postprocess_conv": {
+   "in": 256,
+   "out": 256,
+   "ckpt_suffix": "postprocess_conv",
+   "adapter_key": "model.postprocess_conv",
+   "A": "loraA::postprocess_conv",
+   "B": "loraB::postprocess_conv",
+   "P": "loraP::postprocess_conv"
+  }
+ },
+ "provenance": {
+  "built_by": "lora/build_branch.py --model sa3-sm-music",
+  "source_onnx": "stabilityai/stable-audio-3-optimized : onnx/sa3-sm-music/dit_fp16.onnx",
+  "onnx_sha256_head64m": "eb0feaa45b7c7dea1b6ebcf23ea82077ebc7b1a84a76e92a607e23c2239c4b2a",
+  "targets_mode": "all",
+  "n_targets": 193,
+  "rank_max": 512,
+  "rank_opt": 32,
+  "note": "the layer map is a property of the ONNX graph and ships with the repo; the engine is built locally because TensorRT bakes in the GPU architecture, and its location comes from paths.for_model(<model>).branch_engine"
+ }
+}

@@ -7,9 +7,12 @@ PCM tensor, eliminating per-stage Python / CUDA submission overhead.
 
 Mega-graph path requirements:
   --cfg 1.0 (the default)
+  --init-noise-level 1.0 (the default)
   no --inpaint-range
   no --init-audio
-The script falls back to sa3_trt.py's eager pipeline for anything else.
+Anything else delegates to sa3_trt_core.main()'s eager pipeline. That handoff happens
+BEFORE this module loads any engine — canon.main() loads its own set, so loading here
+first left two full sets resident and doubled peak VRAM (see _delegate_to_eager).
 
 Usage: same CLI as sa3_trt.py. Optional --no-mega-graph forces the eager
 path even for the fast case (useful for ablation).
@@ -29,20 +32,21 @@ The canonical CLI invokes one inference per process, so users never see
 the drift in practice.
 """
 from __future__ import annotations
-import argparse, math, os, random, sys, threading, time, wave
+import argparse, json, math, os, random, sys, threading, time, wave
 from pathlib import Path
 import numpy as np
 
 # Reuse everything from the canonical script — including its lazy torch/trt
 # imports, engine path resolution, and all the helper classes.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tensorrt as trt          # windowed decode builds its own contexts
 import sa3_trt_core as canon
 from sa3_trt_core import (
     # Module-level state we touch:
     SAMPLE_RATE, SAMPLES_PER_LATENT, IO_CHANNELS, T5_MAX_LEN, COND_DIM,
     DIT_CHOICES, DECODER_PATHS, ENCODER_PATHS,
     DIT_ENGINE_FILES, DECODER_FILES, ENCODER_FILES, SHARED_FILES,
-    HF_REPO_ID, ARCH,
+    HF_REPO_ID, ARCH, DECODER_MIN_L,
     # Helpers:
     _import_heavy, _ensure_files, _init_nvml, _stage_vram, _my_vram_bytes,
     _STAGE_VRAMS, _silence_fd, _fmt_mem,
@@ -52,10 +56,160 @@ from sa3_trt_core import (
     t5gemma_encode, encoder_encode, decoder_decode,
     build_pingpong_schedule, sample_flow_pingpong,
     save_wav, read_wav,
+    # Checked enqueue for capture regions — shared so both graphs behave alike.
+    _enqueue_captured as _enqueue,
 )
 
 
+_WRAPPER_ONLY_FLAGS = ("--mega-graph", "--no-mega-graph")
+
+
+def _delegate_to_eager(args) -> None:
+    """Hand off to canon.main() for any configuration the mega-graph cannot serve.
+
+    MUST be called before this module loads a single engine. canon.main() loads its
+    own T5 + DiT + decoder, so loading them here first left two full sets resident —
+    this frame keeps the first set referenced for as long as canon.main() runs. That
+    doubled peak VRAM (measured 26.7-26.8 GB against 14.7 GB for medium + same-l) and
+    on a 32 GB card it OOM'd *every* eager configuration: --cfg != 1,
+    audio-to-audio, inpaint, --init-noise-level != 1, and --no-mega-graph. It is also
+    the "malloc_consolidate(): invalid chunk size" abort that had been recorded
+    against medium + same-l + cfg>1 — the trigger was never CFG itself, only that
+    asking for CFG routes you here.
+
+    canon.main() re-parses sys.argv from scratch, so anything this wrapper already
+    resolved has to be pinned into argv or it gets re-derived differently. --seed is
+    the one that silently corrupts results: prompt_user_if_missing() picks a RANDOM
+    seed when the user omits it and the banner has already printed that value, so
+    letting canon draw its own meant the render did not match the seed we reported
+    and could not be reproduced from it.
+    """
+    print()
+    print(dim("  Mega-graph path unavailable for this configuration; "
+              "delegating to sa3_trt_core.main()..."))
+    argv = [a for a in sys.argv if a not in _WRAPPER_ONLY_FLAGS]
+    for flag, val in (("--dit", args.dit), ("--decoder", args.decoder),
+                      ("--precision", args.precision), ("--seed", args.seed)):
+        if val is not None and flag not in argv:
+            argv += [flag, str(val)]
+    sys.argv = argv
+    canon.main()
+
+
 # ─── Full-pipeline CUDA-graph runner ─────────────────────────────────────
+class _SecondContext:
+    """A second TRT execution context on an ALREADY-LOADED engine.
+
+    The eager path (CFG / audio-to-audio / inpaint / σmax≠1) has to call
+    set_input_shape + set_tensor_address on every step, at whatever L the request
+    asks for. Doing that on the same context the mega-graph captured is unsafe:
+    DiTRunner._setup() reallocates its velocity buffer when L changes, and the
+    captured graph still launches kernels pointing at the OLD allocation — which
+    torch is then free to hand to someone else. The failure is silent (garbage or
+    stale audio on the next fast-path replay), so the eager path gets its own
+    context instead.
+
+    Costs activation memory only — the engine's weights are shared, not re-loaded.
+    """
+
+    def __init__(self, runner: TRTRunner, scratch=None):
+        """scratch: optional shared device buffer (see SA3Inference._share_scratch).
+
+        A separate CONTEXT is required (the reason is above), but the separate SCRATCH is not: the
+        eager path and the captured graph never run concurrently -- the inference lock serialises
+        them -- and TRT device memory is pure scratch, re-derived on every execution rather than
+        carried between calls. Left STATIC, each eager context re-added the engine's full private
+        worst case (~980 MiB on `large`), giving back most of what sharing just saved.
+        """
+        torch = canon.torch
+        self.engine = runner.engine
+        if scratch is not None:
+            import tensorrt as _trt
+            self.context = runner.engine.create_execution_context(
+                _trt.ExecutionContextAllocationStrategy.USER_MANAGED)
+            self.context.set_device_memory(scratch.data_ptr(), scratch.numel())
+        else:
+            self.context = runner.engine.create_execution_context()
+        self.stream = torch.cuda.Stream()
+        self.in_dtype = dict(runner.in_dtype)
+        self.out_dtype = dict(runner.out_dtype)
+
+    def free(self):
+        del self.context
+
+
+class BatchedDiT:
+    """Batch-N DiT forward on a var-batch engine (one enqueue, not N).
+
+    The canonical engine bakes batch=1, so CFG has to run cond and uncond as two sequential
+    calls. The var-batch engine (traced with axis 0 dynamic, built `--batches 1,2`) carries
+    one optimization profile per batch size, so the pair goes through as a single batch-2
+    call with tactics tuned for that shape.
+
+    `attach()` returns None when the engine has no profile covering this batch, so callers
+    fall back to the sequential dual pass without inspecting TRT themselves.
+    """
+
+    def __init__(self, engine, batch, profile_index):
+        torch = canon.torch
+        self.engine = engine
+        self.batch = batch
+        self.profile_index = profile_index
+        self.context = engine.create_execution_context()
+        self.stream = torch.cuda.Stream()
+        self.context.set_optimization_profile_async(profile_index, self.stream.cuda_stream)
+        self.stream.synchronize()
+        self._L = None
+        self._vel = None
+
+    @classmethod
+    def attach(cls, runner, batch=2):
+        eng = runner.engine
+        for p in range(eng.num_optimization_profiles):
+            try:
+                mn, _opt, mx = eng.get_tensor_profile_shape("x", p)
+            except Exception:
+                continue
+            if mn[0] <= batch <= mx[0]:
+                return cls(eng, batch, p)
+        return None
+
+    def _setup(self, L):
+        if L == self._L:
+            return
+        torch = canon.torch
+        b, ctx = self.batch, self.context
+        ctx.set_input_shape("x", (b, IO_CHANNELS, L))
+        ctx.set_input_shape("t", (b,))
+        ctx.set_input_shape("t5_hidden", (b, T5_MAX_LEN, COND_DIM))
+        ctx.set_input_shape("t5_mask", (b, T5_MAX_LEN))
+        ctx.set_input_shape("seconds_total", (b,))
+        ctx.set_input_shape("local_add_cond", (b, 257, L))
+        self._vel = torch.empty(tuple(ctx.get_tensor_shape("velocity")),
+                                dtype=torch.float32, device="cuda")
+        self._L = L
+
+    def step(self, x, t, t5_hidden, t5_mask, seconds, local_add_cond):
+        """All inputs batch-N on cuda. Returns velocity (N, 256, L)."""
+        torch = canon.torch
+        self._setup(x.shape[-1])
+        ctx = self.context
+        held = []                                   # keep the contiguous copies alive
+        for name, ten in (("x", x), ("t", t), ("t5_hidden", t5_hidden),
+                          ("t5_mask", t5_mask), ("seconds_total", seconds),
+                          ("local_add_cond", local_add_cond)):
+            c = ten.float().contiguous()
+            held.append(c)
+            ctx.set_tensor_address(name, c.data_ptr())
+        ctx.set_tensor_address("velocity", self._vel.data_ptr())
+        self.stream.wait_stream(torch.cuda.current_stream())
+        if not ctx.execute_async_v3(self.stream.cuda_stream):
+            raise RuntimeError(f"batched DiT enqueue failed (batch={self.batch}, "
+                               f"L={x.shape[-1]})")
+        self.stream.synchronize()
+        return self._vel.clone()
+
+
 class FullPipelineGraph:
     """Captures T5 + DiT-loop + decoder + narrow + DtoH in ONE CUDA graph.
 
@@ -87,7 +241,18 @@ class FullPipelineGraph:
     """
 
     def __init__(self, t5_runner: TRTRunner, dit: DiTRunner, dec_runner: TRTRunner,
-                 L: int, steps: int, requested_samples: int):
+                 L: int, steps: int, requested_samples: int, dec_chunk_lat: int = 0,
+                 scratch=None, balance: bool = True):
+        # dec_chunk_lat > 0 captures the decode as a sequence of windows instead of one call,
+        # which is what lets the decoder engine be built with a low profile ceiling: scratch is
+        # linear in the ceiling and committed at create_execution_context(), so a 4096-ceiling
+        # engine reserves ~5.5 GB whether it decodes 32 latents or 4096. Chunking inside the graph
+        # keeps every enqueue within `dec_chunk_lat` while the render length stays free.
+        # Addresses are re-pointed per window between enqueues; set_tensor_address is host-side, so
+        # each recorded enqueue bakes the offsets that were current when it was captured.
+        self.dec_chunk_lat = int(dec_chunk_lat or 0)
+        self.dec_balance = bool(balance)
+        self.dec_win_lat = self.dec_chunk_lat   # actual window width (<= chunk once balanced)
         self.t5_runner = t5_runner
         self.dit = dit
         self.dec_runner = dec_runner
@@ -108,8 +273,107 @@ class FullPipelineGraph:
         self.pcm_int16_buf = None       # (T_lat*4096, 2) int16, device
         self.pinned_host_pcm = None     # (T_lat*4096, 2) int16, pinned host
         self.local_add_cond_buf = None  # (1, 257, L) fp32, device (kept zero)
+        self._dec_plan = None           # [(start, size)] windows, when chunking
+        self._shared_scratch = scratch  # SA3Inference._scratch, shared by every engine+graph
+        self._dec_ctx_main = None       # THIS graph's decoder context (never the runner's -- see
+                                        # build(); destroying a context a graph was captured from
+                                        # segfaults that graph's replay)
+        self._dec_ctx_tail = None       # 2nd context for a short tail window (odd L)
+        self._dec_win_i32 = None        # one window's int32 PCM, reused by every window
+        self._dec_win_lat = None        # one window's latents, CONTIGUOUS (see _decode_windows)
+        self._ceiling_buf = None        # persistent scalar for a runtime limiter ceiling
+        self._dec_scratch = None        # shared scratch buffer for the decoder contexts
         self._graph = None
         self._built = False
+
+    def set_limiter_ceiling(self, value: float):
+        """Change the limiter ceiling between graph replays -- a 4-byte write, no recapture.
+
+        canon.LIMITER_BYPASS disables limiting; the graph's +-1.0 clamp still bounds the output.
+        """
+        if self._ceiling_buf is None:
+            raise ValueError("this decoder engine bakes the ceiling in; rebuild with "
+                             "build_ship_capped.py --ceiling-input")
+        self._ceiling_buf.fill_(float(value))
+
+    @staticmethod
+    def _plan_windows(N: int, chunk: int, trim: int = 16, balance: bool = True):
+        """Even-aligned windows covering N. `balance` shrinks them to the smallest uniform size
+        that still covers N, instead of always using the full `chunk`.
+
+        Why balance matters: the stitch requires consecutive starts to be exactly `w - trim`
+        apart, so a fixed-width plan covers only `chunk - trim` = 240 new latents per window. Just
+        above the chunk size that is brutally wasteful -- L=257 pads to 258 and needs TWO full
+        256-windows, decoding 512 latents to produce 258. Measured 25.9 ms against 12.3 ms at
+        L=256: one extra latent for 2.1x the time. The waste decays as 256*n/N (1.99x at 257,
+        1.50x at 512, 1.25x at 1024, 1.06x at 4096), which is exactly the shape of the measured
+        latency curve -- predicted-from-waste tracks measured within 3-7% at every length.
+
+        Balancing picks the smallest n with an even w <= chunk satisfying n*w - (n-1)*trim >= N,
+        which pins the waste at a flat ~1.07x everywhere. Measured recovery, eager, vs the
+        fixed-width plan: L=257 1.68x, 512 1.30x, 1024 1.14x, 1291 1.07x, and nothing at 2048+
+        where the fixed plan was already optimal. Accuracy is UNCHANGED (+-0.1 dB vs the shipped
+        full-length decode at every length) -- the extra SWA edges cost nothing measurable.
+
+        ⚠ `balance` is a property of the CALLER, not of the decoder. A balanced window size varies
+        with N, and on the eager path a varying decoder shape costs ~34-40 ms per switch (which
+        made balanced decoding 22% WORSE on a mixed-length stream -- hence balance=False in
+        canon.decode_chunked). Inside a captured graph the shape is resolved once at capture and
+        replay never rebinds, so the switch is free and only the saved work remains.
+        """
+        w = chunk
+        if balance:
+            for n in range(1, N // 2 + 2):
+                cand = -(-(N + (n - 1) * trim) // n)
+                cand += cand & 1                      # keep every start even (SAME-S parity)
+                if cand <= chunk:
+                    w = cand
+                    break
+        step = (w - trim) // 2 * 2
+        starts = list(range(0, N - w, step))
+        last = -(-(N - w) // 2) * 2
+        if not starts or starts[-1] != last:
+            starts.append(last)
+        return [(st, (N - st) if i == len(starts) - 1 else w)
+                for i, st in enumerate(starts)]
+
+    def _decode_windows(self, capture_stream):
+        """Enqueue the windowed decode, narrowing each window into pcm_int16_buf.
+
+        Interiors are trimmed by half the overlap on each neighbour-facing edge, matching
+        canon.decode_chunked and the repo's encode_chunked. Addresses are re-pointed per window;
+        each enqueue records the offsets current at capture time.
+        """
+        SPL = SAMPLES_PER_LATENT
+        trim = 16
+        half = trim // 2
+        n = len(self._dec_plan)
+        for i, (st, sz) in enumerate(self._dec_plan):
+            ctx = (self._dec_ctx_tail if (self._dec_ctx_tail is not None
+                                           and sz != self.dec_win_lat)
+                   else (self._dec_ctx_main or self.dec_runner.context))
+            # Gather the window into a CONTIGUOUS buffer. Offsetting the latent pointer instead
+            # does not work: decoder_in_buf is (1, 256, L) with the 256 channels strided by L, so
+            # a pointer bumped by `st` latents only shifts within the first channel's row and the
+            # engine reads 256*chunk contiguous elements of the wrong data (measured: cos 0.0027
+            # against the unwindowed decode, 80% of samples wrong). The copy is a kernel, so it
+            # captures fine, and the engine's bound address stays fixed across all windows.
+            self._dec_win_lat[..., :sz].copy_(self.decoder_in_buf[..., st:st + sz])
+            ctx.set_tensor_address("latent", self._dec_win_lat.data_ptr())
+            ctx.set_tensor_address("pcm", self._dec_win_i32.data_ptr())
+            if self._ceiling_buf is not None:
+                # Engines with a runtime limiter ceiling: bind it here, because this loop enqueues
+                # the context directly and never goes through decoder_decode (where the default
+                # lives). Unbound, TRT refuses the enqueue -- and under capture that would drop the
+                # decode stage silently.
+                ctx.set_input_shape("limiter_ceiling", ())
+                ctx.set_tensor_address("limiter_ceiling", self._ceiling_buf.data_ptr())
+            _enqueue(ctx, capture_stream, f"decoder window {i} (mega-graph)")
+            kl = 0 if i == 0 else half
+            kr = sz if i == n - 1 else sz - (trim - half)
+            self.pcm_int16_buf[(st + kl) * SPL:(st + kr) * SPL] = \
+                self._dec_win_i32[0, kl * SPL:kr * SPL, :].clamp(-32767, 32767).to(
+                    canon.torch.int16)
 
     def build(self, sigmas, seconds: float, sigma_max: float):
         """Allocate persistent buffers, prime + warm all engines, capture the graph.
@@ -122,6 +386,17 @@ class FullPipelineGraph:
         L = self.L
         ns = self.steps
         T_full = L * SAMPLES_PER_LATENT
+        # ── Padded DECODE length ──
+        # An odd L cannot be tiled by even-start windows of `dec_chunk_lat` (every start must be
+        # even or that window decodes at cos 0.978), so the tail comes out one latent short and
+        # needs a SECOND bound shape -- a second context, and an in-loop shape transition that
+        # costs ~54 ms on SAME-L. Replicating the final latent makes the length even, at which
+        # point every window is exactly dec_chunk_lat and the tail disappears: measured over
+        # L=257..4096, even lengths need no shape but 256, odd lengths need 255 as well.
+        # The extra latent's audio is decoded and then never returned (run() slices to
+        # requested_samples), exactly as canon.decode_chunked already does on the eager path.
+        self._L_dec = L + 1 if (self.dec_chunk_lat and L > self.dec_chunk_lat and L % 2) else L
+        T_dec = self._L_dec * SAMPLES_PER_LATENT
 
         # We force all three engines to execute on the same stream and capture
         # the whole pipeline on that one stream. Easiest: take the DiT runner's
@@ -177,18 +452,121 @@ class FullPipelineGraph:
         self.latents_out_buf = canon.torch.empty(1, IO_CHANNELS, L,
                                                   dtype=canon.torch.float32, device="cuda")
 
-        # ── Decoder: bind static-L addresses ──
+        # ── Decoder: bind addresses ──
         dec_ctx = self.dec_runner.context
-        dec_ctx.set_input_shape("latent", (1, IO_CHANNELS, L))
+        # A runtime limiter ceiling must be bound BEFORE capture: the window loop enqueues the
+        # context directly rather than through decoder_decode (where the default lives), and an
+        # unbound input makes TRT refuse the enqueue -- which under capture would drop the decode
+        # stage silently. Persistent buffer => set_limiter_ceiling() works between replays with no
+        # recapture, the same way seconds_total does.
+        if "limiter_ceiling" in self.dec_runner.in_dtype:
+            self._ceiling_buf = canon.torch.tensor(
+                canon.DEFAULT_LIMITER_CEILING, dtype=canon.torch.float32, device="cuda")
+        if self.dec_chunk_lat and L > self.dec_chunk_lat:
+            self._dec_plan = self._plan_windows(self._L_dec, self.dec_chunk_lat,
+                                                balance=self.dec_balance)
+            # Every window in a balanced plan is the same width, but that width is <= chunk, so
+            # the buffers and bound shape follow the PLAN rather than the engine ceiling.
+            self.dec_win_lat = max(sz for _, sz in self._dec_plan)
+            sizes = sorted({sz for _, sz in self._dec_plan})
+            # SAME-S tiles latents in PAIRS (17 tokens/latent, 34-token chunks, midpoint-shifted by
+            # one latent), so every window START must be even or that window decodes at cos 0.978.
+            assert all(st % 2 == 0 for st, _ in self._dec_plan), "odd window start"
+            # An odd L cannot be covered by uniform even-start windows, so the tail is shorter and
+            # needs its own shape. A second context is cheap because both share one scratch buffer
+            # (validated bit-identical, and it survives graph capture).
+            assert len(sizes) <= 2, f"expected at most 2 window shapes, got {sizes}"
+            dec_ctx.set_input_shape("latent", (1, IO_CHANNELS, self.dec_win_lat))
+        else:
+            self._dec_plan = None
+            dec_ctx.set_input_shape("latent", (1, IO_CHANNELS, L))
         dec_in_dt = self.dec_runner.in_dtype["latent"]
-        self.decoder_in_buf = canon.torch.empty(1, IO_CHANNELS, L, dtype=dec_in_dt, device="cuda")
+        self.decoder_in_buf = canon.torch.empty(1, IO_CHANNELS, self._L_dec,
+                                                 dtype=dec_in_dt, device="cuda")
         # Auto-detect output flavor like decoder_decode does.
         if "pcm" in self.dec_runner.out_dtype:
             self._dec_out_name = "pcm"
             pcm_dt = self.dec_runner.out_dtype["pcm"]
-            self.pcm_int32_buf = canon.torch.empty(1, T_full, 2, dtype=pcm_dt, device="cuda")
-            dec_ctx.set_tensor_address("latent", self.decoder_in_buf.data_ptr())
-            dec_ctx.set_tensor_address("pcm", self.pcm_int32_buf.data_ptr())
+            if self._dec_plan is not None:
+                # One window-sized int32 buffer, reused by every window, instead of a
+                # full-length one: at L=16384 that is 8 MB rather than 537 MB. The int16
+                # destination already exists (pcm_int16_buf), and the graph clamps to
+                # +-32767 before its int32 cast, so narrowing per window is bit-exact.
+                self._dec_win_i32 = canon.torch.empty(
+                    1, self.dec_win_lat * SAMPLES_PER_LATENT, 2, dtype=pcm_dt, device="cuda")
+                self._dec_win_lat = canon.torch.zeros(
+                    1, IO_CHANNELS, self.dec_win_lat,
+                    dtype=self.dec_runner.in_dtype["latent"], device="cuda")
+                self.pcm_int32_buf = self._dec_win_i32          # stage-5 code reads this name
+                sizes = sorted({sz for _, sz in self._dec_plan})
+                tail = [sz for sz in sizes if sz != self.dec_win_lat]
+                if tail:
+                    # An odd L cannot be tiled by uniform even-start windows, so the tail window is
+                    # shorter and needs its own bound shape -- i.e. a second context.
+                    #
+                    # Both decoder contexts must then SHARE one scratch buffer, and the main
+                    # context has to be REPLACED rather than merely re-pointed: TRTRunner created
+                    # it with the default (STATIC) strategy, so it already owns a full private
+                    # scratch allocation. Adding a shared buffer beside it pays 2x instead of 1x,
+                    # which showed up as odd lengths costing ~350 MiB more than their even
+                    # neighbours (L=323 -> 3004 MiB vs L=256 -> 2650). Building both contexts
+                    # USER_MANAGED against one buffer and dropping the STATIC one leaves a single
+                    # allocation. Sharing is safe because the two run sequentially on one stream --
+                    # verified bit-identical and stable under graph capture.
+                    # get_device_memory_size_for_profile_v2, NOT device_memory_size: on a
+                    # multi-profile engine the latter is the MAX ACROSS PROFILES, so a low-band
+                    # deployment would allocate the wide band's 5778 MB here. That showed up as
+                    # odd lengths peaking at 7854 MiB against 2342 for even ones -- the tail
+                    # context is only created when L is odd.
+                    #
+                    # Both contexts belong to THIS GRAPH and are built here rather than reusing
+                    # (and formerly REPLACING) self.dec_runner.context. A captured CUDA graph's
+                    # recorded launches reference the context they were enqueued from, so handing
+                    # the runner a new context destroys the old one underneath every graph already
+                    # in the LRU cache: the next replay of an earlier graph segfaults. That is not
+                    # hypothetical -- two cached graphs whose lengths both need a tail (e.g. 645
+                    # then 1291) crashed on the first replay after the second capture. Per-graph
+                    # contexts are cheap (a few hundred KB of host state each) because they carry
+                    # no scratch of their own.
+                    eng = self.dec_runner.engine
+                    if self._shared_scratch is not None:
+                        # Preferred: the one buffer _share_scratch() already sized for every
+                        # engine. T5 -> DiT -> decoder run sequentially on one stream, so the
+                        # decoder's windows reuse it with no extra allocation at all.
+                        sptr, sbytes = (self._shared_scratch.data_ptr(),
+                                        self._shared_scratch.numel())
+                    else:
+                        # Standalone use (no shared buffer): one per-graph allocation, sized from
+                        # get_device_memory_size_for_profile_v2, NOT device_memory_size -- on a
+                        # multi-profile engine the latter is the MAX ACROSS PROFILES, so a
+                        # low-band deployment would allocate the wide band's 5778 MB here. That
+                        # showed up as odd lengths peaking at 7854 MiB against 2342 for even ones.
+                        _pi = getattr(self.dec_runner, "profile", 0) or 0
+                        sbytes = eng.get_device_memory_size_for_profile_v2(_pi)
+                        self._dec_scratch = canon.torch.empty(sbytes, dtype=canon.torch.uint8,
+                                                               device="cuda")
+                        sptr = self._dec_scratch.data_ptr()
+                    self._dec_ctx_main = eng.create_execution_context(
+                        trt.ExecutionContextAllocationStrategy.USER_MANAGED)
+                    self._dec_ctx_main.set_device_memory(sptr, sbytes)
+                    self._dec_ctx_main.set_input_shape("latent",
+                                                       (1, IO_CHANNELS, self.dec_win_lat))
+                    dec_ctx = self._dec_ctx_main
+                    self._dec_ctx_tail = eng.create_execution_context(
+                        trt.ExecutionContextAllocationStrategy.USER_MANAGED)
+                    self._dec_ctx_tail.set_device_memory(sptr, sbytes)
+                    self._dec_ctx_tail.set_input_shape("latent", (1, IO_CHANNELS, tail[0]))
+                    self._dec_ctx_tail.set_tensor_address("latent", self._dec_win_lat.data_ptr())
+                    self._dec_ctx_tail.set_tensor_address("pcm", self._dec_win_i32.data_ptr())
+                dec_ctx.set_tensor_address("latent", self.decoder_in_buf.data_ptr())
+                dec_ctx.set_tensor_address("pcm", self._dec_win_i32.data_ptr())
+            else:
+                self.pcm_int32_buf = canon.torch.empty(1, T_full, 2, dtype=pcm_dt, device="cuda")
+                dec_ctx.set_tensor_address("latent", self.decoder_in_buf.data_ptr())
+                dec_ctx.set_tensor_address("pcm", self.pcm_int32_buf.data_ptr())
+                if self._ceiling_buf is not None:
+                    dec_ctx.set_input_shape("limiter_ceiling", ())
+                    dec_ctx.set_tensor_address("limiter_ceiling", self._ceiling_buf.data_ptr())
         else:
             # Legacy fp output — graph-capture supported but the postprocess
             # path is different. Not the production target.
@@ -203,7 +581,7 @@ class FullPipelineGraph:
         # Full (T_full, 2) int16 GPU buffer — kept resident; we narrow with a
         # tensor view at replay time. The DtoH copy goes only to the requested
         # window (first requested_samples).
-        self.pcm_int16_buf = canon.torch.empty(T_full, 2, dtype=canon.torch.int16, device="cuda")
+        self.pcm_int16_buf = canon.torch.empty(T_dec, 2, dtype=canon.torch.int16, device="cuda")
         # Pinned host — pre-pinned, persistent. Exactly the right size for
         # this T_lat. The captured DMA copies from device to here.
         self.pinned_host_pcm = canon.torch.empty(T_full, 2, dtype=canon.torch.int16,
@@ -235,7 +613,7 @@ class FullPipelineGraph:
                 # that the engine state evolution is the same — what matters
                 # for downstream determinism is that EACH engine's call count
                 # and rough input pattern matches canonical).
-                self.t5_runner.context.execute_async_v3(capture_stream.cuda_stream)
+                _enqueue(self.t5_runner.context, capture_stream, "t5 (mega-graph)")
                 # DiT single step with zero inputs (matches canon's warmup
                 # `dit.step(_w_x, _w_t, _w_h, _w_m, 30.0, _w_l)`).
                 self.dit._t_buf[0] = 0.5
@@ -244,23 +622,28 @@ class FullPipelineGraph:
                 self.dit._t5_mask_buf.copy_(zero_m)
                 self.dit._local_add_cond_buf.copy_(zero_l)
                 self.dit._sec_buf[0] = 30.0
-                self.dit.runner.context.execute_async_v3(capture_stream.cuda_stream)
+                _enqueue(self.dit.runner.context, capture_stream, "dit (mega-graph)")
                 # Decoder with zero latents (matches canon's _w_lat = zeros).
                 self.decoder_in_buf.copy_(zero_latents)
-                self.dec_runner.context.execute_async_v3(capture_stream.cuda_stream)
+                if self._dec_plan is not None:
+                    # Same window sequence the capture will record -- this warmup exists so the
+                    # decoder context's state at capture matches what it saw while warming.
+                    self._decode_windows(capture_stream)
+                else:
+                    _enqueue(self.dec_runner.context, capture_stream, "decoder (mega-graph)")
             # Then canon runs ONE full sampling pass (8 DiT calls, no decoder).
             # Mirror that here so the DiT context's state also matches.
             self.dit._x_buf.copy_(zero_x)
             for i in range(ns):
                 self.dit._t_buf[0] = float(sigmas[i])
-                self.dit.runner.context.execute_async_v3(capture_stream.cuda_stream)
+                _enqueue(self.dit.runner.context, capture_stream, "dit (mega-graph)")
             # Then canon's GraphPingpongSampler.build() does 2 more 8-step
             # passes of the DiT (still no decoder). Mirror that too.
             for _w in range(2):
                 self.dit._x_buf.copy_(zero_x)
                 for i in range(ns):
                     self.dit._t_buf[0] = float(sigmas[i])
-                    self.dit.runner.context.execute_async_v3(capture_stream.cuda_stream)
+                    _enqueue(self.dit.runner.context, capture_stream, "dit (mega-graph)")
                     v = self.dit._vel_buf.float()
                     denoised = self.dit._x_buf - self._sigma_curr_bufs[i] * v
                     if i < ns - 1:
@@ -287,7 +670,7 @@ class FullPipelineGraph:
         with canon.torch.cuda.stream(capture_stream):
             with canon.torch.cuda.graph(self._graph, stream=capture_stream):
                 # Stage 1: T5
-                self.t5_runner.context.execute_async_v3(capture_stream.cuda_stream)
+                _enqueue(self.t5_runner.context, capture_stream, "t5 (mega-graph)")
                 # Cast attn_mask → fp32 → dit's t5_mask_buf
                 self.dit._t5_mask_buf.copy_(self.attn_mask_buf.float())
                 # T5 hidden (fp32) → dit's t5_hidden_buf
@@ -297,7 +680,7 @@ class FullPipelineGraph:
                 # Stage 3: DiT loop
                 for i in range(ns):
                     self.dit._t_buf[0] = self._sigma_curr_bufs[i]
-                    self.dit.runner.context.execute_async_v3(capture_stream.cuda_stream)
+                    _enqueue(self.dit.runner.context, capture_stream, "dit (mega-graph)")
                     v = self.dit._vel_buf.float()
                     denoised = self.dit._x_buf - self._sigma_curr_bufs[i] * v
                     if i < ns - 1:
@@ -310,10 +693,24 @@ class FullPipelineGraph:
                     else:
                         self.latents_out_buf.copy_(new_x)
                 # Stage 4: Decoder
-                self.decoder_in_buf.copy_(self.latents_out_buf)
-                self.dec_runner.context.execute_async_v3(capture_stream.cuda_stream)
+                self.decoder_in_buf[..., :L].copy_(self.latents_out_buf)
+                if self._L_dec > L:
+                    # Edge-replicate into the pad slot. A device copy, so it captures like any
+                    # other stage and costs one extra latent of decode.
+                    self.decoder_in_buf[..., L:].copy_(self.latents_out_buf[..., -1:])
+                if self._dec_plan is not None:
+                    self._decode_windows(capture_stream)
+                else:
+                    _enqueue(self.dec_runner.context, capture_stream, "decoder (mega-graph)")
                 # Stage 5a: narrow + cast int32 → int16 (or legacy fp32 → int16)
-                if self._dec_out_name == "pcm":
+                if self._dec_plan is not None:
+                    # Already done per window: _decode_windows narrows each window straight into
+                    # pcm_int16_buf, so there is no full-length int32 buffer to convert here
+                    # (that buffer is window-sized in this path -- 8 MB instead of 537 MB at
+                    # L=16384). Running the copy below would try to write a window over the
+                    # whole output.
+                    pass
+                elif self._dec_out_name == "pcm":
                     # Belt-and-suspenders int16 clamp. New engines (from the
                     # FP32 clip+scale fix in the ONNX producer) already bound
                     # the int32 output to ±32767, so this is a no-op for them.
@@ -368,11 +765,101 @@ class FullPipelineGraph:
             # Replay the full pipeline.
             self._graph.replay()
         stream.synchronize()
+        # The mega-graph never surfaces the latent -- DiT, decode and the DtoH are one capture
+        # -- so canon.assert_finite_latent() in the samplers cannot see this path. Check the
+        # buffer the decoder read instead. A NaN latent decodes to int16 ZERO, i.e. EXACT
+        # digital silence with every call reporting success.
+        canon.assert_finite_latent(self.decoder_in_buf, "FullPipelineGraph.run")
         # pinned_host_pcm has been written by the DtoH; return a view.
         return self.pinned_host_pcm[:self.requested_samples].numpy()
 
 
 # ─── Reusable inference class (CLI + gradio share this) ─────────────────
+def _is_float(t):
+    try:
+        float(t)
+        return True
+    except ValueError:
+        return False
+
+
+def _lora_dir():
+    """scripts/lora/ -- next to this file, NOT one level up.
+
+    ⚠ Both map finders below used to glob `<tensorRT>/lora`, which is where this package
+    sat before it moved under scripts/. That directory does not exist in the shipped tree,
+    so every glob came back empty and --lora raised "no branch map matches" before loading
+    anything. One function, so there is one answer.
+    """
+    return Path(__file__).resolve().parent / "lora"
+
+
+def _lora_paths():
+    """The lora package's `paths` module, with scripts/lora on sys.path."""
+    d = str(_lora_dir())
+    if d not in sys.path:
+        sys.path.insert(0, d)
+    import paths as lora_paths
+    return lora_paths
+
+
+def _branch_map_for(engine, model=None):
+    """The branch map whose targets EXACTLY match this engine's lora inputs.
+
+    Matched on names, not filenames: the engines differ only in WHICH linears they branch,
+    so a hand-paired map mis-sizes every operand and nothing raises. `model` only reorders
+    the search; the name match is still what decides.
+
+    sm-music and sm-sfx cannot be told apart this way -- their graphs are the same shape, so
+    their maps' `layers` and `rank_max` are byte-identical and only the provenance differs.
+    That is why passing the wrong one between those two is harmless, and why the `model`
+    hint exists: to land on the one whose provenance actually describes this engine.
+    """
+    want = {engine.get_tensor_name(i) for i in range(engine.num_io_tensors)
+            if engine.get_tensor_name(i).startswith("loraA::")}
+    lp = _lora_paths()
+    cands = list(lp.branch_map_candidates())
+    if model is not None:
+        try:
+            pref = lp.for_model(model).branch_map
+            cands = [pref] + [c for c in cands if c != pref]
+        except (ValueError, KeyError):
+            pass
+    for f in cands:
+        try:
+            m = json.loads(Path(f).read_text())["layers"]
+        except Exception:
+            continue
+        if {rec["A"] for rec in m.values()} == want:
+            return str(f)
+    raise RuntimeError(
+        f"no branch map matches this engine's {len(want)} lora inputs\n"
+        f"    looked at: {', '.join(str(c) for c in cands) or '(none found)'}\n"
+        f"    build the map with:  python scripts/lora/build_branch.py --model <m>")
+
+
+def _detect_map_for(engine, model=None):
+    """Back-compatible name for _branch_map_for."""
+    return _branch_map_for(engine, model)
+
+
+
+
+def _adapter_rank(path):
+    """Rank an adapter will contribute to the stack, read from its tensors (no fold)."""
+    import struct as _struct
+    with open(path, "rb") as f:
+        n = _struct.unpack("<Q", f.read(8))[0]
+        hdr = json.loads(f.read(n))
+    for k, v in hdr.items():
+        if k.endswith(".lora_A"):
+            return int(v["shape"][0])
+        if k.endswith(".M_xs"):          # -xs adapters: M_xs is [r, r]
+            return int(v["shape"][0])
+    raise ValueError(f"cannot determine rank of {path}")
+
+
+
 class SA3Inference:
     """SA3 TRT inference, set up once and reused.
 
@@ -391,26 +878,45 @@ class SA3Inference:
 
     MAX_GRAPHS = 4
     DEFAULT_SIGMA_MAX = 1.0  # mega-graph path requires this
+    # Hard latent-length bounds. Every DiT engine's TRT profile is L=1..4096, the
+    # SAME-L decoder caps at 4096, and for --precision fp8 the baked RoPE cos/sin
+    # tables are sized to exactly 4096 (a longer render needs a re-bake). Enforced
+    # in get_graph() so every library caller (gradio / API / generate) is covered,
+    # not just the CLI.
+    DIT_MIN_L = 1
+    DIT_MAX_L = 4096
+    # The decoders' own floor is DECODER_MIN_L (32) from sa3_trt_core — the DiT's
+    # profile starts at 1, so nothing used to enforce it and a short render passed
+    # validation, ran the DiT happily, then died or fell silent inside the decoder
+    # instead of being rejected up front.
 
     def __init__(self, dit: str, decoder: str, *,
                  precision: str | None = None,
+                 dec_precision: str = "canonical",
                  default_T_lat: int = 324, default_steps: int = 8,
                  default_seconds: float = 30.0,
                  models_dir: Path | None = None,
                  with_encoder: bool = False,
+                 chunking: bool = True,
+                 dit_engine: "Path | str | None" = None,
+                 dec_engine: "Path | str | None" = None,
                  quiet: bool = False):
         """Load engines + build a warmup graph.
 
         Args:
             dit:            one of DIT_CHOICES — "sm-music" / "sm-sfx" / "medium"
             decoder:        one of DECODER_PATHS — "same-s" / "same-l"
-            precision:      None (default → per model: "bf16" for medium, else
-                            "fp16mixed"), or an explicit "bf16" (medium only;
-                            FMHA-fused, ~1.8-4.7× faster, within the perceptual
-                            floor, not seed-reproducible vs fp16mixed),
-                            "fp16mixed" (canonical, bit-reproducible), or "fp32"
-                            (bit-equiv PyTorch eager, ~2× slower). Engines auto-
-                            download from HF if the requested file is missing.
+            precision:      None (default → "fp16" for every model), or an
+                            explicit "fp16" (canonical: FP16 trunk, FP32
+                            RMSNorm/RoPE islands, FMHA-fused FP16 attention core),
+                            "fp8" (medium only; max-speed clean tier — fp8 linears
+                            + bf16 fused FMHA + baked fp32 RoPE, ~1.3× faster than
+                            fp16 and clean at long sequence, capped L≤4096),
+                            or "fp32" (bit-equiv
+                            PyTorch eager, ~2× slower). ("fp16mixed" and the
+                            retired medium-only "bf16" alias to "fp16".)
+                            Engines auto-download
+                            from HF if the requested file is missing.
             default_T_lat:  latent length to build the initial graph at
             default_steps:  pingpong steps for the initial graph
             default_seconds: duration condition for the initial graph (used for
@@ -418,21 +924,37 @@ class SA3Inference:
             models_dir:     override the canonical models/ root (optional)
             with_encoder:   also load the audio encoder TRT engine (needed for
                             future audio-to-audio / inpaint modes)
+            dit_engine:     explicit DiT engine path, overriding the precision-derived default.
+                            ⚠ Needed by any caller that picks an engine FILE rather than a
+                            precision: get_dit_engine_path() rebuilds the path from
+                            <arch>/<subdir>/dit_<precision>.trt and ignores DIT_CHOICES[...]
+                            ["engine"], so mutating that global silently had no effect -- the
+                            gradio variant dropdown was a no-op and every render used the fp16
+                            engine whatever the user chose.
+            dec_engine:     same, for the decoder.
+            chunking:       True (default) selects the engines' LOW band -- decode in
+                            256-latent windows, encode in 64 -- which is the only thing that
+                            reduces the scratch reservation, because TRT commits scratch from
+                            the profile ceiling before any shape is bound. 509 MB instead of
+                            8143 for the SAME-L decoder. False selects the WIDE band: one
+                            single-shot call, ~10-20% faster above L=256 and ~5.4 GB more
+                            resident. Ignored by single-profile engines.
             quiet:          suppress per-stage print() output from canon helpers
         """
         if dit not in DIT_CHOICES:
             raise ValueError(f"unknown dit={dit!r}; valid: {list(DIT_CHOICES)}")
         if decoder not in DECODER_PATHS:
             raise ValueError(f"unknown decoder={decoder!r}; valid: {list(DECODER_PATHS)}")
-        # Resolve precision default per model: bf16 for medium (FMHA-fused speed
-        # default), fp16-mixed for sm-music/sm-sfx. bf16 is medium-only.
+        # Resolve precision default per model: fp16 everywhere. Retired tokens
+        # (fp16mixed, bf16) alias to fp16.
         if precision is None:
             precision = canon.default_precision(dit)
+        precision = canon.normalize_precision(precision)
         if precision not in canon.PRECISIONS:
             raise ValueError(f"unknown precision={precision!r}; valid: {canon.PRECISIONS}")
-        if precision == "bf16" and dit != "medium":
-            raise ValueError("precision='bf16' is only available for dit='medium' "
-                             "(sm-music/sm-sfx already fuse in fp16mixed)")
+        if precision == "fp8" and dit != "medium":
+            raise ValueError("precision='fp8' is only available for dit='medium' "
+                             "(fp8 linears + bf16 FMHA + baked fp32 RoPE; sm-music/sm-sfx ship fp16 only)")
 
         # Quiet: patch canon's stage/sub/_stage_vram to no-ops so loading
         # doesn't spam stdout (gradio in particular wants a clean log).
@@ -446,7 +968,7 @@ class SA3Inference:
         if models_dir is not None and str(models_dir) != str(canon.MODELS_DIR):
             new_root = Path(models_dir).resolve()
             new_arch_dir = new_root / ARCH
-            canon.T5GEMMA_PATH = new_arch_dir / "t5gemma" / "t5gemma_fp16mixed.trt"
+            canon.T5GEMMA_PATH = new_arch_dir / "t5gemma" / "t5gemma_fp16.trt"
             for kk in DIT_CHOICES:
                 DIT_CHOICES[kk]["engine"] = new_arch_dir / DIT_CHOICES[kk]["engine"].relative_to(canon.ARCH_DIR)
             for kk in DECODER_PATHS:
@@ -456,14 +978,26 @@ class SA3Inference:
             canon.MODELS_DIR = new_root
             canon.ARCH_DIR = new_arch_dir
 
+        # chunking picks the optimization profile (band), not a runtime code path: profile 0 is
+        # the low-ceiling band, 1 the wide one. A single-profile engine only has 0.
+        self.chunking = bool(chunking)
+        self.dec_profile = 0 if chunking else 1
+        self._scratch = None
+        self._scratch_bytes = 0
+        self._eager = None
+        self._eager_dit = None
+        self._cfg_batched = None
         self.dit_name = dit
         self.decoder_name = decoder
         self.precision = precision
+        # _encoder_runner() resolves the encoder by this tier; without it audio-to-audio
+        # and inpainting died on the first attribute read.
+        self.dec_precision = dec_precision
         self.with_encoder = with_encoder
         self.quiet = quiet
 
         # 1. Lazy-download any missing engines (precision-aware).
-        needed = canon.get_engine_files(dit, decoder, precision, with_encoder=with_encoder)
+        needed = canon.get_engine_files(dit, decoder, precision, with_encoder=with_encoder, dec_tier=dec_precision)
         _ensure_files(needed)
 
         # 2. Heavy imports (torch + tensorrt + plugin).
@@ -488,23 +1022,41 @@ class SA3Inference:
         import concurrent.futures
         engine_specs = {
             "t5":  canon.T5GEMMA_PATH,
-            "dit": canon.get_dit_engine_path(dit, precision),
-            "dec": canon.get_decoder_engine_path(decoder, precision),
+            "dit": Path(dit_engine) if dit_engine else canon.get_dit_engine_path(dit, precision),
+            "dec": (Path(dec_engine) if dec_engine else
+                    canon.resolve_decoder_engine(decoder, precision, dec_precision)),
         }
         if with_encoder:
-            engine_specs["enc"] = ENCODER_PATHS[decoder]
+            engine_specs["enc"] = canon.resolve_encoder_engine(decoder, dec_precision)
         t0 = time.time()
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(engine_specs)) as ex:
-            futs = {name: ex.submit(TRTRunner, path) for name, path in engine_specs.items()}
+            # user_managed=True -- _share_scratch() immediately below owns the allocation.
+            futs = {name: ex.submit(TRTRunner, path, None, True,
+                                    self.dec_profile if name in ("dec", "enc") else 0)
+                    for name, path in engine_specs.items()}
             self.runners = {name: fut.result() for name, fut in futs.items()}
         sub(f"{dim(f'engine load (parallel, {len(self.runners)} engines)')} {(time.time()-t0)*1000:.0f} ms")
 
+        self._share_scratch()
         self.dit = DiTRunner(self.runners["dit"])
+
+        # LoRA branch operands (None until set_lora is called; None for a plain engine).
+        self._lora = None
+        self._lora_specs = []
 
         # 5. Graph cache + lock.
         self._graphs: dict[tuple[int, int], FullPipelineGraph] = {}
         self._graph_lru: list[tuple[int, int]] = []
         self._lock = threading.Lock()
+
+        # A branch engine will NOT enqueue with its 3N+1 operands unbound, even unused: TRT
+        # returns "Address is not set for input tensor lora_srow" and refuses. The warmup
+        # capture below is an enqueue, so an engine selected through dit_engine= used to die
+        # in __init__ before any caller could attach an adapter. The CLI already pre-empted
+        # this; the library path -- which is what the gradio uses -- did not.
+        # Must come AFTER the graph cache above: _ensure_lora drops captured graphs.
+        if self._engine_is_branch():
+            self._ensure_lora()
 
         # 6. Build the initial graph at the default config.
         t0 = time.time()
@@ -525,12 +1077,136 @@ class SA3Inference:
         """
         return max(1, math.ceil(seconds * SAMPLE_RATE / SAMPLES_PER_LATENT))
 
+    def _share_scratch(self):
+        """One scratch buffer for every engine loaded at construction (see canon.share_scratch).
+
+        ⚠ Call this ONCE, from __init__, before any execution context or CUDA graph exists.
+        canon.share_scratch() REPLACES each runner's execution context and frees the previous
+        scratch allocation, so calling it again after a render would leave the captured
+        mega-graph and the eager path's contexts pointing at destroyed objects -- a segfault
+        with no Python traceback. That is why the lazily-loaded encoder gets its OWN scratch
+        (see _encoder_runner) instead of being folded in here.
+        """
+        buf = canon.share_scratch(self.runners)
+        if buf is not None:
+            self._scratch, self._scratch_bytes = buf, buf.numel()
+
+    def close(self):
+        """Tear the instance down in the ONE order that is safe on the GPU.
+
+        A captured mega-graph holds raw pointers into the execution contexts it was
+        captured against and into the shared scratch buffer; so do the eager path's
+        _SecondContext objects. Free the runners first and destroying those graphs
+        afterwards touches memory that is already gone -- which surfaces as
+        `CUDA error: an illegal memory access was encountered` on the NEXT render, in
+        a different instance, because a poisoned CUDA context stays poisoned. (That is
+        what the gradio LRU eviction used to do, so switching models twice bricked the
+        server.) Python's own GC order over __dict__ is arbitrary, so relying on
+        refcounting to get this right is not an option: it has to be explicit.
+
+        Idempotent — safe to call twice, and safe on a half-constructed instance.
+        """
+        t = canon.torch
+        try:
+            t.cuda.synchronize()          # nothing may still be in flight
+        except Exception:
+            pass
+        # 1. graphs, 2. eager contexts, 3. runner contexts + engines, 4. the buffer they shared
+        for attr in ("_graphs", "_graph_lru"):
+            try:
+                getattr(self, attr).clear()
+            except Exception:
+                pass
+        self._eager = self._eager_dit = None
+        for _, runner in list(getattr(self, "runners", {}).items()):
+            try:
+                runner.free()
+            except Exception:
+                pass
+        try:
+            self.runners.clear()
+        except Exception:
+            pass
+        self._scratch, self._scratch_bytes = None, 0
+        try:
+            t.cuda.synchronize()
+            t.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def engine_footprint(self) -> dict:
+        """Per-engine resident VRAM: weights (the deserialised engine) + scratch.
+
+        Scratch is read per PROFILE, never device_memory_size_v2 -- on the two-profile
+        autoencoders the latter reports the MAX ACROSS profiles, so a chunked deployment
+        would be blamed for the wide band's 7.8 GB it never reserves.
+
+        `shared` marks the engines folded into one buffer by canon.share_scratch: their
+        scratch is the SAME allocation, so summing the column double-counts.
+        """
+        out = {}
+        for name, r in self.runners.items():
+            try:
+                prof = getattr(r, "profile", 0) or 0
+                scratch = r.engine.get_device_memory_size_for_profile_v2(prof)
+            except Exception:
+                scratch = 0
+            # TRT exposes no API for an engine's weight allocation; the serialised file
+            # size is the faithful proxy, since weights dominate it.
+            try:
+                weights = Path(r.engine_path).stat().st_size
+            except Exception:
+                weights = 0
+            out[name] = {"weights": weights, "scratch": scratch,
+                         "profile": getattr(r, "profile", 0) or 0,
+                         "shared": r._scratch is None}
+        out["_shared_scratch"] = (self._scratch.numel() if self._scratch is not None else 0)
+        return out
+
+    def _dec_min_L(self) -> int:
+        """The loaded decoder engine's real profile floor.
+
+        DECODER_MIN_L (32) is the SHIPPED engines' floor and was a build-time convention, not a
+        model limit -- the DiT's floor is 1, and an engine rebuilt with `--min-l 1` decodes L=1
+        natively at cos 0.9993 (SAME-L) against eager, where padding up to 32 is out-of-
+        distribution and measures 0.82-0.92. So the guard has to ask the engine, not a constant.
+        """
+        try:
+            # ⚠ profile_bounds returns (min, max) as plain ints, not shape tuples. This read
+            # `lo[-1]`, which raises TypeError on an int, so EVERY call fell into the except
+            # and returned the stale DECODER_MIN_L=32 — rejecting every render under ~2.97 s
+            # even though the shipped chunkable engines all report a floor of 1.
+            lo, _ = canon.profile_bounds(self.runners["dec"], "latent")
+            return int(lo)
+        except Exception:
+            return DECODER_MIN_L
+
     def get_graph(self, T_lat: int, steps: int, seconds: float) -> FullPipelineGraph:
         """Return the cached graph for (T_lat, steps), building on miss.
 
         LRU-evicts when the cache exceeds MAX_GRAPHS to keep VRAM bounded.
         Called under the inference lock when reached from generate().
         """
+        # Hard length cap (see DIT_MAX_L). Reject cleanly here so the library path
+        # fails with a clear message rather than a cryptic TRT profile error deep
+        # in graph build. For fp8 this is a real correctness limit (baked RoPE table).
+        dec_min = self._dec_min_L()
+        if T_lat < dec_min:
+            min_s = dec_min * SAMPLES_PER_LATENT / SAMPLE_RATE
+            raise ValueError(
+                f"T_lat={T_lat} is below this decoder engine's profile minimum of "
+                f"{dec_min} (~{min_s:.2f}s). The DiT accepts it but the decoder refuses the "
+                f"shape, so it is rejected here instead of failing obscurely further in. "
+                f"Rebuild the decoder with a lower floor (build_capped.py --min-l 1) to go below.")
+        if not (self.DIT_MIN_L <= T_lat <= self.DIT_MAX_L):
+            max_s = self.DIT_MAX_L * SAMPLES_PER_LATENT / SAMPLE_RATE
+            reason = ("the fp8 baked RoPE table (sized to L=4096; a longer render needs a "
+                      "re-bake — build/make_rope_baked_onnx.py --max-t)"
+                      if self.precision == "fp8" else
+                      "the DiT engine's optimization profile (built for L=1..4096)")
+            raise ValueError(
+                f"T_lat={T_lat} is out of range [{self.DIT_MIN_L}, {self.DIT_MAX_L}] "
+                f"(~{max_s:.0f}s max), bounded by {reason} and the SAME-L decoder's 4096 cap.")
         key = (T_lat, steps)
         if key in self._graphs:
             self._graph_lru.remove(key)
@@ -544,8 +1220,11 @@ class SA3Inference:
         # to the actual requested samples, so one graph per (T_lat, steps)
         # serves any seconds within that T_lat's range.
         max_samples = T_lat * SAMPLES_PER_LATENT
+        _, dec_hi = canon.profile_bounds(self.runners["dec"], "latent")
+        chunk = dec_hi if T_lat > dec_hi else 0
         graph = FullPipelineGraph(self.runners["t5"], self.dit, self.runners["dec"],
-                                   T_lat, steps, max_samples)
+                                   T_lat, steps, max_samples, dec_chunk_lat=chunk,
+                                   scratch=self._scratch)
         graph.build(sigmas, seconds, sigma_max)
         canon.torch.cuda.synchronize()
 
@@ -558,6 +1237,387 @@ class SA3Inference:
             del self._graphs[evict]
         return graph
 
+    # ── LoRA ─────────────────────────────────────────────────────────────
+    def _lora_rank_cap(self):
+        """Max concatenated stack rank, read from the engine's own profile (not hardcoded)."""
+        eng = self.dit.runner.engine
+        _, _, hi = eng.get_tensor_profile_shape("lora_srow", 0)
+        return int(hi[-1])
+
+    def _engine_is_branch(self):
+        eng = self.dit.runner.engine
+        return any(eng.get_tensor_name(i).startswith("lora")
+                   for i in range(eng.num_io_tensors))
+
+    def _detect_branch_map(self):
+        """The map whose targets EXACTLY match this engine's lora inputs.
+
+        One implementation, shared with the CLI path: two copies of this search drifted
+        apart once already, and both ended up globbing a directory that does not exist.
+        """
+        return _branch_map_for(self.dit.runner.engine, getattr(self, "dit_name", None))
+
+    def lora_targets(self):
+        """How many branch targets this DiT engine has (0 if it is a plain engine)."""
+        return 0 if self._lora is None else len(self._lora.map)
+
+    def _ensure_lora(self, branch_map=None):
+        """Attach a RefoldLora to the ALREADY-loaded DiT engine.
+
+        Never loads a second engine: the branch operands are driven through the same
+        ICudaEngine the pipeline is already running, so this costs operand buffers only
+        (~38-43 MB at rank 16) rather than another 2.9 GB.
+        """
+        if self._lora is None:
+            sys.path.insert(0, str(_lora_dir()))
+            from refold_runtime import RefoldLora
+            # model= decides which checkpoint a DoRA fold reads its row norms from, so it
+            # must be THIS pipeline's DiT -- medium's weights against a small engine fold
+            # against the wrong W0 and nothing raises.
+            self._lora = RefoldLora(model=self.dit_name, engine=self.dit.runner.engine,
+                                    branch_map=branch_map or self._detect_branch_map())
+            self._lora.zero(1)                 # a branch engine will not enqueue unbound
+            self.dit.attach_lora(self._lora)
+            self._drop_graphs()
+        return self._lora
+
+    def _drop_graphs(self):
+        """Every cached pipeline graph bakes the operand ADDRESSES, so they die together."""
+        self._graphs.clear()
+        self._graph_lru.clear()
+
+    def set_lora(self, specs, branch_map=None):
+        """Install / replace / clear the LoRA stack. specs = [(adapter_path, strength)].
+
+        Same rank -> fold into the EXISTING operand buffers and every cached graph stays
+        valid, because the addresses it baked are unchanged. That is the hot swap.
+        Different rank (or first load) -> the buffers change shape, so the bindings and every
+        cached graph are dropped and the next generate() recaptures.
+        """
+        with self._lock:
+            B = self._ensure_lora(branch_map)
+            # dict(...) NOT B.bufs: set_stack_gpu mutates the SAME dict in place, so holding a
+            # reference means the "copy into the old buffers" below copies each tensor onto
+            # itself and the captured graph is left pointing at freed memory -- which renders
+            # as silence, not as an error.
+            # The engine's optimisation profile caps the rank of the CONCATENATED stack.
+            # Overrunning it makes TRT reject every operand shape; set_input_shape returns
+            # False rather than raising, so the render then proceeds on the PREVIOUS
+            # bindings and returns confident, wrong audio. Refuse it here instead.
+            cap = self._lora_rank_cap()
+            want = sum(_adapter_rank(pth) for pth, _st in specs)
+            if want > cap:
+                raise ValueError(
+                    f"stack rank {want} exceeds this engine's maximum of {cap} "
+                    f"({len(specs)} adapters). Load fewer adapters, use lower-rank ones, or "
+                    f"rebuild the engine with --rank-max >= {want}.")
+            old_rank, old_bufs = B.rank, dict(B.bufs)
+            if not specs:
+                B.zero(1)
+            else:
+                B.set_stack_gpu(list(specs), {})
+            if B.rank == old_rank and old_bufs and self._graphs:
+                for n, v in old_bufs.items():          # keep the captured pointers alive
+                    v.copy_(B.bufs[n])
+                B.bufs = old_bufs
+            else:
+                self.dit.attach_lora(B)
+                self._drop_graphs()
+            # The eager context binds the same operand buffers; a rank change reallocates
+            # them, so it must be re-pointed too or a2a/inpaint/CFG keep the stale addresses.
+            if self._eager_dit is not None:
+                self._eager_dit.attach_lora(B)
+            self._lora_specs = list(specs)
+            # rank = what the adapters carry; rank_bound = what the engine binds, padded
+            # to the fast multiple of 8 (see branch_runtime.pad_rank).
+            return {"rank": B.rank_real, "rank_bound": B.rank,
+                    "targets": len(B.map), "adapters": len(specs)}
+
+    def set_lora_strength(self, per_adapter):
+        """Per-adapter strength, no refold and no recapture (a linear fade)."""
+        with self._lock:
+            if self._lora is None:
+                raise RuntimeError("no LoRA loaded")
+            v = list(per_adapter)
+            # One strength PER ADAPTER. A wrong count otherwise dies inside the runtime as
+            # `mat1 and mat2 shapes cannot be multiplied (1x1 and 3x768)`, which names nothing
+            # useful. A single value broadcasts, since that is what a UI with one slider means.
+            n = len(self._lora_specs) or 1
+            if len(v) == 1 and n > 1:
+                v = v * n
+            if len(v) != n:
+                raise ValueError(f"set_lora_strength expects {n} value(s) for the "
+                                 f"{n}-adapter stack, got {len(v)}")
+            self._lora.set_strengths(v)
+            return {"strengths": v}
+
+
+    # ── Eager path: CFG / negative prompt / audio-to-audio / inpaint ──────
+    #
+    # Same math as sa3_trt_core.main()'s eager branch (sequential dual-pass CFG with
+    # APG, linear init-latent mix for audio-to-audio, keep-mask local_add_cond +
+    # paste-back for inpaint), but driven from the already-loaded engines instead of
+    # a second process, and on its own execution contexts so the captured mega-graph
+    # stays valid (see _SecondContext).
+    def _eager_runners(self):
+        if self._eager is None:
+            self._eager = {n: _SecondContext(self.runners[n], self._scratch)
+                           for n in ("t5", "dit", "dec")}
+            self._eager_dit = DiTRunner(self._eager["dit"])
+            # The eager path runs on its OWN execution context. A branch engine's LoRA inputs
+            # are per-context bindings, so without this the eager context has them unbound:
+            # TRT then cannot resolve the velocity shape and the render dies on
+            # `tensor with negative dimension -1: [1, 256, -1]` -- with or without an adapter.
+            if self._lora is not None:
+                self._eager_dit.attach_lora(self._lora)
+            # Var-batch engine? Then CFG's cond+uncond pair goes through as one batch-2 call.
+            self._cfg_batched = BatchedDiT.attach(self.runners["dit"], batch=2)
+            if not self.quiet:
+                sub(dim("CFG dual-pass: " + ("batched (var-batch engine, profile "
+                                             f"{self._cfg_batched.profile_index})"
+                                             if self._cfg_batched else
+                                             "sequential (engine is batch-1 only)")))
+        return self._eager
+
+    def _encoder_runner(self):
+        """The SAME-S/L encoder engine — only needed for audio-to-audio / inpaint."""
+        if "enc" not in self.runners:
+            _ensure_files(ENCODER_FILES[self.decoder_name])
+            # The encoder arrives long after construction -- the first audio-to-audio or
+            # inpaint of a session -- by which point the mega-graph is captured and the
+            # eager contexts exist. Re-running canon.share_scratch() to fold it in would
+            # swap those contexts out and free the buffer underneath them: a segfault with
+            # no traceback, reachable as "generate, audio-to-audio, generate".
+            #
+            # So bind the encoder ALONE. If the buffer the other engines already share is
+            # big enough it costs nothing extra -- the encoder runs before them on the same
+            # stream under the same lock, exactly the sequential-reuse assumption
+            # canon.share_scratch() is built on -- and no other context is touched. Only
+            # when the encoder needs more does it fall back to its own allocation, which is
+            # still strictly additive rather than disruptive.
+            enc = TRTRunner(
+                canon.resolve_encoder_engine(self.decoder_name, self.dec_precision),
+                None, True)
+            need = enc.engine.get_device_memory_size_for_profile_v2(enc.profile)
+            if self._scratch is not None and self._scratch.numel() >= need:
+                enc.context.set_device_memory(self._scratch.data_ptr(), self._scratch.numel())
+            else:
+                enc._scratch = canon.torch.empty(need, dtype=canon.torch.uint8, device="cuda")
+                enc.context.set_device_memory(enc._scratch.data_ptr(), need)
+                if not self.quiet:
+                    sub(dim(f"encoder scratch {need / 2**20:.0f} MiB (own buffer — larger than "
+                            f"the {self._scratch.numel() / 2**20:.0f} MiB shared one)"
+                            if self._scratch is not None else
+                            f"encoder scratch {need / 2**20:.0f} MiB"))
+            self.runners["enc"] = enc
+        return self.runners["enc"]
+
+    @staticmethod
+    def _read_audio_any(path: str) -> np.ndarray:
+        """Any soundfile-readable audio → (2, T) float32 @ 44.1 kHz, in [-1, 1].
+
+        canon.read_wav() only accepts 16-bit PCM at 44.1 kHz; the gradio file picker
+        will happily hand over 24-bit, 48 kHz, mono, or mp3.
+        """
+        import soundfile as sf
+        data, sr = sf.read(path, dtype="float32", always_2d=True)   # (T, C)
+        a = data.T                                                   # (C, T)
+        if a.shape[0] == 1:
+            a = np.repeat(a, 2, axis=0)
+        elif a.shape[0] > 2:
+            a = a[:2]
+        if sr != SAMPLE_RATE:
+            import torch as _t
+            import torchaudio
+            a = torchaudio.functional.resample(_t.from_numpy(np.ascontiguousarray(a)),
+                                                sr, SAMPLE_RATE).numpy()
+        return np.ascontiguousarray(a, dtype=np.float32)
+
+    def generate_eager(self, prompt: str, *,
+                       seconds: float = 30.0, steps: int = 8,
+                       seed: int | None = None,
+                       cfg: float = 1.0, apg: float = 1.0,
+                       negative_prompt: str | None = None,
+                       init_audio_path: str | None = None,
+                       init_noise_level: float = 1.0,
+                       inpaint_range: tuple[float, float] | None = None,
+                       ) -> tuple[np.ndarray, dict]:
+        """Advanced-mode render (no mega-graph). Returns (pcm_int16 (T,2), timing)."""
+        torch = canon.torch
+        T_lat = self.resolve_T_lat(seconds, self.decoder_name)
+        dec_min = self._dec_min_L()
+        if T_lat < dec_min:
+            raise ValueError(f"T_lat={T_lat} is below the {self.decoder_name} decoder engine's "
+                             f"profile minimum of {dec_min} "
+                             f"(~{dec_min * SAMPLES_PER_LATENT / SAMPLE_RATE:.2f}s)")
+        if not (self.DIT_MIN_L <= T_lat <= self.DIT_MAX_L):
+            raise ValueError(f"T_lat={T_lat} out of range [{self.DIT_MIN_L}, {self.DIT_MAX_L}]")
+        sigma_max = float(init_noise_level)
+        if not (0.0 < sigma_max <= 1.0):
+            raise ValueError(f"init_noise_level must be in (0, 1], got {sigma_max}")
+        if inpaint_range is not None and init_audio_path is None:
+            raise ValueError("inpaint needs init audio to keep the un-inpainted part of")
+        if seed is None:
+            seed = random.randint(0, 2**31 - 1)
+
+        with self._lock:
+            t_start = time.time()
+            # Per-stage peaks for the debug view. reset_peak_memory_stats is free when
+            # nobody reads it, and the numbers are torch-side allocations only: TRT weights
+            # and scratch are reported separately by engine_footprint(), because they are
+            # resident for the whole process rather than attributable to one stage.
+            _vram = {}
+            def _mark(k, base):
+                # transient working set for this stage: everything above the resting
+                # allocation. Without subtracting the base, every stage just reports
+                # the persistent shared scratch and they all look identical.
+                _vram[k] = max(0, torch.cuda.max_memory_allocated() - base)
+            def _base():
+                torch.cuda.reset_peak_memory_stats()
+                return torch.cuda.memory_allocated()
+            R = self._eager_runners()
+            dit = self._eager_dit
+
+            # 1. T5 (+ the uncond branch when CFG is on)
+            t0 = time.time(); _b = _base()
+            embeds, mask = t5gemma_encode(R["t5"], self.tokenizer, prompt)
+            null_embeds = null_mask = None
+            if cfg != 1.0:
+                null_embeds, null_mask = t5gemma_encode(
+                    R["t5"], self.tokenizer, negative_prompt or "")
+                if not (negative_prompt or "").strip():
+                    # No negative prompt → all-zero hidden + all-zero mask, which the
+                    # engine's bundled conditioner turns into the learned padding
+                    # embedding at every position (canon's "zero cross-attn" uncond).
+                    null_embeds = torch.zeros_like(embeds)
+                    null_mask = torch.zeros_like(mask)
+            t5_ms = (time.time() - t0) * 1000
+            _mark('t5', _b)
+
+            # 2. init audio → latents (audio-to-audio / inpaint)
+            init_latents = None
+            encode_ms = 0.0
+            if init_audio_path:
+                t0 = time.time(); _b = _base()
+                a = self._read_audio_any(init_audio_path)
+                target = T_lat * SAMPLES_PER_LATENT
+                a = (a[:, :target] if a.shape[-1] >= target
+                     else np.pad(a, ((0, 0), (0, target - a.shape[-1]))))
+                init_latents = canon.encode_chunked(
+                    self._encoder_runner(),
+                    torch.from_numpy(np.ascontiguousarray(a)).unsqueeze(0).cuda())
+                encode_ms = (time.time() - t0) * 1000
+                _mark('encode', _b)
+
+            # 3. schedule + initial latent
+            sigmas = build_pingpong_schedule(steps, sigma_max=sigma_max,
+                                              dist_shift=self.dist_shift, latent_len=T_lat)
+            g = torch.Generator(device="cuda")
+            g.manual_seed(int(seed))
+            pure_noise = torch.randn(1, IO_CHANNELS, T_lat, device="cuda",
+                                      dtype=torch.float32, generator=g)
+            lat_range = None
+            if inpaint_range is not None:
+                s_sec, e_sec = inpaint_range
+                if not (0 <= s_sec < e_sec <= seconds):
+                    raise ValueError(f"inpaint range {s_sec},{e_sec} must satisfy "
+                                     f"0 <= start < end <= {seconds}")
+                lat_range = (max(0, int(round(s_sec * SAMPLE_RATE / SAMPLES_PER_LATENT))),
+                             min(T_lat, int(round(e_sec * SAMPLE_RATE / SAMPLES_PER_LATENT))))
+            if init_latents is not None and lat_range is None:
+                noise = init_latents * (1.0 - sigma_max) + pure_noise * sigma_max
+            else:
+                noise = pure_noise
+
+            # 4. local_add_cond: zeros, or the inpaint keep-mask + masked input
+            if lat_range is not None:
+                s0, s1 = lat_range
+                keep = torch.ones((1, 1, T_lat), device="cuda", dtype=torch.float32)
+                keep[:, :, s0:s1] = 0.0
+                local_add_cond = torch.cat([keep, init_latents * keep], dim=1).contiguous()
+                paste_back = (init_latents, keep)
+            else:
+                local_add_cond = torch.zeros((1, 257, T_lat), device="cuda", dtype=torch.float32)
+                paste_back = None
+
+            batched = self._cfg_batched if cfg != 1.0 else None
+            if batched is not None:
+                cat = torch.cat
+                h2 = cat([embeds.float(), null_embeds.float()], 0)
+                m2 = cat([mask.float(), null_mask.float()], 0)
+                lac2 = cat([local_add_cond, local_add_cond], 0)
+                sec2 = torch.full((2,), float(seconds), device="cuda")
+
+            def model_fn(x, t):
+                if cfg == 1.0:
+                    return dit.step(x, t, embeds, mask, seconds, local_add_cond)
+                if batched is not None:
+                    tv = float(t.item() if torch.is_tensor(t) else t)
+                    v2 = batched.step(cat([x, x], 0), torch.full((2,), tv, device="cuda"),
+                                      h2, m2, sec2, lac2)
+                    v_cond, v_uncond = v2[0:1], v2[1:2]
+                else:
+                    v_cond = dit.step(x, t, embeds, mask, seconds, local_add_cond)
+                    v_uncond = dit.step(x, t, null_embeds, null_mask, seconds, local_add_cond)
+                sigma = t.reshape(-1, 1, 1).float()
+                cond_d = x.float() - v_cond.float() * sigma
+                uncond_d = x.float() - v_uncond.float() * sigma
+                diff = cond_d - uncond_d
+                if apg <= 0.0:
+                    cfg_diff = diff
+                else:
+                    norm = torch.sqrt((cond_d * cond_d).sum(dim=(-2, -1), keepdim=True))
+                    unit = cond_d / torch.clamp(norm, min=1e-8)
+                    parallel = (diff * unit).sum(dim=(-2, -1), keepdim=True) * unit
+                    orth = diff - parallel
+                    cfg_diff = orth if apg >= 1.0 else (apg * orth + (1.0 - apg) * diff)
+                cfg_d = cond_d + (cfg - 1.0) * cfg_diff
+                return ((x.float() - cfg_d) / sigma).to(x.dtype)
+
+            t0 = time.time(); _b = _base()
+            latents = sample_flow_pingpong(model_fn, noise, sigmas, seed=int(seed) + 1,
+                                            paste_back=paste_back)
+            torch.cuda.synchronize()
+            sampling_ms = (time.time() - t0) * 1000
+            _mark('dit', _b)
+
+            # 5. decode
+            t0 = time.time(); _b = _base()
+            # Eager path serves CFG / APG / a2a / inpaint, which the mega-graph does not cover.
+            # It must window the decode for the same reason the graph does: a capped decoder engine
+            # refuses any length above its profile ceiling, and that refusal used to surface as the
+            # previous request's buffer rather than an error.
+            _, _dec_hi = canon.profile_bounds(R["dec"], "latent")
+            out = (canon.decode_chunked(R["dec"], latents, chunk_lat=_dec_hi)
+                   if latents.shape[-1] > _dec_hi else decoder_decode(R["dec"], latents))
+            # ⚠ int16 too: decode_chunked accumulates in int16 (see its docstring). Testing only
+            # for int32 sends chunked output down the float branch, where it is clamped to ±1 and
+            # multiplied by 32767 a second time -- saturating every sample AND transposing to
+            # (2, T). Any render past the decoder's chunk ceiling hit this.
+            if out.dtype in (torch.int32, torch.int16):
+                pcm_full = out[0].to(torch.int16).cpu().numpy()
+            else:
+                pcm_full = (out.clamp(-1, 1) * 32767.0).to(torch.int16
+                            ).squeeze(0).T.contiguous().cpu().numpy()
+            decode_ms = (time.time() - t0) * 1000
+            _mark('decode', _b)
+
+        actual_samples = int(round(seconds * SAMPLE_RATE))
+        pcm = pcm_full[:actual_samples].copy()
+        inference_ms = (time.time() - t_start) * 1000
+        mode = ("inpaint" if lat_range is not None else
+                "audio-to-audio" if init_latents is not None else "text-to-audio")
+        return pcm, {
+            "inference_ms": inference_ms,
+            "graph_build_ms": 0.0,
+            "realtime": (seconds * 1000.0) / inference_ms if inference_ms > 0 else 0.0,
+            "seed": int(seed), "T_lat": T_lat, "samples": len(pcm),
+            "t5_ms": t5_ms, "encode_ms": encode_ms,
+            "sampling_ms": sampling_ms, "decode_ms": decode_ms,
+            "mode": mode, "cfg": cfg, "sigma_max": sigma_max, "eager": True,
+            "stage_vram": _vram, "steps": int(steps),
+        }
+
     def generate(self, prompt: str, *,
                  seconds: float = 30.0, steps: int = 8,
                  seed: int | None = None,
@@ -565,6 +1625,7 @@ class SA3Inference:
                  init_noise_level: float = 1.0,
                  negative_prompt: str | None = None,
                  cfg: float = 1.0,
+                 apg: float = 1.0,
                  init_audio_path: str | None = None,
                  inpaint_range: tuple[float, float] | None = None,
                  ) -> tuple[np.ndarray, dict]:
@@ -575,17 +1636,16 @@ class SA3Inference:
             timing: dict with 'inference_ms', 'graph_build_ms' (0 if cache hit),
                     'realtime', 'seed', 'T_lat', 'samples'
         """
-        # MVP scope gate. These all raise; SA3Inference is wired for them on
-        # the API surface but the implementations route through the eager
-        # path in sa3_trt_core (TBD).
-        if cfg != 1.0:
-            raise NotImplementedError("CFG support not yet wired through SA3Inference")
-        if init_audio_path is not None:
-            raise NotImplementedError("audio-to-audio not yet wired through SA3Inference")
-        if inpaint_range is not None:
-            raise NotImplementedError("inpaint not yet wired through SA3Inference")
-        if init_noise_level != 1.0:
-            raise NotImplementedError("non-unity init_noise_level not yet wired")
+        # Anything the mega-graph cannot serve -- CFG's dual pass, an init latent to mix or paste
+        # back, sigma_max != 1 -- routes to the eager sampler. It runs on its OWN execution
+        # contexts (see _SecondContext) so an already-captured graph stays valid.
+        if (cfg != 1.0 or init_audio_path is not None or inpaint_range is not None
+                or init_noise_level != 1.0):
+            return self.generate_eager(
+                prompt, seconds=seconds, steps=steps, seed=seed,
+                cfg=cfg, apg=apg, negative_prompt=negative_prompt,
+                init_audio_path=init_audio_path, init_noise_level=init_noise_level,
+                inpaint_range=inpaint_range)
 
         T_lat = self.resolve_T_lat(seconds, self.decoder_name)
         if not (1 <= T_lat <= 4096):
@@ -644,12 +1704,20 @@ def main():
     ap.add_argument("--inpaint-range", default=None)
     ap.add_argument("--dit", choices=list(DIT_CHOICES.keys()), default=None)
     ap.add_argument("--decoder", choices=list(DECODER_PATHS.keys()), default=None)
-    ap.add_argument("--precision", choices=list(canon.PRECISIONS), default=None,
-                    help="DiT engine precision. Default resolves per model: 'bf16' for medium "
-                         "(FMHA-fused, ~1.8-4.7× faster, within perceptual floor; not "
-                         "seed-reproducible vs fp16mixed), 'fp16mixed' for sm-music/sm-sfx. "
-                         "'fp16mixed' = canonical/bit-reproducible. 'fp32' = bit-equiv PyTorch "
-                         "eager, slower. bf16 is medium-only. Auto-downloads from HF.")
+    ap.add_argument("--dec-precision", choices=list(canon.DECODER_TIERS), default="canonical",
+                    help="Decoder/encoder quantization tier (orthogonal to --precision, which is the "
+                         "DiT). 'canonical' (bf16, default); 'fp8' (~1.14x, near-transparent); "
+                         "'fp8_fast' (SAME-S only; fp8 attention projections too, ~1.22x, lossier). "
+                         "Engine auto-downloads from HF. (For max-fidelity decode use --precision fp32.)")
+    ap.add_argument("--precision", choices=list(canon.PRECISIONS) + list(canon._PRECISION_ALIAS), default=None,
+                    help="DiT engine precision. Default is 'fp16' for every model: "
+                         "canonical FP16 trunk + FP32 RMSNorm/RoPE islands + FMHA-fused FP16 "
+                         "attention core, fp32-accurate at every length. 'fp8' (medium only) "
+                         "is the max-speed clean tier — fp8 linears + bf16 fused FMHA + baked "
+                         "fp32 RoPE, ~1.3x faster than fp16 at every length and clean at "
+                         "long sequence (L<=4096). 'fp32' = bit-equiv PyTorch eager, slower. "
+                         "('fp16mixed' and the retired medium-only 'bf16' are accepted as "
+                         "deprecated aliases for 'fp16'.) Auto-downloads from HF.")
     ap.add_argument("--models-dir", default=str(canon.MODELS_DIR))
     ap.add_argument("--seconds", type=float, default=30.0)
     ap.add_argument("--steps", type=int, default=8)
@@ -661,12 +1729,38 @@ def main():
     ap.add_argument("--pinned-copy", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--out", default="out.wav")
+    ap.add_argument("--chunking", action=argparse.BooleanOptionalAction, default=True,
+                    help="SAME-L only. On (default): decode in 256-latent windows and encode in "
+                         "64, using the engines' LOW optimization profile -- 509 MB of decoder "
+                         "scratch instead of 8143, because TRT commits scratch from the profile "
+                         "ceiling before any shape is bound. Off: one single-shot call on the WIDE "
+                         "profile, ~10-20%% faster above L=256 and ~5.4 GB more resident. Chunking "
+                         "is a MEMORY mechanism, not a speed one: it only wins on time at exactly "
+                         "L=256, where the whole request is one window.")
+    ap.add_argument("--limiter-ceiling", type=float, default=None,
+                    help="Peak ceiling the decoder's limiter holds, linear (0.977 = -0.2021 dBFS "
+                         "everywhere by default). ⚠ The SHIPPED engines BAKE this so their IO "
+                         "stays ('latent','pcm') and they drop in for the pre-limiter engines; "
+                         "passing this flag against them is an error. Rebuild with "
+                         "build_samel_chunkable.py --ceiling-input for a settable ceiling, or use "
+                         "--dec-precision legacy for the pre-limiter hard-clip behaviour.")
+    # Repeatable. "path" or "path:strength" -- e.g.
+    #   --lora a.safetensors --lora b.safetensors:0.5
+    # Needs a branch DiT engine (dit_fp16_lora.trt); a plain engine has no LoRA inputs.
+    # DoRA adapters must be norm-baked (scripts/lora/bake_dora.py), otherwise the fold would
+    # have to load ~10 GB of base weights.
+    ap.add_argument("--lora", action="append", default=[], metavar="PATH[:STRENGTH]",
+                    help="LoRA/DoRA adapter to apply; repeat to stack. Optional :strength.")
     ap.add_argument("--mega-graph", action=argparse.BooleanOptionalAction, default=True,
                     help="Capture the entire pipeline in one CUDA graph (T5+DiT+decoder+narrow+DtoH). "
                          "On by default. Falls back to eager path for cfg≠1.0, inpaint, or audio-to-audio.")
     args = ap.parse_args()
     if args.steps < 1:
         ap.error(f"--steps must be ≥ 1 (got {args.steps})")
+    if args.precision in canon._PRECISION_ALIAS:   # retired token → canonical, with a note
+        _canon_p = canon._PRECISION_ALIAS[args.precision]
+        print(f"  note: --precision {args.precision} is retired → using {_canon_p}", file=sys.stderr)
+        args.precision = _canon_p
 
     # Mute display in quiet mode — match sa3_trt's behavior.
     if args.quiet:
@@ -684,7 +1778,7 @@ def main():
     if args.models_dir != str(canon.MODELS_DIR):
         new_root = Path(args.models_dir).resolve()
         new_arch_dir = new_root / ARCH
-        canon.T5GEMMA_PATH = new_arch_dir / "t5gemma" / "t5gemma_fp16mixed.trt"
+        canon.T5GEMMA_PATH = new_arch_dir / "t5gemma" / "t5gemma_fp16.trt"
         for kk in DIT_CHOICES:
             DIT_CHOICES[kk]["engine"] = new_arch_dir / DIT_CHOICES[kk]["engine"].relative_to(canon.ARCH_DIR)
         for kk in DECODER_PATHS:
@@ -703,8 +1797,22 @@ def main():
     target_dur = T_lat * SAMPLES_PER_LATENT / SAMPLE_RATE
 
     DIT_MIN_L, DIT_MAX_L = 1, 4096
+    if T_lat < DECODER_MIN_L:
+        min_s = DECODER_MIN_L * SAMPLES_PER_LATENT / SAMPLE_RATE
+        sys.exit(f"error: --seconds {args.seconds} gives T_lat={T_lat}, below the "
+                 f"{args.decoder} decoder's minimum of {DECODER_MIN_L} latents "
+                 f"(~{min_s:.2f}s). The DiT would accept it, but the decoder's "
+                 f"optimization profile starts at {DECODER_MIN_L}; it would refuse the "
+                 f"shape and the render would come back empty rather than erroring. "
+                 f"Use --seconds {min_s:.2f} or more.")
     if T_lat < DIT_MIN_L or T_lat > DIT_MAX_L:
-        sys.exit(f"error: T_lat={T_lat} out of [{DIT_MIN_L}, {DIT_MAX_L}]")
+        max_s = DIT_MAX_L * SAMPLES_PER_LATENT / SAMPLE_RATE
+        why = ("the fp8 baked RoPE table (sized to L=4096; a longer render needs a re-bake — "
+               "build/make_rope_baked_onnx.py --max-t)"
+               if args.precision == "fp8" else
+               "the DiT engine's L=1..4096 profile") + " and the SAME-L decoder's 4096 cap"
+        sys.exit(f"error: T_lat={T_lat} (= {args.seconds}s) out of [{DIT_MIN_L}, {DIT_MAX_L}] "
+                 f"(~{max_s:.0f}s max), bounded by {why}.")
 
     # Inpaint validation (unchanged from sa3_trt)
     inpaint_range = None
@@ -741,16 +1849,24 @@ def main():
     if args.negative_prompt:
         suffix = "" if args.cfg != 1.0 else dim("  (ignored: --cfg=1.0)")
         print(f"  {k('neg prompt')}  {bold(repr(args.negative_prompt))}{suffix}")
-    print(f"  {k('dit')}  {magenta(v(args.dit))}   {k('decoder')}  {magenta(v(args.decoder))}   {k('precision')}  {v(args.precision)}")
+    _dtier = f"   {k('dec-tier')}  {magenta(v(args.dec_precision))}" if args.dec_precision != "canonical" else ""
+    print(f"  {k('dit')}  {magenta(v(args.dit))}   {k('decoder')}  {magenta(v(args.decoder))}{_dtier}   {k('precision')}  {v(args.precision)}")
     print(f"  {k('σmax')}  {bold(f'{sigma_max:.2f}')}")
     print(f"  {k('seconds')}  {v(f'{args.seconds}s')}   {k('steps')}  {v(args.steps)}   {k('seed')}  {args.seed}")
     print(f"  {k('cfg')}  {v(args.cfg)}   {k('mega-graph')}  {v('on' if use_mega else 'off (fallback)')}")
     print(f"  {k('T_lat')}  {T_lat} {dim(f'({target_dur:.2f}s → trimmed to {args.seconds}s)')}")
     print()
 
+    # Everything below this point allocates. If the mega-graph cannot serve this
+    # configuration, hand off NOW — before the lazy-download, the heavy imports and
+    # above all the engine load — so only one set of engines is ever resident.
+    if not use_mega:
+        _delegate_to_eager(args)
+        return
+
     # Lazy-download
     needed = canon.get_engine_files(args.dit, args.decoder, args.precision,
-                                      with_encoder=bool(args.init_audio))
+                                      with_encoder=bool(args.init_audio), dec_tier=args.dec_precision)
     _ensure_files(needed)
 
     # Heavy imports
@@ -776,14 +1892,45 @@ def main():
     engine_specs = {
         "t5":  canon.T5GEMMA_PATH,
         "dit": canon.get_dit_engine_path(args.dit, args.precision),
-        "dec": canon.get_decoder_engine_path(args.decoder, args.precision),
+        "dec": canon.resolve_decoder_engine(args.decoder, args.precision, args.dec_precision),
     }
     if args.init_audio:
-        engine_specs["enc"] = ENCODER_PATHS[args.decoder]
+        engine_specs["enc"] = canon.resolve_encoder_engine(args.decoder, args.dec_precision)
+
+    # --lora needs a BRANCH engine: the canonical dit_fp16.trt has no LoRA inputs at all, so
+    # asking for an adapter against it would be a silent no-op. Switch automatically rather
+    # than making the user also know the variant filename.
+    if args.lora:
+        lora_paths = _lora_paths()
+        try:
+            _mp = lora_paths.for_model(args.dit)
+        except ValueError:
+            sys.exit(f"error: --lora is not available for --dit {args.dit}")
+        _be, _cur = Path(_mp.branch_engine), engine_specs["dit"]
+        if not _be.exists():
+            sys.exit(f"error: --lora needs the branch DiT engine and none is built:\n"
+                     f"    {_be}\n"
+                     f"    build it with:  python scripts/lora/build_branch.py "
+                     f"--model {_mp.slug} --download")
+        if _be != _cur:
+            engine_specs["dit"] = _be
+            sub(f"{dim('--lora given')} using branch engine {_be.name} (not {_cur.name})")
     t0 = time.time()
+    # The decoder/encoder carry two profiles: 0 = low ceiling (chunked, minimum scratch),
+    # 1 = wide (single-shot). Selecting it at context creation is what makes the saving real --
+    # a context created on the default profile reserves the MAX across profiles.
+    _band = 0 if args.chunking else 1
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(engine_specs)) as ex:
-        futs = {name: ex.submit(TRTRunner, path) for name, path in engine_specs.items()}
+        # user_managed=True: allocate NO private scratch. share_scratch() below hands every
+        # engine one buffer. Letting each runner commit its own first and freeing it afterwards
+        # leaves both resident at peak -- measured 11924 MiB where this path takes 8946.
+        futs = {name: ex.submit(TRTRunner, path, None, True,
+                                _band if name in ("dec", "enc") else 0)
+                for name, path in engine_specs.items()}
         runners = {name: fut.result() for name, fut in futs.items()}
+    # One scratch buffer for every engine: they run sequentially on a single stream, so holding
+    # a private allocation each costs several GB for nothing.
+    _shared_scratch = canon.share_scratch(runners)   # keep alive for the process lifetime
     sub(f"{dim(f'engine load (parallel, {len(runners)} engines)')} {(time.time()-t0)*1000:.0f} ms")
 
     # ── Warmup + graph build ──
@@ -792,6 +1939,37 @@ def main():
     t0 = time.time()
     dit = DiTRunner(runners["dit"])
 
+    # ── LoRA ────────────────────────────────────────────────────────────────────────────
+    lora = None
+    if args.lora:
+        specs = []
+        for item in args.lora:
+            path, _, st = str(item).rpartition(":")
+            if not path or "/" in st or not _is_float(st):   # no ":strength" suffix given
+                path, st = str(item), "1.0"
+            specs.append((path, float(st)))
+        sys.path.insert(0, str(_lora_dir()))
+        from refold_runtime import RefoldLora
+        _t = time.time()
+        # model= is THIS pipeline's DiT: it decides which base checkpoint a DoRA fold
+        # reads its row norms from, and the wrong one folds silently against the wrong W0.
+        lora = RefoldLora(model=args.dit, engine=runners["dit"].engine,
+                          branch_map=_detect_map_for(runners["dit"].engine, args.dit))
+        lora.set_stack_gpu(specs, {})
+        dit.attach_lora(lora)
+        sub(f"{dim('lora')} {len(specs)} adapter(s), rank {lora.rank_real}, "
+            f"{len(lora.map)} targets  {(time.time()-_t)*1000:.0f} ms")
+    elif any(runners["dit"].engine.get_tensor_name(i).startswith("lora")
+             for i in range(runners["dit"].engine.num_io_tensors)):
+        # A branch engine will not enqueue with its operands unbound, even unused -- so a
+        # branch engine selected without --lora still needs a zero stack.
+        sys.path.insert(0, str(_lora_dir()))
+        from refold_runtime import RefoldLora
+        lora = RefoldLora(model=args.dit, engine=runners["dit"].engine,
+                          branch_map=_detect_map_for(runners["dit"].engine, args.dit))
+        lora.zero(1)
+        dit.attach_lora(lora)
+
     if use_mega:
         # ── Mega-graph fast path ──
         sigmas = build_pingpong_schedule(args.steps, sigma_max=sigma_max,
@@ -799,9 +1977,16 @@ def main():
         requested_samples = int(round(args.seconds * SAMPLE_RATE))
         # The graph copies the full pinned-host buffer up to requested_samples;
         # the WAV save reads the same buffer.
+        # Windowed decode when the request exceeds the decoder's bound ceiling. profile_bounds
+        # reports the ACTIVE profile, so --no-chunking (wide band) reports 4096 and takes the
+        # single-shot path while the default (low band) reports 256 and windows.
+        _, _dec_hi = canon.profile_bounds(runners["dec"], "latent")
         mega = FullPipelineGraph(runners["t5"], dit, runners["dec"],
-                                  T_lat, args.steps, requested_samples)
+                                  T_lat, args.steps, requested_samples,
+                                  dec_chunk_lat=(_dec_hi if T_lat > _dec_hi else 0))
         mega.build(sigmas, args.seconds, sigma_max)
+        if args.limiter_ceiling is not None:
+            mega.set_limiter_ceiling(args.limiter_ceiling)
         torch.cuda.synchronize()
         sub(f"{dim(f'warmup + capture')} {(time.time()-t0)*1000:.0f} ms")
         print()
@@ -855,28 +2040,6 @@ def main():
         rule()
         print(f"  {bold(green('▸ saved'))}  {bold(cyan(out_display))}   {dim(f'({out_path.resolve()})')}")
         return
-
-    # ── Eager fallback path: re-run sa3_trt.main() ──
-    # We've consumed CLI args; the cleanest thing is to spawn the canonical
-    # main() — but it parses its own args, so we'd have to manipulate sys.argv.
-    # Practical: re-invoke canon main with the same argv.
-    print()
-    print(dim("  Mega-graph path unavailable for this configuration; delegating to sa3_trt.main()..."))
-    # canon's main parses sys.argv directly; we leave sys.argv intact (already
-    # contains all the same flags — the only flag we added is --mega-graph
-    # which canon will reject. Strip it.)
-    new_argv = []
-    skip_next = False
-    for a in sys.argv:
-        if skip_next:
-            skip_next = False
-            continue
-        if a in ("--mega-graph", "--no-mega-graph"):
-            continue
-        new_argv.append(a)
-    sys.argv = new_argv
-    # canon already had _import_heavy()'d so canon.torch is set.
-    canon.main()
 
 
 if __name__ == "__main__":

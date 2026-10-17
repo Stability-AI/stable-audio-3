@@ -6,3 +6,7 @@ huggingface_hub>=0.20
 # The >=0.12 wheel BUNDLES libsndfile (macOS arm64 dylib), so no `brew install
 # libsndfile` is ever needed — installing this package is the whole fix.
 soundfile>=0.12
+# Training-demo spectrograms (JPEG) when underfit drives the trainer — see
+# models/defs/demo_mlx.py:_write_demo_spectrogram. Without it the dashboard
+# renders them itself, so this is a speed-up, not a hard requirement.
+pillow>=10.0

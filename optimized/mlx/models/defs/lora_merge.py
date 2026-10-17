@@ -372,6 +372,78 @@ def merge_loras_into_weights(weights: dict, lora_paths, strength: float = 1.0,
     return {"merged": len(accum), "skipped": skipped, "adapters": len(parsed)}
 
 
+def merge_trainable_layers_into_model(model, layers, log=lambda _m: None) -> dict:
+    """Merge live training adapters into an already-built DiT, on the GPU.
+
+    The in-memory twin of ``merge_loras_into_weights`` for the trainer's ARC
+    demos: instead of saving the adapters to a scratch checkpoint, re-reading it
+    and merging on the CPU in numpy (several seconds per demo round, most of the
+    round), each ``LoRALinear``/``LoRAConv1d`` in ``layers`` is merged straight
+    into the matching parameter of ``model`` with MLX ops in float32 and cast
+    back to the parameter dtype.
+
+    Same math as ``_merged_weight`` at strength 1, and the adapter tensors are
+    rounded through float16 first — the precision ``save_lora_checkpoint``
+    writes — so the demo reflects exactly what the saved checkpoint would
+    produce. -xs adapters are not handled here (``merge_loras_into_weights``
+    re-derives their SVD bases from the target weight); callers use the
+    checkpoint path for them.
+
+    Returns ``{"merged": int, "skipped": list[str]}``.
+    """
+    from mlx.utils import tree_flatten
+
+    params = dict(tree_flatten(model.parameters()))
+    f16 = lambda a: a.astype(mx.float16).astype(mx.float32)  # noqa: E731
+    merged_n, skipped = 0, []
+    for layer in layers:
+        adapter_type = layer.adapter_type
+        if adapter_type.endswith("-xs"):
+            raise LoraError(f"{adapter_type} adapters need the checkpoint merge path")
+        key = _layer_to_npz_key(layer.checkpoint_name)
+        if key not in params:
+            skipped.append(layer.checkpoint_name)
+            continue
+        W = params.pop(key)  # drop our reference so the old weight frees on swap
+        if W.ndim == 2:
+            W0 = W.astype(mx.float32)
+        elif W.ndim == 3:  # Conv1d, MLX (out, k, in) -> PyTorch-order (out, in*k)
+            out, k, cin = W.shape
+            W0 = W.astype(mx.float32).transpose(0, 2, 1).reshape(out, cin * k)
+        else:
+            raise LoraError(f"unexpected weight rank {W.ndim} for {key}")
+
+        V = W0 + float(layer.scaling) * (f16(layer.lora_B) @ f16(layer.lora_A))
+        if adapter_type == "lora":
+            merged = V
+        elif adapter_type in ("dora-rows", "dora-cols"):
+            norm_dim = 1 if adapter_type == "dora-rows" else 0
+            mag = f16(layer.magnitude).reshape(-1)
+            mag = mag.reshape(-1, 1) if norm_dim == 1 else mag.reshape(1, -1)
+            norm = mx.sqrt(mx.sum(V * V, axis=norm_dim, keepdims=True))
+            merged = V / (norm + 1e-12) * mag
+        elif adapter_type == "bora":
+            V_r = V / (mx.sqrt(mx.sum(V * V, axis=1, keepdims=True)) + 1e-12)
+            inter = f16(layer.magnitude_r).reshape(-1, 1) * V_r
+            H_c = inter / (mx.sqrt(mx.sum(inter * inter, axis=0, keepdims=True)) + 1e-12)
+            merged = H_c * f16(layer.magnitude_c).reshape(1, -1)
+        else:
+            raise LoraError(f"unknown adapter_type {adapter_type!r}")
+
+        if W.ndim == 3:
+            merged = merged.reshape(out, cin, k).transpose(0, 2, 1)
+        merged = merged.astype(W.dtype)
+        mx.eval(merged)
+        # Swap each layer in as soon as it is merged: peak memory is the model
+        # plus one layer's temporaries, not a second copy of every weight.
+        model.load_weights([(key, merged)], strict=False)
+        del W, W0, V, merged
+        merged_n += 1
+    if skipped:
+        log(f"lora: skipped {len(skipped)} layer(s) not in this DiT (e.g. {skipped[0]})")
+    return {"merged": merged_n, "skipped": skipped}
+
+
 def _weight_as_2d(arr):
     """Return ``(W2d, restore)`` where ``W2d`` is the PyTorch-layout 2D weight
     (fan_out, fan_in) as numpy float32, and ``restore(W2d)`` rebuilds the MLX

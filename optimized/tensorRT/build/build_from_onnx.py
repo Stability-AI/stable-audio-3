@@ -8,6 +8,17 @@ stabilityai/stable-audio-3-optimized/onnx/.
 To rebuild engines for a new GPU arch (sm_100, sm_120, ...) you run this on
 that GPU and TRT bakes the arch into the engine.
 
+SAME-L attention kernel: the SWA plugin ships two implementations and the choice is
+baked into the engine at build time. AOT (default) compiles a block-tiled tensor-core
+PTX kernel in, so nothing re-enters Python at inference and the engine can be captured
+into a CUDA graph. JIT dispatches to Triton through a Python callback on every enqueue.
+If you are bringing up a new architecture and the decoder produces a constant wash of
+noise, or silence, read "Choosing the SAME-L attention kernel" in build/README.md before
+anything else — that is the signature of a non-capturable engine inside the mega-graph.
+
+    SA3_SWA_PLUGIN=aot|jit   which implementation the engine uses (default aot)
+    SA3_SWA_AOT=mma|ptx      which AOT kernel, if AOT (default mma)
+
 Usage:
     python build_from_onnx.py t5gemma
     python build_from_onnx.py same-s-encoder
@@ -15,7 +26,7 @@ Usage:
     python build_from_onnx.py same-l-encoder
     python build_from_onnx.py same-l-decoder
     # SA3 DiT engines use a different builder (FP16-mixed recipe):
-    python build_dit_fp16mixed.py --input <onnx> --engine <out.trt>
+    python build_dit_fp16.py --input <onnx> --engine <out.trt>
     python build_from_onnx.py all          # build everything for this arch
 """
 import os
@@ -28,7 +39,16 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 # diff_attn_nocast_plugin + triton_swa_v2 (for SAME-L plugin) live in ../scripts/
 sys.path.insert(0, str(SCRIPTS_DIR.parent / "scripts"))
 
-from _arch import detect_arch, arch_dir  # noqa: E402
+# ⚠ There are TWO _arch.py — this directory's (detect_arch + repo_root + arch_dir +
+# onnx_dir) and scripts/ (detect_arch only). The scripts/ insert above lands at index 0,
+# so a plain `from _arch import ...` picked the wrong one and this script died on import
+# with "cannot import name 'arch_dir'". Load it by explicit path so the order cannot
+# matter again.
+import importlib.util as _ilu  # noqa: E402
+_spec = _ilu.spec_from_file_location("_build_arch", SCRIPTS_DIR / "_arch.py")
+_build_arch = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_build_arch)
+detect_arch, arch_dir = _build_arch.detect_arch, _build_arch.arch_dir
 
 
 HF_REPO = "stabilityai/stable-audio-3-optimized"
@@ -62,60 +82,20 @@ TARGETS = {
         "onnx_hf":     ["t5gemma/encoder.onnx"],
         # tokenizer.json ships bundled with the repo at scripts/tokenizer.json
         # (arch-agnostic), so we don't fetch it here anymore.
-        "trt_local":    "t5gemma/t5gemma_fp16mixed.trt",
+        "trt_local":    "t5gemma/t5gemma_fp16.trt",
         "flags":        set(),  # STRONGLY_TYPED carries the FP16/FP32 dtype hints
         "network":      "STRONGLY_TYPED",
         "workspace_gb": 8,
         "profile":      None,  # static shapes
         "plugin":       False,
     },
-    "same-s-encoder": {
-        "onnx_hf":      ["same-s/enc_dynamic_bf16.onnx"],
-        "trt_local":    "same-s/enc_dynamic_bf16.trt",
-        "flags":        {"BF16"},
-        "network":      "EXPLICIT_BATCH",
-        "workspace_gb": 16,
-        "profile":      {"audio": [(1, 2, 32 * SAMPLES_PER_LATENT),
-                                    (1, 2, 1292 * SAMPLES_PER_LATENT),
-                                    (1, 2, 4096 * SAMPLES_PER_LATENT)]},
-        "plugin":       False,
-    },
-    "same-s-decoder": {
-        "onnx_hf":      ["same-s/dec_dynamic_bf16.onnx"],
-        "trt_local":    "same-s/dec_dynamic_bf16.trt",
-        "flags":        {"BF16"},
-        "network":      "EXPLICIT_BATCH",
-        "workspace_gb": 16,
-        "profile":      {"latent": [(1, 256, 32), (1, 256, 1292), (1, 256, 4096)]},
-        "plugin":       False,
-    },
-    "same-l-encoder": {
-        "onnx_hf":      ["same-l/enc_dynamic_triton_swa.onnx"],
-        "trt_local":    "same-l/enc_dynamic_triton_swa.trt",
-        "flags":        set(),  # STRONGLY_TYPED carries dtype hints
-        "network":      "STRONGLY_TYPED",
-        "workspace_gb": 16,
-        "profile":      {"audio": [(1, 2, 32 * SAMPLES_PER_LATENT),
-                                    (1, 2, 1292 * SAMPLES_PER_LATENT),
-                                    (1, 2, 4096 * SAMPLES_PER_LATENT)]},
-        "plugin":       True,
-    },
-    "same-l-decoder": {
-        "onnx_hf":      ["same-l/dec_dynamic_triton_swa.onnx"],
-        "trt_local":    "same-l/dec_dynamic_triton_swa.trt",
-        "flags":        set(),
-        "network":      "STRONGLY_TYPED",
-        "workspace_gb": 16,
-        "profile":      {"latent": [(1, 256, 32), (1, 256, 1292), (1, 256, 4096)]},
-        "plugin":       True,
-    },
     # SA3 DiT engines: build from the pre-processed FP16-mixed ONNX hosted on
-    # HF. The producer (build_dit_fp16mixed.py) does the FP32-island surgery
+    # HF. The producer (build_dit_fp16.py) does the FP32-island surgery
     # once and uploads the result; consumers just compile with STRONGLY_TYPED
     # (no onnx-graphsurgeon dependency).
     "sa3-sm-music": {
-        "onnx_hf":      ["sa3-sm-music/dit_fp16mixed.onnx"],
-        "trt_local":    "sa3-sm-music/dit_fp16mixed.trt",
+        "onnx_hf":      ["sa3-sm-music/dit_fp16.onnx"],
+        "trt_local":    "sa3-sm-music/dit_fp16.trt",
         "flags":        set(),         # STRONGLY_TYPED + ONNX dtypes carry precision
         "network":      "STRONGLY_TYPED",
         "workspace_gb": 16,
@@ -123,8 +103,37 @@ TARGETS = {
         "plugin":       False,
     },
     "sa3-sm-sfx": {
-        "onnx_hf":      ["sa3-sm-sfx/dit_fp16mixed.onnx"],
-        "trt_local":    "sa3-sm-sfx/dit_fp16mixed.trt",
+        "onnx_hf":      ["sa3-sm-sfx/dit_fp16.onnx"],
+        "trt_local":    "sa3-sm-sfx/dit_fp16.trt",
+        "flags":        set(),
+        "network":      "STRONGLY_TYPED",
+        "workspace_gb": 16,
+        "profile":      _DIT_PROFILE,
+        "plugin":       False,
+    },
+    # SA3 small DiTs in fp8 — SELECTABLE (default stays fp16). fp8 E4M3 on the
+    # 186 linear GEMMs, attention left fp16-fused and the fp32 RMSNorm/RoPE islands
+    # intact — an fp8-QDQ graft onto the fp16 graph (build/make_dit_fp8_smalldit.py),
+    # NOT the medium's baked-RoPE recipe (these DiTs never had the bf16 long-angle
+    # problem). Built STRONGLY_TYPED: the QDQ nodes carry fp8; TRT fires fp8 tensor-core
+    # GEMMs on the linears while the fp16 FMHA fuser still runs the attention. Same
+    # _DIT_PROFILE (batch=1, dynamic L∈[1,4096]) → identical CLI/feature surface.
+    # This is a CLEAN WEIGHT-HALVING tier (479 vs 936 MB, velocity-cos ~0.99 vs eager,
+    # clip% at/below fp16), only marginally faster (~1.1×): the small DiTs' ~5 ms
+    # forward is overhead-bound at batch 1, so fp8's GEMM savings barely show. sm-* fp8
+    # is NOT seed-reproducible vs fp16.
+    "sa3-sm-music-fp8": {
+        "onnx_hf":      ["sa3-sm-music/dit_fp8.onnx", "sa3-sm-music/dit_fp8.onnx.data"],
+        "trt_local":    "sa3-sm-music/dit_fp8.trt",
+        "flags":        set(),         # STRONGLY_TYPED + the fp8 QDQ carry the precision
+        "network":      "STRONGLY_TYPED",
+        "workspace_gb": 16,
+        "profile":      _DIT_PROFILE,
+        "plugin":       False,
+    },
+    "sa3-sm-sfx-fp8": {
+        "onnx_hf":      ["sa3-sm-sfx/dit_fp8.onnx", "sa3-sm-sfx/dit_fp8.onnx.data"],
+        "trt_local":    "sa3-sm-sfx/dit_fp8.trt",
         "flags":        set(),
         "network":      "STRONGLY_TYPED",
         "workspace_gb": 16,
@@ -133,40 +142,120 @@ TARGETS = {
     },
     "sa3-m": {
         # 2.9 GB external-data sidecar travels alongside.
-        "onnx_hf":      ["sa3-m/dit_fp16mixed.onnx", "sa3-m/dit_fp16mixed.onnx.data"],
-        "trt_local":    "sa3-m/dit_fp16mixed.trt",
+        "onnx_hf":      ["sa3-m/dit_fp16.onnx", "sa3-m/dit_fp16.onnx.data"],
+        "trt_local":    "sa3-m/dit_fp16.trt",
         "flags":        set(),
         "network":      "STRONGLY_TYPED",
         "workspace_gb": 16,
         "profile":      _DIT_PROFILE,
         "plugin":       False,
     },
-    # SA3 medium DiT in bf16 — the medium SPEED DEFAULT (fp16-mixed above stays
-    # selectable). Reuses the SAME raw fp32 dit.onnx as the fp32 variant, but
-    # builds with BuilderFlag.BF16 + EXPLICIT_BATCH (NOT STRONGLY_TYPED): bf16
-    # carries fp32's dynamic range, so the FP32-softmax islands that fp16-mixed
-    # kept vanish and TRT 10.15's FMHA fuser fires (0 → 96 fused _gemm_mha_v2
-    # nodes) → measured ~1.76×@L=256 / 4.70×@L=4096 vs fp16-mixed, within the
-    # perceptual re-seed floor (FAD 0.59× floor, CLAP within spread, n=128).
-    # It is a build-time PRECISION RECIPE only — no new ONNX, no graph change.
+    # SA3 medium DiT in bf16 — SELECTABLE, no longer the medium default (see the
+    # sa3-m entry above). Reuses the SAME raw fp32 dit.onnx as the fp32 variant,
+    # but builds with BuilderFlag.BF16 + EXPLICIT_BATCH (NOT STRONGLY_TYPED): a
+    # uniform bf16 trunk lets TRT 10.15's FMHA fuser fire (0 → 96 fused
+    # _gemm_mha_v2 nodes). It is a build-time PRECISION RECIPE only — no new
+    # ONNX, no graph change.
+    #
+    # The ~1.76×@L=256 / 4.70×@L=4096 speedup this engine was shipped for was
+    # measured against an fp16-mixed engine whose attention core was stuck in
+    # FP32; with that fixed (build_dit_fp16.py's bound_attention_core) bf16
+    # is only ~3% ahead, and it loses on accuracy: weakly-typed BF16 also lets
+    # TRT evaluate RoPE's rotation angle in bf16, and that angle reaches ~4155
+    # rad at L=4092 where bf16's spacing is 32 rad (> 2π), so position info for
+    # the fast-rotating dims is destroyed — the latent inflates ~2.5× over 8
+    # steps and a 6-min render clips 2–3% of samples. Clean at short lengths.
+    # (The FAD 0.59× floor / CLAP-within-spread n=128 result that cleared this
+    # engine predates the long-sequence finding.)
     # medium-only: sm-music / sm-sfx use standard attention and already fuse in
-    # their fp16-mixed engines. bf16 is NOT seed-reproducible vs fp16-mixed
-    # (differential attention is cancellation-sensitive) — a different-but-equal
-    # take per seed; use fp16-mixed for bit-reproducibility.
+    # their fp16-mixed engines. bf16 is also NOT seed-reproducible vs fp16-mixed;
+    # use fp16-mixed for bit-reproducibility.
     # Same _DIT_PROFILE (batch=1, dynamic L∈[1,4096], opt=1292) as every DiT
     # engine → identical CLI/feature surface (varlen, CFG sequential dual-pass,
     # neg-prompt/APG, a2a, inpaint). The DiT ONNX bakes batch=1, so there is no
     # varbatch axis on ANY TRT DiT engine (CFG is a sequential dual-pass, as in
     # fp16-mixed) — fusion is verified to survive the full L profile at batch=1.
+    # SA3 medium DiT in bf16 — SELECTABLE (fp16-mixed is the medium default).
+    # Reads the ROPE-BAKED ONNX from build_dit_bf16.py, NOT the raw dit.onnx.
+    #
+    # Baking is what makes a bf16 trunk safe here. RoPE's angle is t*inv_freq with
+    # inv_freq[0] == 1.0 exactly, so it reaches ~4155 rad at L=4092 — and bf16's
+    # spacing up there is 32 rad, more than a full 2*pi rotation. Computing that
+    # angle in bf16 destroys 9/16 frequency pairs, the latent inflates ~2.5x over 8
+    # sampling steps, and a 6-minute render clips 2-3% of samples. Building the raw
+    # dit.onnx with BuilderFlag.BF16 — what shipped before 2026-07 — has exactly
+    # that defect. Precomputing the tables on the host removes the angle arithmetic
+    # from the graph entirely; the baked table VALUES live in [-1,1] where bf16 is
+    # perfectly adequate (measured: latent std 0.9161 vs fp32's 0.9162).
+    #
+    # bf16 needs no fp32 RMSNorm islands (its exponent range covers the variance
+    # that would overflow fp16), so the trunk is uniform and TRT's FMHA fuser fires:
+    # 96 fused MHA nodes. Measured teacher-forced velocity cos vs the fp32 engine
+    # 0.9993/0.9990/0.9983 at L=256/1292/4092 on sm_120 (0.9987/0.9990/0.9923 on
+    # sm_90), and 380 s clipping 3.112% -> 0.014%. It is ~4-7% faster than
+    # fp16-mixed but NOT fp32-exact, and it is not seed-reproducible against it.
+    #
+    # The 5.8 GB fp32 sidecar is shared with dit.onnx — no second weight copy.
     "sa3-m-bf16": {
-        # 5.8 GB external-data sidecar (fp32 weights) travels alongside.
-        "onnx_hf":      ["sa3-m/dit.onnx", "sa3-m/dit.onnx.data"],
+        "onnx_hf":      ["sa3-m/dit_bf16.onnx", "sa3-m/dit.onnx.data"],
         "trt_local":    "sa3-m/dit_bf16.trt",
-        "flags":        {"BF16"},
+        "flags":        {"BF16", "OBEY_PRECISION_CONSTRAINTS"},
         "network":      "EXPLICIT_BATCH",
         "workspace_gb": 16,
         "profile":      _DIT_PROFILE,
         "plugin":       False,
+        # The two Fourier chains take runtime inputs, so they cannot be baked and
+        # still need a (tiny, ~0.1%) fp32 island. See _pin_fourier_fp32.
+        "pin_fourier_fp32": True,
+    },
+    # SA3 medium DiT in fp8 — SELECTABLE, medium-only, the MAX-SPEED clean tier,
+    # now CALIBRATED. Identical recipe to sa3-m-bf16 (same RoPE-baked ONNX flow from
+    # build_dit_bf16.py, same EXPLICIT_BATCH + OBEY + Fourier fp32 island) PLUS
+    # BuilderFlag.FP8: the ONNX carries fp8 E4M3 Quantize/Dequantize pairs on the 176
+    # Linear GEMMs, so TRT fires fp8 tensor-core GEMMs there while the 96 attention
+    # blocks stay bf16 fused-MHA (_gemm_mha_v2) and the RoPE cos/sin ride as baked fp32
+    # constants. Measured on H200 (same-run round-robin): ~1.3x faster than fp16-mixed
+    # at every length (1.40x@L129 / 1.32x@L1292 / 1.34x@L4092, also ahead of bf16) and
+    # clean at long sequence (latent std 0.86 vs eager 0.95, 0.000% clip @6-min) — the
+    # baked RoPE dodges bf16's long-angle drift, so it stays clean where bf16 clips.
+    #
+    # CALIBRATED SCALES (2026-07-31): the published dit_fp8.onnx now carries the
+    # real-conditioning calibrated activation + per-channel weight scales from
+    # @ryanontheinside's fp8 work (#47), grafted onto this bakedmin structure by
+    # build/transplant_scales.py. Calibration is speed-free (31.2 vs the uncalibrated
+    # 30.8 ms/fwd, within run noise) and lifts worst-step velocity-cos vs fp32 from
+    # 0.52/0.57/0.64 to 0.92/0.94/0.92 on adversarial seeds; sampling steps 1-7 match
+    # the fully-calibrated #47 reference within ~0.001. It is still a SPEED tier over the
+    # fp16-mixed default rather than a fidelity upgrade over it (single-step velocity cos
+    # ~0.92-0.94 < fp16's ~1.0), but it no longer collapses at the highest-noise
+    # first step the way the uncalibrated engine did. #47's fp16-attention variant buys
+    # the last ~0.03 of step-0 fidelity for +2 ms/fwd; this tier keeps bf16 attention for
+    # the speed. Identity of the shipped engine: 176 fp8 GEMMs + 96 bf16 fused MHA +
+    # baked fp32 RoPE constant — check with scripts/verify_fp8_rope.py. Same _DIT_PROFILE
+    # (batch=1, L in [1,4096]) → identical CLI/feature surface. medium-only, not
+    # seed-reproducible vs fp16.
+    #
+    # Producer: the fp8-linear ONNX (fp8 QDQ inserted; inv_freq inline) is RoPE-baked by
+    # build_dit_bf16.py, the SAME baker as the bf16 tier (it handles inline OR external
+    # inv_freq), then build/transplant_scales.py swaps in #47's calibrated scale VALUES
+    # (the 5.8 GB fp32 weights are untouched — TRT re-quantizes them at build). A
+    # from-scratch recalibration (model retrain) regenerates those scales with #47's full
+    # pipeline: make_calib.py (real-conditioning capture, in this repo) -> build_dit_fp8.py
+    # (max-PTQ + per-channel scales, lives in #47). The baked cos/sin tables are sized to
+    # profile max L=4096; renders past 4096 (the SAME-L decoder's own cap → rejected by
+    # sa3_trt) would need a re-bake (--max-t). The .onnx keeps its external-data reference
+    # to `dit_fp8lin.onnx.data`, so that exact sidecar name is what ships alongside.
+    "sa3-m-fp8": {
+        "onnx_hf":      ["sa3-m/dit_fp8.onnx", "sa3-m/dit_fp8lin.onnx.data"],
+        "trt_local":    "sa3-m/dit_fp8.trt",
+        "flags":        {"BF16", "FP8", "OBEY_PRECISION_CONSTRAINTS"},
+        "network":      "EXPLICIT_BATCH",
+        "workspace_gb": 16,
+        "profile":      _DIT_PROFILE,
+        "plugin":       False,
+        # Same tiny fp32 island as bf16 for the runtime Fourier chains; on the
+        # RoPE-baked ONNX the only Cos/Sin left ARE those two chains.
+        "pin_fourier_fp32": True,
     },
     # ── FP32 variants ────────────────────────────────────────────────────
     # DiT FP32: read the unsurgered FP32 ONNX directly (dit.onnx), build
@@ -277,6 +366,70 @@ def _upcast_onnx_to_fp32(input_onnx: str, output_onnx: str) -> str:
     return output_onnx
 
 
+def _pin_fourier_fp32(network, trt) -> int:
+    """Pin the seconds_total / timestep Fourier angle chains to FP32 compute.
+
+    Needed only by the bf16 recipe, and only for these two chains. Both compute
+    cos/sin of an angle that reaches ~62,000 and ~55,000 radians respectively
+    (seconds_total is s/384 * seconds_freqs, with seconds_freqs maxing at 2*pi*10000).
+    bf16 has 8 significand bits, so its ULP passes 2*pi above ~2048 rad — one
+    quantisation step becomes more than a full rotation and the feature is destroyed.
+    Unlike RoPE these are functions of RUNTIME INPUTS, so they cannot be baked into
+    constants and fp32 is the only option. The tensors are scalars and [1,128]
+    vectors, so the island costs ~0.1%.
+
+    Selection is STRUCTURAL, not by name. The input graph has already had RoPE's trig
+    replaced by baked constants, so every Cos/Sin still present *is* one of these two
+    chains — which stays true across re-exports, where a name regex would not. Then
+    pin the whole ancestor closure, because one bf16 op anywhere upstream ruins the
+    angle just as thoroughly as one at the trig itself. (An earlier name-based pin
+    silently missed ONNX `/Clip`: the parser expands it into two *unnamed* ElementWise
+    layers that no regex can match, and the resulting engine was a no-op fix.)
+
+    CONSTANT layers are skipped: one holding Int64 weights rejects a FLOAT precision
+    outright, and TRT materialises float constants at whatever precision the pinned
+    consumer demands anyway.
+    """
+    layers = [network.get_layer(i) for i in range(network.num_layers)]
+    sinks = [ly for ly in layers
+             if ly.type == trt.LayerType.UNARY and
+             any(s in ly.name for s in ("Cos", "Sin"))]
+    if not sinks:
+        raise RuntimeError(
+            "no Cos/Sin layers found — expected the two Fourier chains. Is this the "
+            "RoPE-baked ONNX (build_dit_bf16.py)? Building the raw dit.onnx as bf16 "
+            "reintroduces the long-sequence RoPE defect.")
+
+    by_out = {}
+    for ly in layers:
+        for j in range(ly.num_outputs):
+            by_out[ly.get_output(j).name] = ly
+    seen, stack = {id(s): s for s in sinks}, list(sinks)
+    while stack:
+        ly = stack.pop()
+        for j in range(ly.num_inputs):
+            t = ly.get_input(j)
+            if t is None:
+                continue
+            up = by_out.get(t.name)
+            if up is not None and id(up) not in seen:
+                seen[id(up)] = up
+                stack.append(up)
+
+    FLOATY = (trt.DataType.FLOAT, trt.DataType.HALF, trt.DataType.BF16)
+    n = 0
+    for ly in seen.values():
+        if ly.type == trt.LayerType.CONSTANT:
+            continue
+        if not any(ly.get_output(j).dtype in FLOATY for j in range(ly.num_outputs)):
+            continue
+        ly.precision = trt.DataType.FLOAT
+        n += 1
+    print(f"  fourier fp32 island: {len(sinks)} trig sinks -> {len(seen)} ancestors, "
+          f"{n} pinned", flush=True)
+    return n
+
+
 def _ensure_onnx(rel_paths):
     """Pull the ONNX (and any .data sidecar) from HF; cache on disk."""
     try:
@@ -322,6 +475,29 @@ def build_one(name: str) -> str:
         net_flags = 1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
     else:
         net_flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    if recipe["plugin"]:
+        # The SAME-L SWA plugin registers BOTH an aot_impl (PTX compiled into the
+        # engine) and an impl (Triton via a Python callback). TRT refuses to create the
+        # plugin unless the network states which it prefers:
+        #   "Plugin 'samel::diff_attn_swa' has both AOT and JIT implementations.
+        #    PREFER_AOT_PYTHON_PLUGINS or PREFER_JIT_PYTHON_PLUGINS should be specified."
+        #
+        # Two implementations of the SAME-L SWA plugin exist and the engine bakes in
+        # whichever this build prefers. Default AOT; override with SA3_SWA_PLUGIN=jit.
+        # See "Choosing the SAME-L attention kernel" in build/README.md.
+        want = os.environ.get("SA3_SWA_PLUGIN", "aot").lower()
+        if want not in ("aot", "jit"):
+            sys.exit(f"SA3_SWA_PLUGIN must be 'aot' or 'jit', got {want!r}")
+        if want == "aot":
+            net_flags |= 1 << int(
+                trt.NetworkDefinitionCreationFlag.PREFER_AOT_PYTHON_PLUGINS)
+            print("  plugin impl: AOT — graph-capturable, no Python in the enqueue "
+                  "path (SA3_SWA_PLUGIN=jit to switch)", flush=True)
+        else:
+            net_flags |= 1 << int(
+                trt.NetworkDefinitionCreationFlag.PREFER_JIT_PYTHON_PLUGINS)
+            print("  plugin impl: JIT — Triton at runtime. NOT stream-capturable on "
+                  "sm_120; verify before shipping (see build/README.md)", flush=True)
     network = builder.create_network(net_flags)
     parser = trt.OnnxParser(network, logger)
     if not parser.parse_from_file(onnx_path):
@@ -331,8 +507,10 @@ def build_one(name: str) -> str:
 
     cfg = builder.create_builder_config()
     cfg.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, recipe["workspace_gb"] << 30)
-    if "BF16" in recipe["flags"]:
-        cfg.set_flag(trt.BuilderFlag.BF16)
+    for flag in sorted(recipe["flags"]):
+        cfg.set_flag(getattr(trt.BuilderFlag, flag))
+    if recipe.get("pin_fourier_fp32"):
+        _pin_fourier_fp32(network, trt)
 
     if recipe["profile"]:
         profile = builder.create_optimization_profile()
@@ -362,6 +540,31 @@ def build_one(name: str) -> str:
     return str(target)
 
 
+# The autoencoders are NOT built here. build_autoencoders.py owns them: the shipping
+# engines carry two optimization profiles (a 256-latent low band for chunked decode and a
+# wide single-shot band) and, for the decoders, a baked limiter — none of which this
+# single-profile recipe table can express. Building them here produced
+# dec_dynamic_triton_swa.trt / dec_dynamic_bf16.trt and friends, retired names the runtime
+# registry never asks for, so the output was silently unusable.
+AUTOENCODER_TARGETS = {
+    "same-s-encoder": ("same-s", "enc"), "same-s-decoder": ("same-s", "dec"),
+    "same-l-encoder": ("same-l", "enc"), "same-l-decoder": ("same-l", "dec"),
+}
+
+
+def build_autoencoder(name: str) -> None:
+    """Delegate to build_autoencoders.py so there is exactly one AE build path."""
+    import subprocess
+    model, kind = AUTOENCODER_TARGETS[name]
+    script = Path(__file__).resolve().parent / "build_autoencoders.py"
+    cmd = [sys.executable, str(script), "--model", model, "--kind", kind]
+    print(f"\n━━━ {name} → build_autoencoders.py ━━━")
+    print(f"  $ {' '.join(cmd[1:])}", flush=True)
+    rc = subprocess.call(cmd)
+    if rc != 0:
+        raise SystemExit(f"build_autoencoders.py exited {rc}")
+
+
 def main():
     canonical = [k for k in TARGETS if not k.endswith("-fp32")]
     fp32      = [k for k in TARGETS if k.endswith("-fp32")]
@@ -370,6 +573,10 @@ def main():
         print(__doc__)
         print("\nCanonical (FP16-mixed) targets:")
         for k in canonical:
+            print(f"  {k}")
+        print("\nAutoencoders (delegated to build_autoencoders.py — two profiles + "
+              "baked limiter):")
+        for k in AUTOENCODER_TARGETS:
             print(f"  {k}")
         print("\nFP32 variants (~2x slower, ~2x engine size, opt-in):")
         for k in fp32:
@@ -381,20 +588,23 @@ def main():
         sys.exit(1)
 
     target = sys.argv[1]
+    def _build(name):
+        (build_autoencoder if name in AUTOENCODER_TARGETS else build_one)(name)
     if target == "all":
-        for name in canonical:
-            build_one(name)
+        for name in canonical + list(AUTOENCODER_TARGETS):
+            _build(name)
     elif target == "all-fp32":
         for name in fp32:
             build_one(name)
     elif target == "all-both":
-        for name in canonical + fp32:
-            build_one(name)
-    elif target in TARGETS:
-        build_one(target)
+        for name in canonical + list(AUTOENCODER_TARGETS) + fp32:
+            _build(name)
+    elif target in TARGETS or target in AUTOENCODER_TARGETS:
+        _build(target)
     else:
         print(f"unknown target: {target}")
-        print(f"valid: {list(TARGETS)} + 'all' / 'all-fp32' / 'all-both'")
+        print(f"valid: {list(TARGETS) + list(AUTOENCODER_TARGETS)} "
+              f"+ 'all' / 'all-fp32' / 'all-both'")
         sys.exit(1)
 
 

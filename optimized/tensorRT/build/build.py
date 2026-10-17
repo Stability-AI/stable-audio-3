@@ -52,36 +52,44 @@ def _from_onnx(name):
 TARGETS = [
     {"label": "t5gemma  (text encoder + tokenizer)",
      "command": _from_onnx("t5gemma"),
-     "outputs": ["t5gemma/t5gemma_fp16mixed.trt", "t5gemma/tokenizer.json"]},
-    {"label": "same-s encoder",
-     "command": _from_onnx("same-s-encoder"),
-     "outputs": ["same-s/enc_dynamic_bf16.trt"]},
-    {"label": "same-s decoder",
-     "command": _from_onnx("same-s-decoder"),
-     "outputs": ["same-s/dec_dynamic_bf16.trt"]},
-    {"label": "same-l encoder (Triton SWA plugin, FP16-mixed)",
-     "command": _from_onnx("same-l-encoder"),
-     "outputs": ["same-l/enc_dynamic_triton_swa.trt"]},
-    {"label": "same-l decoder (Triton SWA plugin, FP16-mixed)",
-     "command": _from_onnx("same-l-decoder"),
-     "outputs": ["same-l/dec_dynamic_triton_swa.trt"]},
+     "outputs": ["t5gemma/t5gemma_fp16.trt", "t5gemma/tokenizer.json"]},
+    # The autoencoders build through build_autoencoders.py: they need two optimization profiles
+    # and (decoders) a grafted limiter, which build_from_onnx.py's single-profile path cannot
+    # express. One command does all eight and verifies them.
+    {"label": "SAME-L + SAME-S autoencoders (8 engines: enc/dec x canonical/fp8)",
+     "command": [sys.executable, str(SCRIPTS_DIR / "build_autoencoders.py")],
+     "outputs": ["same-l/enc_fp16_chunkable.trt", "same-l/dec_fp16_chunkable_limiter.trt",
+                 "same-l/enc_fp8_chunkable.trt", "same-l/dec_fp8_chunkable_limiter.trt",
+                 "same-s/enc_bf16_chunkable.trt", "same-s/dec_bf16_chunkable_limiter.trt",
+                 "same-s/enc_fp8_chunkable.trt", "same-s/dec_fp8_chunkable_limiter.trt"]},
     # DiT engines now build from pre-processed FP16-mixed ONNX on HF;
     # build_from_onnx.py does the simple STRONGLY_TYPED compile.
-    # Medium ships TWO engines: bf16 (FMHA-fused, the speed DEFAULT) built from
-    # the raw fp32 dit.onnx with BuilderFlag.BF16, and fp16-mixed (canonical,
-    # bit-reproducible, kept selectable). sm-music/sm-sfx are fp16-mixed only.
-    {"label": "DiT medium  (SA3-M, bf16 — FMHA-fused, medium DEFAULT)",
+    # Medium ships TWO engines: fp16-mixed (the DEFAULT since 2026-07 — its
+    # attention core now fuses, see below) and bf16 (built from the raw fp32
+    # dit.onnx with BuilderFlag.BF16). sm-music/sm-sfx are fp16-mixed only.
+    #
+    # fp16-mixed became the medium default when the RoPE island was bounded so
+    # QK^T + Softmax run FP16: the engine went 0 -> 96 fused MHA nodes and 4.3x
+    # faster at L=4096, which removed the speed reason to prefer bf16. It is also
+    # the accurate one — teacher-forced velocity cos 1.0000 vs the FP32 engine at
+    # every length, where bf16 evaluates RoPE's rotation angle too coarsely and
+    # drifts at long sequence (the angle reaches ~4155 rad at L=4092, where bf16's
+    # spacing is 32 rad — more than a full 2*pi rotation).
+    {"label": "DiT medium  (SA3-M, FP16-mixed — medium DEFAULT, attention-fused)",
+     "command": _from_onnx("sa3-m"),
+     "outputs": ["sa3-m/dit_fp16.trt"]},
+    {"label": "DiT medium  (SA3-M, bf16 — selectable; drifts at long sequence)",
      "command": _from_onnx("sa3-m-bf16"),
      "outputs": ["sa3-m/dit_bf16.trt"]},
-    {"label": "DiT medium  (SA3-M, FP16-mixed — selectable, bit-reproducible)",
-     "command": _from_onnx("sa3-m"),
-     "outputs": ["sa3-m/dit_fp16mixed.trt"]},
+    {"label": "DiT medium  (SA3-M, fp8 — selectable; MAX-SPEED clean tier, ~1.3x over fp16)",
+     "command": _from_onnx("sa3-m-fp8"),
+     "outputs": ["sa3-m/dit_fp8.trt"]},
     {"label": "DiT sm-music (FP16-mixed)",
      "command": _from_onnx("sa3-sm-music"),
-     "outputs": ["sa3-sm-music/dit_fp16mixed.trt"]},
+     "outputs": ["sa3-sm-music/dit_fp16.trt"]},
     {"label": "DiT sm-sfx (FP16-mixed)",
      "command": _from_onnx("sa3-sm-sfx"),
-     "outputs": ["sa3-sm-sfx/dit_fp16mixed.trt"]},
+     "outputs": ["sa3-sm-sfx/dit_fp16.trt"]},
     # FP32 variants — opt-in. ~2× engine size, ~2× slower, but bit-equivalent
     # to PyTorch eager. Useful for precision-debug or reference comparisons.
     {"label": "[opt-in] same-l decoder FP32",

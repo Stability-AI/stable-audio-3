@@ -60,7 +60,9 @@ sys.path.insert(0, str(REPO))                    # so `from models.defs.* import
 sys.path.insert(0, str(REPO / "scripts"))        # so `from weights import *` resolves
 
 from models.defs import tflite_pipeline as P    # Tokenizer, T5GemmaTFLite, build_pingpong_schedule, make_noise, sample, save_wav
-from weights import ensure_local, is_present, PRECISIONS, dit_rel, dec_rel, enc_rel
+from weights import ensure_local, is_present, PRECISIONS, CODEC_PRECISIONS, dit_rel, dec_rel, enc_rel
+from rung_encoder import RungEncoder            # SAME audio encoder — static rungs, litert>=2.2.0
+from rung_decoder import RungDecoder            # SAME audio decoder — static rungs, litert>=2.2.0
 
 SAMPLE_RATE = 44100
 SAMPLES_PER_LATENT = 4096
@@ -69,27 +71,28 @@ COND_DIM = 768
 MIN_SIGMA = 0.01   # rf_denoiser is undefined at t≈0 → NaN below this
 
 # ─── Model manifest (local rel paths; resolved via weights.ensure_local at load) ───
-# --precision picks the DiT + decoder variant (same flag as the TensorRT release's
-# --precision; values here use the wXaY convention — weights/activations bit-widths,
-# "16" = fp16, there is no int16). Encoders + T5Gemma have one precision, like TRT.
-#   fp32      reference models (default — on CPU fp16 is SLOWER than fp32, so unlike
-#             TRT the fastest-and-accurate choice is fp32)
-#   w16a32    fp16 weights / fp32 activations — half size, ≈lossless, 1.5-3× slower
-#             on an M4 Pro (legacy name: fp16mixed; ≈ TRT's fp16mixed in spirit,
-#             storage-only here)
-#   w8a32     GPTQ weight-only int8 — ¼ size at fp32 speed (legacy: woint8)
-#   w8a8-dyn  GPTQ dynamic int8 — fastest (~1.2-1.3×), lowest quality (legacy: dynint8)
-# PRECISIONS + the path builders live in weights.py (single source of truth with
-# the download manifest — a precision the CLI accepts is guaranteed downloadable).
+# Precision is split: the DiT keeps its ladder; the SAME codec (enc+dec) has two rung tiers.
+#   DiT   (--dit-precision, or --precision):  fp32 (default) · w16a32 · w8a32 · w8a8-dyn
+#         int8 fails on the DiT (chaotic sampler -> a different sample), so fp32 is the pick.
+#   codec (--decoder/encoder-precision):      fp32 · w8a8  (rung models; w8a8 is the DEFAULT)
+#         the codec runs once on a fixed latent, so int8 (w8a8) is quality-free on the round-trip;
+#         w16a32/w8a32 add no audible quality and live in tflite/same-*/legacy/.
+# --precision is a global default: it sets the DiT directly and maps to the codec (fp32->fp32,
+# any int8 -> w8a8). PRECISIONS / CODEC_PRECISIONS + the path builders live in weights.py.
 DIT_REL = {d: dit_rel(d) for d in ("sm-music", "sm-sfx", "medium")}   # fp32 (picker)
 DEC_REL = {d: dec_rel(d) for d in ("same-s", "same-l")}
 ENC_REL = {d: enc_rel(d) for d in ("same-s", "same-l")}
 T5_REL = "models/tflite/t5gemma/encoder_fp16.tflite"
-DEFAULT_DECODER = {"sm-music": "same-s", "sm-sfx": "same-s", "medium": "same-l"}
+DEFAULT_DECODER = {"sm-music": "same-s", "sm-sfx": "same-s", "medium": "same-s"}
+# Default DiT precision per family — all three now ship the cache-safe rung w8a8 (int8, flat RAM, ~equal
+# quality to the retired varlen w8a8-dyn) as the default; fp32 is the opt-in reference/LoRA tier.
+DEFAULT_DIT_PRECISION = {"medium": "w8a8", "sm-music": "w8a8", "sm-sfx": "w8a8"}
 
-# SAME-L dense SWA mask is O(S^2): chunk long decodes. SAME-S has a narrow field: whole.
-SAMEL_CHUNK = 64     # latent tokens/window — throughput optimum (6.5x RT) vs the O(S^2) dense SWA mask
-SAMEL_OVERLAP = 8    # symmetric latent-token context each interior side (SAME-L needs >=8)
+# The SAME codec runs as static RUNG models: RungEncoder/RungDecoder auto-dispatch the optimal rung
+# per length (no chunk-size knob), holding RAM flat while the old dense-varlen graphs blew up
+# (SAME-L O(S^2) -> 16 GB@256; SAME-S linear -> ~50 GB@8192). Tiling overlap = the SWA receptive
+# field: SAME-L 12 latents, SAME-S 16 (its 34-token/2-latent chunking widens it) -> tiling bit-exact.
+RUNG_TRIM = {"same-l": 12, "same-s": 16}
 
 
 def _free():
@@ -296,7 +299,7 @@ class BakedDiT:
         cached BakedDiT can therefore be re-pointed at a new prompt/length WITHOUT rebuilding
         the interpreter or re-packing XNNPACK's weights: resize+allocate_tensors runs only
         when the batch (cfg on/off) or length L actually changes, otherwise the residents are
-        overwritten in place (same reuse pattern BakedDecoder/BakedEncoder use for L). Called
+        overwritten in place (resize/reallocate only when L or the batch actually changes). Called
         from __init__ (so the CLI's one-shot path is unchanged) and by the gradio DiT cache."""
         self.L = L
         self.cfg = float(cfg); self.apg = float(apg)
@@ -368,98 +371,34 @@ class BakedDiT:
         return _apply_cfg(x, t, v_cond, v_uncond, self.cfg, self.apg)
 
 
-# ─── Baked audio-in encoder (audio -> latents; SAME-S needs even L) ────────
-class BakedEncoder:
-    def __init__(self, path, threads=8, needs_even=False):
-        from ai_edge_litert import interpreter as tfl
-        self.it = tfl.Interpreter(model_path=str(path), num_threads=threads)
-        self.i = self.it.get_input_details()[0]["index"]
-        self.o = self.it.get_output_details()[0]["index"]
-        self.needs_even = needs_even
-        self._cur_N = None
-
-    def _resize(self, N):
-        if self._cur_N != N:
-            self.it.resize_tensor_input(self.i, [1, 2, N], strict=False)
-            self.it.allocate_tensors()
-            self._cur_N = N
-
-    def encode(self, audio, T_lat):
-        """audio: (1,2,M), M a multiple of 4096 (caller pads to even L for SAME-S).
-        Returns latents (1,256,T_lat) — trimmed back to the natural (decoder-independent) T_lat."""
-        self._resize(audio.shape[-1])
-        self.it.set_tensor(self.i, audio.astype(np.float32))
-        self.it.invoke()
-        return self.it.get_tensor(self.o)[:, :, :T_lat].copy()
+def _is_rung_dit(path) -> bool:
+    """True if the .tflite exposes s<N> rung signatures (the merged DiT rung ladder — medium, and any
+    lora-merged clone of it) vs a single serving_default varlen graph (the small DiTs). Cheap: reads the
+    signature list from a metadata-only Interpreter, no tensor allocation."""
+    from ai_edge_litert.interpreter import Interpreter
+    keys = Interpreter(model_path=str(path)).get_signature_list().keys()
+    return any(k.startswith("s") and k[1:].isdigit() for k in keys)
 
 
-# ─── Baked audio-out decoder (whole for SAME-S; chunked for SAME-L) ─────────
-class BakedDecoder:
-    def __init__(self, path, threads=8, needs_even=False):
-        from ai_edge_litert import interpreter as tfl
-        self.tfl = tfl
-        self.path = str(path)
-        self.threads = threads
-        self.needs_even = needs_even   # SAME-S: T_aud=L*16 must be %32 -> pad odd L->even
-        self.it = tfl.Interpreter(model_path=self.path, num_threads=threads)
-        self.i = self.it.get_input_details()[0]["index"]
-        self.o = self.it.get_output_details()[0]["index"]
-        self.i_det = self.it.get_input_details()[0]
-        self._cur_L = None
+def make_dit_backend(path, L, t5_hidden, t5_mask, seconds, threads, *, cfg, apg,
+                     null_hidden, null_mask, local_add_cond, batched):
+    """Pick the DiT backend by MODEL TYPE, not family: RungDiT (static rung ladder + XNNPACK weight
+    cache, needs litert>=2.2.0) for the merged rungs; BakedDiT (varlen) otherwise. Both expose the same
+    model_fn(x,t,cross,gcond)->v that P.sample drives. Rungs are batch=1, so CFG there is sequential
+    (the `batched` flag is a no-op); _apply_cfg (passed as cfg_fn) does the guidance in both."""
+    if _is_rung_dit(path):
+        from rung_dit import RungDiT
+        return RungDiT(path, L, t5_hidden, t5_mask, seconds, threads=threads, cfg=cfg, apg=apg,
+                       null_hidden=null_hidden, null_mask=null_mask, local_add_cond=local_add_cond,
+                       cfg_fn=_apply_cfg)
+    return BakedDiT(path, L, t5_hidden, t5_mask, seconds, threads=threads, cfg=cfg, apg=apg,
+                    null_hidden=null_hidden, null_mask=null_mask, local_add_cond=local_add_cond,
+                    batched=batched)
 
-    def _resize(self, L):
-        if self._cur_L != L:
-            self.it.resize_tensor_input(self.i, [1, 256, L], strict=False)
-            self.it.allocate_tensors()
-            self._cur_L = L
 
-    def decode_whole(self, latents):
-        L = latents.shape[2]
-        if self.needs_even and L % 2 != 0:
-            # SAME-S needs even L. Pad one edge-replicated latent token, decode at L+1,
-            # trim the extra token's audio. Narrow receptive field => negligible boundary
-            # effect on the kept L*4096 samples. Keeps odd-L requests working without
-            # changing the DiT/noise path (which stays natural-ceil, MLX/TRT-matched).
-            latents = np.concatenate([latents, latents[:, :, -1:]], axis=2)
-            self._resize(L + 1)
-            self.it.set_tensor(self.i, latents.astype(np.float32))
-            self.it.invoke()
-            return self.it.get_tensor(self.o)[:, :, :L * SAMPLES_PER_LATENT].copy()
-        self._resize(L)
-        self.it.set_tensor(self.i, latents.astype(np.float32))
-        self.it.invoke()
-        return self.it.get_tensor(self.o).copy()          # [1,2,L*4096]
-
-    def decode_chunked(self, latents, chunk, overlap, on_chunk=None):
-        """Stitch audio directly (stride = 4096 samples per latent token)."""
-        B, C, L = latents.shape
-        if L <= chunk:
-            return self.decode_whole(latents)
-        S = SAMPLES_PER_LATENT
-        out = np.zeros((B, 2, L * S), np.float32)
-        K = chunk - 2 * overlap
-        assert K > 0, (chunk, overlap)
-        core = 0
-        n_windows = (L + K - 1) // K
-        wi = 0
-        while core < L:
-            core_end = min(core + K, L)
-            win_start = core - overlap
-            win_end = win_start + chunk
-            if win_start < 0:
-                win_start, win_end = 0, chunk
-            if win_end > L:
-                win_end, win_start = L, L - chunk
-            win = latents[:, :, win_start:win_end]
-            y = self.decode_whole(win)                    # [1,2,chunk*4096]
-            ks = (core - win_start) * S
-            ke = (core_end - win_start) * S
-            out[:, :, core * S: core_end * S] = y[:, :, ks:ke]
-            wi += 1
-            if on_chunk:
-                on_chunk(wi, n_windows)
-            core = core_end
-        return out
+# The SAME audio encoder/decoder run as static rungs — see rung_encoder.RungEncoder /
+# rung_decoder.RungDecoder, driven from the Encode/Decode stages in main(). The old dense-varlen
+# BakedEncoder/BakedDecoder (+ manual chunking) they replace are gone.
 
 
 def valid_T_lat(seconds):
@@ -538,35 +477,35 @@ def main():
                     help="DiT model (names match sa3_mlx / sa3_trt). If omitted, prompts "
                          "interactively with an arrow-key picker.")
     ap.add_argument("--decoder", choices=["same-s", "same-l"], default=None,
-                    help="Audio decoder. Default: same-s for sm-music/sm-sfx, same-l for medium. "
+                    help="Audio decoder. Default: same-s for every model (medium's latents decode "
+                         "fine on SAME-S, ~7x faster); same-l is the bigger max-fidelity option. "
                          "If omitted, prompts interactively with an arrow-key picker.")
-    ap.add_argument("--precision", choices=list(PRECISIONS), default="fp32",
-                    help="DiT + decoder precision, wXaY = weight/activation bits (same flag "
-                         "as the TensorRT CLI): 'fp32' (default — reference; on CPU also the "
-                         "fast choice) | 'w16a32' (fp16 weights, half size, ≈lossless, 1.5-3× "
-                         "slower) | 'w8a32' (GPTQ int8 weights, ¼ size at fp32 speed) | "
-                         "'w8a8-dyn' (dynamic int8, fastest, lower quality). "
-                         "Applies to the DiT, codec decoder, and (for a2a/inpaint) the "
-                         "encoder; T5Gemma is single-precision. Per-component overrides below.")
+    ap.add_argument("--precision", choices=list(PRECISIONS), default=None,
+                    help="Global precision default: sets the DiT directly and maps to the SAME codec "
+                         "(fp32->fp32, any int8 -> the codec's w8a8). wXaY = weight/activation bits. All "
+                         "three DiTs are rung ladders with the same two tiers: 'w8a8' / 'fp32'. Defaults "
+                         "when omitted: DiT w8a8 (every family), codec w8a8. Per-component overrides below; "
+                         "T5Gemma is single-precision.")
     ap.add_argument("--dit-precision", choices=list(PRECISIONS), default=None,
-                    help="Override --precision for the DiT only (e.g. a quantized DiT "
-                         "with an fp32 codec).")
-    ap.add_argument("--decoder-precision", choices=list(PRECISIONS), default=None,
-                    help="Override --precision for the SAME codec only. The codec runs "
-                         "once on a fixed latent, so its precision maps directly to "
-                         "audio quality (w8a32 is transparent at 40-46 dB).")
-    ap.add_argument("--encoder-precision", choices=list(PRECISIONS), default=None,
-                    help="Override --precision for the SAME encoder (audio-to-audio / "
-                         "inpainting only). Latent PSNR vs fp32 (same-s/same-l): "
-                         "w16a32 ≈lossless (66/71 dB), w8a32 (GPTQ) 36/46 dB, "
-                         "w8a8-dyn 24/30 dB.")
+                    help="Override the DiT precision ('w8a8' | 'fp32', every family). int8 gives a "
+                         "*different* (not worse) draw on the 8-step sampler; w8a8 is the cache-safe rung "
+                         "default, fp32 is the bit-exact reference (and the pick for LoRA merges).")
+    ap.add_argument("--decoder-precision", choices=list(CODEC_PRECISIONS), default=None,
+                    help="SAME decoder rung tier: 'w8a8' (default — faster, ~half RAM, quality-free) "
+                         "or 'fp32' (bit-exact / for CPUs without int8 acceleration).")
+    ap.add_argument("--encoder-precision", choices=list(CODEC_PRECISIONS), default=None,
+                    help="SAME encoder rung tier (a2a / inpainting only): 'w8a8' (default) or 'fp32'. "
+                         "Round-trip quality is identical (int8 error is far below the AE's own loss).")
+    ap.add_argument("--max-rung", type=int, default=None,
+                    help="Cap the largest SAME rung used (e.g. 64) — lowers peak codec RAM on "
+                         "tiny-memory devices at some speed cost. Default: auto (uncapped = fastest).")
     # LoRA (merged into the DiT weights at load; mirrors the MLX CLI's --lora)
     ap.add_argument("--lora", action="append", nargs="+", default=None,
                     metavar=("ADAPTER", "strength=S"),
                     help="A LoRA adapter to merge into the DiT — repeat the flag to stack "
                          "several. Each --lora takes the adapter path followed by an optional "
                          "strength=S (default --lora-strength). Example: "
-                         "--lora plini.safetensors strength=0.8 . The adapter is a .safetensors "
+                         "--lora myband.safetensors strength=0.8 . The adapter is a .safetensors "
                          "file (SA3-native train_lora.py / underfit output) or a PEFT adapter "
                          "directory; ONLY .safetensors is accepted. The merged weights are "
                          "written into a cached copy of the DiT (models/tflite/lora_cache/) and "
@@ -614,10 +553,13 @@ def main():
     args = ap.parse_args()
     if args.steps < 1:
         ap.error(f"--steps must be ≥ 1 (got {args.steps})")
-    # per-component overrides fall back to the shared --precision
-    args.dit_precision = args.dit_precision or args.precision
-    args.decoder_precision = args.decoder_precision or args.precision
-    args.encoder_precision = args.encoder_precision or args.precision
+    # Resolve codec precisions here (default w8a8). The DiT precision is per-family, so it's resolved
+    # below once --dit is known (medium -> w8a8, the small DiTs -> fp32). --precision is a global that
+    # sets the DiT directly and maps to the codec (fp32->fp32, any int8 -> the codec's w8a8).
+    def _codec_of(p):
+        return None if p is None else ("fp32" if p == "fp32" else "w8a8")
+    args.decoder_precision = args.decoder_precision or _codec_of(args.precision) or "w8a8"
+    args.encoder_precision = args.encoder_precision or _codec_of(args.precision) or "w8a8"
 
     # Parse --lora specs up front (fail fast, before any model work).
     args.lora_specs = None
@@ -635,6 +577,17 @@ def main():
     if args.seed is None:
         args.seed = random.randint(0, 2**31 - 1)
 
+    # DiT precision is per-family, resolved now that --dit is known: medium -> w8a8, small -> fp32.
+    if args.dit_precision or args.precision:
+        args.dit_precision = args.dit_precision or args.precision
+    else:
+        args.dit_precision = DEFAULT_DIT_PRECISION.get(args.dit, "fp32")
+        # A LoRA run needs a mergeable (un-quantized) DiT. If the user pinned no precision and the
+        # family default is int8 (e.g. medium's w8a8), fall back to fp32 so --lora works out of the box.
+        if args.lora_specs and args.dit_precision not in ("fp32", "w16a32"):
+            print(f"  (note: --lora needs an un-quantized DiT — using fp32 instead of the "
+                  f"{args.dit} default '{args.dit_precision}')")
+            args.dit_precision = "fp32"
     dec = args.decoder or DEFAULT_DECODER[args.dit]
     T_lat = valid_T_lat(args.seconds)
     target_dur = T_lat * SAMPLES_PER_LATENT / SAMPLE_RATE
@@ -648,7 +601,7 @@ def main():
         # non-fp32 runs get a precision suffix so same-prompt/seed A/B runs across
         # --precision values don't overwrite each other
         if args.dit_precision == args.decoder_precision:
-            prec_tag = "" if args.precision == "fp32" else f"_{args.precision}"
+            prec_tag = "" if args.dit_precision == "fp32" else f"_{args.dit_precision}"
         else:
             prec_tag = f"_dit-{args.dit_precision}_dec-{args.decoder_precision}"
         lora_tag = ""
@@ -778,8 +731,10 @@ def main():
             audio_in = np.pad(audio_in, ((0, 0), (0, pad)))
             init_action = f"zero-padded by {pad} samples"
         audio_in = audio_in[None]                            # (1,2,target_samples)
-        enc = BakedEncoder(ensure_local(enc_rel(dec, args.encoder_precision)), args.threads, needs_even=(dec == "same-s"))
-        init_latents = enc.encode(audio_in, T_lat)           # (1,256,T_lat)
+        enc = RungEncoder(ensure_local(enc_rel(dec, args.encoder_precision)),
+                          threads=args.threads, trim=RUNG_TRIM[dec], max_rung=args.max_rung)
+        # audio_in is padded to enc_L*4096 (even for SAME-S); RungEncoder auto-dispatches rungs.
+        init_latents = enc.encode(audio_in)[:, :, :T_lat]    # (1,256,T_lat)
         enc_ms = (time.perf_counter() - t0) * 1000
         stage(TAG["enc"], f"Encode init audio → latents ({dec})", enc_ms)
         sub(f"{init_action}   latents {init_latents.shape}")
@@ -804,9 +759,7 @@ def main():
     # ── DiT load + pingpong sample ──
     stage(TAG["dit"], f"DiT — load + sample ({args.steps} steps, σmax={sigma_max:.2f})")
     t0 = time.perf_counter()
-    cfg_note = (("CFG batched (1× batch=2 invoke/step)" if args.cfg_batched
-                 else "CFG sequential (2× batch=1 invokes/step)") if args.cfg != 1.0 else "")
-    print(f"        {dim('loading baked DiT ' + args.dit + ' ...')}", flush=True)
+    print(f"        {dim('loading DiT ' + args.dit + ' ...')}", flush=True)
     dit_path = ensure_local(dit_rel(args.dit, args.dit_precision))
     if args.lora_specs:
         from lora_patch import get_patched_dit
@@ -816,11 +769,15 @@ def main():
                                        precision=args.dit_precision, log=sub)
         except LoraError as e:
             sys.exit(f"error: {e}")
-    backend = BakedDiT(dit_path, T_lat, t5_hidden, mask.astype(np.float32),
-                       args.seconds, args.threads, cfg=args.cfg, apg=args.apg,
-                       null_hidden=null_h, null_mask=null_m, local_add_cond=local_add_cond,
-                       batched=args.cfg_batched)
+    backend = make_dit_backend(dit_path, T_lat, t5_hidden, mask.astype(np.float32),
+                               args.seconds, args.threads, cfg=args.cfg, apg=args.apg,
+                               null_hidden=null_h, null_mask=null_m, local_add_cond=local_add_cond,
+                               batched=args.cfg_batched)
     load_ms = (time.perf_counter() - t0) * 1000
+    # rung DiT is batch=1 → CFG is always sequential (the --cfg-batched flag is a no-op there)
+    cfg_note = ("" if args.cfg == 1.0 else
+                ("CFG batched (1× batch=2 invoke/step)" if getattr(backend, "batched", False)
+                 else "CFG sequential (2× batch=1 invokes/step)"))
     sub(f"load {load_ms/1000:.1f}s" + (f"   {cfg_note}" if cfg_note else ""))
 
     sig = P.build_pingpong_schedule(args.steps, sigma_max)
@@ -856,21 +813,18 @@ def main():
     stage(TAG["dec"], f"Decoder ({dec}, audio-out) + WAV")
     t0 = time.perf_counter()
     print(f"        {dim('loading baked decoder ' + dec + ' ...')}", flush=True)
-    decoder = BakedDecoder(ensure_local(dec_rel(dec, args.decoder_precision)), args.threads, needs_even=(dec == "same-s"))
+    decoder = RungDecoder(ensure_local(dec_rel(dec, args.decoder_precision)),
+                          threads=args.threads, trim=RUNG_TRIM[dec], max_rung=args.max_rung)
     load2_ms = (time.perf_counter() - t0) * 1000
-    sub(f"load {load2_ms:.0f} ms")
+    sub(f"load {load2_ms:.0f} ms  ({len(decoder.sizes)} rungs)")
 
     t0 = time.perf_counter()
-    if dec == "same-l" and T_lat > SAMEL_CHUNK:
-        print(f"        {dim(f'SAME-L chunked decode (chunk={SAMEL_CHUNK}, ovl={SAMEL_OVERLAP}) ...')}", flush=True)
-        def on_chunk(i, n):
-            print(f"        {dim(f'decode chunk {i}/{n}')}", flush=True)
-        audio = decoder.decode_chunked(latents, SAMEL_CHUNK, SAMEL_OVERLAP, on_chunk=on_chunk)
-        dmode = f"chunked (chunk={SAMEL_CHUNK}, ovl={SAMEL_OVERLAP})"
-    else:
-        print(f"        {dim('whole decode ...')}", flush=True)
-        audio = decoder.decode_whole(latents)
-        dmode = "whole"
+    print(f"        {dim('rung decode (auto-dispatch) ...')}", flush=True)
+    dec_lat = latents
+    if dec == "same-s" and T_lat % 2:            # SAME-S needs even L: pad one latent, trim the audio
+        dec_lat = np.concatenate([latents, latents[:, :, -1:]], axis=2)
+    audio = decoder.decode(dec_lat)[:, :, :T_lat * SAMPLES_PER_LATENT]
+    dmode = f"rung (auto, {len(decoder.sizes)} rungs)"
     dec_ms = (time.perf_counter() - t0) * 1000
 
     audio_np = audio[0]                                        # (2, L*4096)

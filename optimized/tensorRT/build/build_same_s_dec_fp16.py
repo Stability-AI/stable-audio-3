@@ -33,11 +33,11 @@ Inputs/outputs:
   Cast(to=INT32) is unaffected by trunk dtype since it's an explicit dtype change.
 
 Usage:
-    python build_same_s_dec_fp16mixed.py
+    python build_same_s_dec_fp16.py
       [--mode {minimal,rope,full}]      # default: rope
-      [--input  /weka2/cj/clod/sa3s/stable-audio-3-optimized/onnx/same-s/dec_dynamic_bf16.onnx]
-      [--onnx   /tmp/same_s_dec_fp16mixed.onnx]
-      [--engine .../models/sm_90/same-s/dec_dynamic_fp16mixed.trt]
+      [--input  /path/to/sa3s/stable-audio-3-optimized/onnx/same-s/dec_dynamic_bf16.onnx]
+      [--onnx   /tmp/same_s_dec_fp16.onnx]
+      [--engine .../models/sm_90/same-s/dec_dynamic_fp16.trt]
 """
 import argparse
 import os
@@ -51,7 +51,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 # Reuse the helpers from the DiT FP16-mixed build. Most of them work as-is
 # — only the FP32-island finder needs SAME-S-specific patterns, which we
 # override below.
-from build_dit_fp16mixed import (
+from build_dit_fp16 import (
     strip_noop_fp32_casts,
     wrap_islands_with_casts,
     fix_dtype_mismatches,
@@ -476,7 +476,7 @@ def fix_extra_dtype_mismatches(model):
     return model
 
 
-def convert_to_fp16mixed(input_onnx, output_onnx, mode="minimal"):
+def convert_to_fp16(input_onnx, output_onnx, mode="minimal"):
     """Load FP32 ONNX, identify FP32 islands, convert everything else to
     FP16, and save."""
     import onnx
@@ -607,17 +607,17 @@ def build_trt_engine(onnx_path, engine_path, workspace_gb=16):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input",
-                    default="/weka2/cj/clod/sa3s/stable-audio-3-optimized/"
+                    default="/path/to/sa3s/stable-audio-3-optimized/"
                             "onnx/same-s/dec_dynamic_bf16.onnx",
                     help="Input FP32 ONNX (the `_bf16` suffix refers to the "
                          "eventual engine flavor; the ONNX itself is FP32)")
     ap.add_argument("--onnx",
-                    default="/tmp/same_s_dec_fp16mixed.onnx",
+                    default="/tmp/same_s_dec_fp16.onnx",
                     help="Output FP16-mixed ONNX (intermediate)")
     ap.add_argument("--engine",
-                    default="/weka2/cj/clod/sa3s/stable-audio-3/optimized/"
+                    default="/path/to/sa3s/stable-audio-3/optimized/"
                             "tensorRT/models/sm_90/same-s/"
-                            "dec_dynamic_fp16mixed.trt",
+                            "dec_dynamic_fp16.trt",
                     help="Output TRT engine path")
     ap.add_argument("--workspace-gb", type=int, default=16)
     ap.add_argument("--mode", choices=("minimal", "rope", "attention", "full"),
@@ -635,7 +635,7 @@ def main():
 
     if not args.skip_convert:
         print(f"━━━ Convert FP32 ONNX -> FP16-mixed ONNX (mode={args.mode}) ━━━")
-        convert_to_fp16mixed(args.input, args.onnx, mode=args.mode)
+        convert_to_fp16(args.input, args.onnx, mode=args.mode)
 
     if not args.skip_build:
         print("\n━━━ Build TRT engine ━━━")

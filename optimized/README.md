@@ -8,10 +8,12 @@ minimal-dependency way to run SA3 on a given accelerator. Pick by hardware:
 | **[mlx](mlx)** | Apple Silicon Macs | Metal GPU (MLX) | ✅ | ✅ `./sa3-gradio` | ✅ LoRA (pure-MLX) |
 | **[tflite](tflite)** | macOS / Linux / Windows, x86 & ARM | CPU (LiteRT / XNNPACK) | ✅ | ✅ `./sa3-gradio` | LoRA *inference* only (weight-patching) |
 | **[tensorRT](tensorRT)** | Linux + NVIDIA GPU | CUDA / TensorRT | ✅ | — | LoRA *inference* only (runtime low-rank branch) |
+| **[directml](directml)** | Windows 10/11 + DirectX 12 GPU | DirectML (ONNX Runtime) | ✅ | — | LoRA *inference* only (weights merged at session load) |
 
-All three read the same weights from
+All runtimes read the same weights from
 [`stabilityai/stable-audio-3-optimized`](https://huggingface.co/stabilityai/stable-audio-3-optimized)
-(auto-downloaded on first use) and cover text-to-audio, audio-to-audio,
+(auto-downloaded on first use; directml runs its ONNX graphs, or binds local
+checkpoint weights into them) and cover text-to-audio, audio-to-audio,
 inpainting, and CFG / negative-prompt guidance.
 
 ## One-liners
@@ -41,7 +43,9 @@ curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/op
   **dashboard** on a Mac, use underfit.
 - **LoRA inference** — every runtime loads `.safetensors` adapters, by three
   different mechanisms. **mlx/tflite** merge or patch them into the graph
-  (per-adapter strength + sampling-step gating on mlx). **tensorRT** cannot:
+  (per-adapter strength + sampling-step gating on mlx); **directml** merges
+  them into the DiT weights it hands to the session at load, leaving the graph
+  file untouched. **tensorRT** cannot:
   its weights are baked into a compiled plan. So it carries the adapter as
   *network inputs* instead — a low-rank branch on each adapted linear (229 on
   medium, 193 on each small DiT) whose

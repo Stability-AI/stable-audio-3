@@ -286,9 +286,16 @@ class SAMESDecoder(nn.Module):
         x = x[:, 1:, :]                                               # [B*T_lat, 16, D]
         x = x.reshape(B, T_lat * SIN_PER_POS, DIM)
 
-        # Channels-first → output mapping (WNConv1d-fused)
+        # Channels-first → output mapping (WNConv1d-fused). Expressed as im2col + a pointwise matmul
+        # (numerically identical to the k=3 Conv1d, verified 1e-6) so the tflite export is a
+        # FULLY_CONNECTED — which the dynamic-int8 quantizer scales PER-TOKEN — instead of a CONV_2D,
+        # which it scales per-TENSOR. The per-tensor scale coarsely quantizes quiet passages into a
+        # 256-sample staircase, i.e. a 172 Hz (= 44100/256) buzz on the w8a8 decoder; per-token fixes it.
         x = x.transpose(1, 2)                                         # [B, 768, T_lat*16]
-        x = self.mapping(x)                                           # [B, 512, T_lat*16]
+        xp = F.pad(x, (1, 1))                                         # pad time axis for k=3, padding=1
+        col = torch.cat([xp[:, :, 0:-2], xp[:, :, 1:-1], xp[:, :, 2:]], dim=1)   # im2col -> [B, 2304, T_lat*16]
+        Wc = self.mapping.weight.permute(0, 2, 1).reshape(OUT_CHANNELS, 3 * DIM)  # [512, 2304], taps k=0,1,2
+        x = (col.transpose(1, 2) @ Wc.t() + self.mapping.bias).transpose(1, 2)    # [B, 512, T_lat*16]
 
         if self.output_audio:
             # Unpatch: [B, 512, T_lat*16] → stereo waveform [B, 2, T_lat*4096].

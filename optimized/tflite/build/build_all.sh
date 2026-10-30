@@ -49,7 +49,12 @@ for S in $LADDER_L; do
   $PY_EXPORT "$HERE/quant_merge/quant_one.py" "$WORK/same-l_enc_windowed_$S.tflite" "$WORK/same-l_enc_windowed_${S}_w8a8.tflite"
 done
 for S in $LADDER_S; do
-  $PY_EXPORT "$HERE/quant_merge/quant_one.py" "$WORK/same-s_enc_fixed_$S.tflite" "$WORK/same-s_enc_fixed_${S}_w8a8.tflite"
+  # RHT the w8a8 encoder branch (block-0 glu_proj) for a ~11 dB lower quiet-section floor; fp32 stays clean.
+  ENC_SRC="$WORK/same-s_enc_fixed_$S.tflite"
+  if [ "${SA3_ENC_RHT:-1}" = 1 ]; then
+    $PY_EXPORT "$HERE/enc_rht.py" "$ENC_SRC" "$WORK/same-s_enc_rht_$S.tflite"; ENC_SRC="$WORK/same-s_enc_rht_$S.tflite"
+  fi
+  $PY_EXPORT "$HERE/quant_merge/quant_one.py" "$ENC_SRC" "$WORK/same-s_enc_fixed_${S}_w8a8.tflite"
   $PY_EXPORT "$HERE/quant_merge/quant_one.py" "$WORK/same-s_dec_fixed_$S.tflite" "$WORK/same-s_dec_fixed_${S}_w8a8.tflite"
 done
 

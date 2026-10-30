@@ -38,6 +38,12 @@ PY_RUNTIME=/path/to/runtime-env/bin/python \
 (`build_dit.sh`) → **verify** (structural: ladders + dispatch + shapes). Outputs land in
 `$SA3_BUILD_WORK/same-{l,s}/` and `$SA3_BUILD_WORK/sa3-m/`.
 
+Between export and quantize, the **w8a8 SAME-S encoder** branch runs `enc_rht.py`: an RHT (randomized-Hadamard)
+rotation on block-0's `glu_proj`, whose input is a DyT-norm output carrying the activation outliers that pin the
+dynamic-int8 floor. Spreading them lets int8 keep ~11 dB more quiet-section floor (cos-to-fp32 also up) at the same
+size and speed — one `BATCH_MATMUL`, folded into the weight (transparent), kept fp32 by quant_one's `HadRot_rot`
+carve-out. The fp32 encoder is untouched. Set `SA3_ENC_RHT=0` to skip it.
+
 The DiT stage is also runnable on its own (it is the slow part — each rung is a full ai_edge_torch convert):
 ```bash
 PY_EXPORT=/path/to/export-env/bin/python DIT_JOBS=6 bash build_dit.sh

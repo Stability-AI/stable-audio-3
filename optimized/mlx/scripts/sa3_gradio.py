@@ -58,6 +58,7 @@ from models.defs.sa3_pipeline import (  # noqa: E402
     apply_prompt_padding, build_pingpong_schedule, sample_flow_pingpong,
     patched_decode, load_conditioner_from_npz,
 )
+from models.defs.limiter_mlx import limit_mlx  # noqa: E402
 from models.defs.lora_merge import (  # noqa: E402
     prepare_loras, apply_conditioner_lora, LoraError,
 )
@@ -458,6 +459,7 @@ def run_generation(dit_name: str, decoder_name: str, prompt: str,
 
     # 5. Unpatch + trim
     audio = patched_decode(patches, patch_size=256, channels=2)
+    audio = limit_mlx(audio[0])[None]                                      # output limiter (ceiling 0.977), on-device
     mx.eval(audio)
     audio_np = np.array(audio.astype(mx.float32))[0]
     requested = int(round(seconds * SAMPLE_RATE))
@@ -903,7 +905,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         if not np.isfinite(audio_np).all():
             return None, "error: model produced non-finite audio (try a higher σmax or different seed)"
 
-        pcm = (np.clip(audio_np, -1, 1) * 32767.0).astype(np.int16).T   # (T, 2)
+        pcm = np.rint(np.clip(audio_np, -1, 1) * 32767.0).astype(np.int16).T   # (T, 2); round-to-nearest (matches TRT/TFLite)
         basename = verbose_basename(prompt, negative_prompt, cfg, sigma_max, seed)
         out_path = OUTPUT_DIR / f"{basename}.wav"
         _save_wav(pcm, out_path)

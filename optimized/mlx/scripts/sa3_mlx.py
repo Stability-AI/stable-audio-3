@@ -30,6 +30,7 @@ from models.defs.sa3_pipeline import (
     load_conditioner_from_npz,
 )
 from models.defs.t5gemma_mlx import T5Gemma
+from models.defs.limiter_mlx import limit_mlx
 from weights import ensure_local, is_present
 
 SAMPLE_RATE = 44100
@@ -234,7 +235,7 @@ def save_wav(path: str, audio: np.ndarray, sample_rate: int = SAMPLE_RATE):
         n_bad = int((~np.isfinite(audio)).sum())
         raise RuntimeError(f"refusing to write WAV — audio contains {n_bad} non-finite samples (NaN/Inf)")
     audio = np.clip(audio, -1.0, 1.0)
-    pcm = (audio * 32767.0).astype(np.int16).T  # (T, channels) interleaved
+    pcm = np.rint(audio * 32767.0).astype(np.int16).T  # (T, channels) interleaved; round-to-nearest (matches TRT/TFLite)
     with wave.open(path, "wb") as w:
         w.setnchannels(audio.shape[0])
         w.setsampwidth(2)
@@ -834,6 +835,7 @@ def main():
     # ── 5. Unpatch → audio + save WAV ──
     t0 = time.time()
     audio = patched_decode(patches, patch_size=256, channels=2)            # (1, 2, T_lat*4096)
+    audio = limit_mlx(audio[0])[None]                                      # output limiter (ceiling 0.977), on-device before int16
     mx.eval(audio)
     audio_np = np.array(audio.astype(mx.float32))[0]                       # (2, T_lat*4096)
     requested_samples = int(round(args.seconds * SAMPLE_RATE))

@@ -94,6 +94,8 @@ def generate_cond(
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        torch.mps.empty_cache()
     gc.collect()
 
     print(f"Prompt: {prompt}")

@@ -48,7 +48,7 @@ It is trained using a combination of five losses:
 - **Adversarial** — a GAN that pushes the model to reduce audible artifacts
 - **Diffusion Alignment** — a small diffusion model trained alongside SAME to ensure its latents are well-suited for generation
 - **Semantic Regression** — small regression models for pitch and stereo image
-- **Constrastive Latent** - a text/audio contrastive critic that encourages the latents to encode rich, cross-modal meaning
+- **Contrastive Latent** - a text/audio contrastive critic that encourages the latents to encode rich, cross-modal meaning
 
 There are two autoencoder variants:
 

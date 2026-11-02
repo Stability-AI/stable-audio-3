@@ -1,0 +1,6 @@
+onnxruntime-directml>=1.24
+onnx>=1.16
+numpy>=1.26
+huggingface_hub>=0.24
+tokenizers>=0.19
+safetensors>=0.4

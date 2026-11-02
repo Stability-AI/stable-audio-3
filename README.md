@@ -45,7 +45,7 @@ Base (un-post-trained) checkpoints, the SAME autoencoders, and optimized variant
 - 🎛️ **Three inference modes** — text-to-audio, audio-to-audio editing, and inpainting/continuation
 - ↔️ **Variable-length generation** — handles generation of a variety of sequences without wasting inference time and VRAM on unused latents
 - 🎯 **Personalization through LoRA fine-tuning** — adapt any model to a target style; stackable, adjustable at runtime
-- 💻 **Broad hardware support** — CPU (Small), CUDA/TensorRT (Medium), Apple Silicon via CoreML, Others coming soon
+- 💻 **Broad hardware support** — CPU (Small), CUDA/TensorRT (Medium), Apple Silicon via CoreML, Windows GPUs via DirectML, Others coming soon
 - 🎵 **SAME autoencoder** — new Semantic-Acoustic Music Encoder; stereo, 44.1 kHz, 256-dimensional latents optimized for both generative tractability and high-quality reconstruction
 
 
@@ -246,6 +246,7 @@ Optimized inference runtimes are available under [optimized/](optimized) — pic
 | [optimized/tflite](optimized/tflite) | **macOS / Linux / Windows**, x86 & ARM | CPU (LiteRT/XNNPACK) | `curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/tflite/bootstrap.sh \| bash`<br>Windows: `irm https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/tflite/bootstrap.ps1 \| iex` <br>*(the curl\|bash line needs Git Bash or WSL on Windows — stock Windows has no bash)* |
 | [optimized/mlx](optimized/mlx) | Apple Silicon Macs | Metal GPU (MLX) | `curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/mlx/bootstrap.sh \| bash` |
 | [optimized/tensorRT](optimized/tensorRT) | Linux + NVIDIA GPU | CUDA/TensorRT | `curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/tensorRT/bootstrap.sh \| bash` |
+| [optimized/directml](optimized/directml) | Windows 10/11 + DirectX 12 GPU | DirectML (ONNX Runtime) | see [optimized/directml](optimized/directml/README.md#installation) |
 
 
 Beyond inference, **[optimized/mlx](optimized/mlx)** and **[optimized/tflite](optimized/tflite)** each ship a **web UI** (`./sa3-gradio`), and **optimized/mlx** also does **LoRA training** on Apple Silicon (pure-MLX, no PyTorch) — see its [LoRA training](optimized/mlx/README.md#lora-training) section, or [underfit](https://github.com/dada-bots/underfit) for a full training dashboard built on it.
@@ -263,6 +264,7 @@ Beyond inference, **[optimized/mlx](optimized/mlx)** and **[optimized/tflite](op
 | [TFLite inference](optimized/tflite/README.md) | Portable CPU inference — macOS / Linux / Windows, x86 & ARM |
 | [MLX inference](optimized/mlx/README.md) | Optimized MLX inference for M-series Mac |
 | [TensorRT inference](optimized/tensorRT/README.md) | Optimized TensorRT inference for Nvidia GPUs |
+| [DirectML inference](optimized/directml/README.md) | Text-to-audio on Windows DirectX 12 GPUs, including AMD Radeon |
 
 ---
 

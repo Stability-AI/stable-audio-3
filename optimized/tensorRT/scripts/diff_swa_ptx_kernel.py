@@ -8,10 +8,26 @@ Output: (B, N, H, D) — already-subtracted differential result.
 
 Plugin signature: diff_swa_attn(Q_bat, K_bat, V_bat) where Q_bat is (B, N, 2H, D)
 Output: (B, N, H, D)
+
+`target_sm` is the PTX `.target` the kernel is generated for. PTX `.target` is a
+MINIMUM requirement, so it must be the arch the engine is being built for — a kernel
+generated for a newer arch than the GPU cannot be loaded by the driver. Defaults to
+sm_90 for backwards compatibility with existing callers, but callers that know the
+build GPU should pass `detect_arch()` (see scripts/_arch.py).
 """
 
-def generate_diff_swa_ptx(window=17, D=64, H=24, warps_per_block=4):
-    """Generate PTX for differential SWA. Returns (kernel_name, ptx_string)."""
+import re
+
+
+def generate_diff_swa_ptx(window=17, D=64, H=24, warps_per_block=4, target_sm="sm_90"):
+    """Generate PTX for differential SWA. Returns (kernel_name, ptx_string).
+
+    `target_sm` sets the PTX `.target`. Keep it at/below the compute capability of the
+    GPU the engine is built for; the scalar kernel below uses no arch-specific
+    instructions, so any plain sm_XX the toolchain knows will assemble.
+    """
+    if not re.fullmatch(r"sm_[0-9]{2,3}", target_sm):
+        raise ValueError(f"invalid target_sm {target_sm!r}; expected e.g. 'sm_75', 'sm_90'")
     WIN = 2 * window + 1
     H2 = 2 * H  # Total heads in input (48)
     THREADS_PER_BLOCK = warps_per_block * 32
@@ -20,7 +36,7 @@ def generate_diff_swa_ptx(window=17, D=64, H=24, warps_per_block=4):
 
     ptx = f"""
 .version 8.0
-.target sm_90
+.target {target_sm}
 .address_size 64
 
 .visible .entry {kernel_name}(
@@ -228,11 +244,22 @@ def generate_diff_swa_ptx(window=17, D=64, H=24, warps_per_block=4):
 
 
 if __name__ == "__main__":
-    name, ptx = generate_diff_swa_ptx()
-    print(f"Kernel: {name}, PTX: {len(ptx)} bytes, shared: {'.shared' in ptx}")
+    import argparse
     import subprocess
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--arch", default=None,
+                    help="target PTX arch, e.g. sm_75; default: detect from the current GPU")
+    a = ap.parse_args()
+    arch = a.arch
+    if arch is None:
+        import sys as _sys, pathlib as _pathlib
+        _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent))
+        from _arch import detect_arch
+        arch = detect_arch()
+    name, ptx = generate_diff_swa_ptx(target_sm=arch)
+    print(f"Kernel: {name}, target: {arch}, PTX: {len(ptx)} bytes, shared: {'.shared' in ptx}")
     with open('/tmp/diff_swa.ptx', 'w') as f: f.write(ptx)
-    r = subprocess.run(['ptxas', '--gpu-name=sm_90', '-o', '/tmp/diff_swa.cubin', '/tmp/diff_swa.ptx'],
+    r = subprocess.run(['ptxas', f'--gpu-name={arch}', '-o', '/tmp/diff_swa.cubin', '/tmp/diff_swa.ptx'],
                        capture_output=True, text=True)
     print(f"ptxas: {'OK' if r.returncode == 0 else 'FAILED'}")
     if r.returncode != 0: print(r.stderr[:300])

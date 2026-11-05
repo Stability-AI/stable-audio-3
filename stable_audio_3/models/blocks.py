@@ -3,6 +3,8 @@ import torch
 from torch import nn
 from torch.nn.utils import weight_norm
 
+from ..utils.device import disable_autocast
+
 
 def get_activation(activation, channels=None) -> nn.Module:
     if activation == "elu":
@@ -54,7 +56,7 @@ class ExpoFourierFeatures(nn.Module):
         self.min_freq = min_freq
         self.max_freq = max_freq
 
-    @torch.amp.autocast("cuda",enabled=False)
+    @disable_autocast
     def forward(self, t):
         """
         t: [B] tensor.

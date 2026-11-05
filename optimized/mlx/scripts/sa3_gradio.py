@@ -300,6 +300,11 @@ def run_generation(dit_name: str, decoder_name: str, prompt: str,
     # 1. T5Gemma
     t0 = time.time()
     enc = get_t5()
+    # NOTE: (phrase:weight) inline prompt weighting (see prompt_weighting.py)
+    # is a CLI-only feature (sa3 / sa3_mlx.py) — this Gradio pipeline encodes
+    # `prompt` as-is and does not parse or apply weighted spans, so any
+    # (phrase:weight) syntax here is passed through to the text encoder
+    # literally rather than being stripped and reweighted.
     embeds, mask = enc.encode([prompt], max_len=256)
     mx.eval(embeds, mask)
     t["t5_ms"] = (time.time() - t0) * 1000
@@ -323,6 +328,8 @@ def run_generation(dit_name: str, decoder_name: str, prompt: str,
     null_cross_attn = None
     if cfg != 1.0:
         if negative_prompt and negative_prompt.strip():
+            # NOTE: same as the positive-prompt enc.encode call above —
+            # (phrase:weight) prompt weighting is CLI-only, not supported here.
             neg_embeds, neg_mask = enc.encode([negative_prompt.strip()], max_len=256)
             mx.eval(neg_embeds, neg_mask)
             neg_padded = apply_prompt_padding(neg_embeds.astype(dtype), neg_mask,
